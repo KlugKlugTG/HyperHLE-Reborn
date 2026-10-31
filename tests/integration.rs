@@ -116,6 +116,30 @@ fn build_object<I: Iterator<Item = P>, P: AsRef<OsStr>>(
     eprintln!("Running {:?}", cmd);
     std::io::stdout().write_all(&output.stdout).unwrap();
     std::io::stderr().write_all(&output.stderr).unwrap();
+    if !output.status.success() {
+        // Clang can die without printing anything (it was killed, or the
+        // driver itself crashed), and then a bare `assert!` leaves no trace of
+        // why the build failed. Report the exit status and re-run the same
+        // command verbosely so the CI log says what actually went wrong.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            eprintln!(
+                "Clang failed: exit code {:?}, signal {:?}",
+                output.status.code(),
+                output.status.signal()
+            );
+        }
+        let verbose = Command::new(clang_path).args(cmd.get_args()).arg("-v").output();
+        match verbose {
+            Ok(verbose) => {
+                eprintln!("Re-running with -v: {:?}", verbose.status);
+                std::io::stdout().write_all(&verbose.stdout).unwrap();
+                std::io::stderr().write_all(&verbose.stderr).unwrap();
+            }
+            Err(e) => eprintln!("Re-running with -v failed: {}", e),
+        }
+    }
     assert!(output.status.success());
     eprintln!("Built successfully.");
     Ok(())
