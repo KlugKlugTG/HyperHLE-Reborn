@@ -71,16 +71,21 @@ fn make_description(env: &mut Environment, achievement: &game_center::Achievemen
 
     let object: id = msg_class![env; GKAchievementDescription alloc];
     let object: id = msg![env; object init];
+
+    // Take the host object's own references first: `retain` needs `env`, so
+    // it cannot be called while a field of the host object is borrowed.
+    let kept_identifier = retain(env, identifier);
+    let kept_title = retain(env, title);
+    // A finished achievement shows `achievedDescription`, an unfinished one
+    // `unachievedDescription`; both get the same placeholder for now, so they
+    // share a single retain (see `dealloc`).
+    let kept_description = retain(env, description);
     {
         let host = env.objc.borrow_mut::<GKAchievementDescriptionHostObject>(object);
-        host.identifier = retain(env, identifier);
-        host.title = retain(env, title);
-        // A finished achievement shows `achievedDescription`, an unfinished
-        // one `unachievedDescription`; both get the same placeholder for now,
-        // so they share a single retain (see `dealloc`).
-        let kept = retain(env, description);
-        host.unachieved_description = kept;
-        host.achieved_description = kept;
+        host.identifier = kept_identifier;
+        host.title = kept_title;
+        host.unachieved_description = kept_description;
+        host.achieved_description = kept_description;
     }
     release(env, identifier);
     release(env, title);
