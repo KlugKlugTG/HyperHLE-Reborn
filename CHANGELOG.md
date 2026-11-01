@@ -239,6 +239,8 @@ Quality and performance:
   - The window framebuffer no longer requests depth/stencil buffers it never uses (everything host-drawn is a flat textured quad), saving a swap chain resolution's worth of bandwidth on tile-based mobile GPUs.
   - Per-frame/per-touch `getenv`-style debug toggle checks (`TOUCHHLE_*` env vars on the present, viewport, draw-call, hit-test and touch-remap paths) are now read once and cached; previously several of them ran an environ scan with locking and allocation on every frame or touch event.
 
+- Game Center achievements and leaderboards now work offline instead of being dropped. `-[GKAchievement reportAchievementWithCompletionHandler:]` and `+[GKAchievement reportAchievements:withCompletionHandler:]` only wrote a log line, `+loadAchievementsWithCompletionHandler:` handed back nothing, and no completion handler was ever called, so games that gate content on achievements could never see progress. Reports are now recorded in a local store (`touchHLE_gamecenter.txt` in the user data directory, keyed by bundle identifier) that keeps each achievement's best percentage and completion state and each leaderboard's best score: `+loadAchievementsWithCompletionHandler:` returns the recorded achievements as `GKAchievement` objects, `+resetAchievementsWithCompletionHandler:` clears them, and `GKLeaderboard`'s `loadScoresWithCompletionHandler:`, `localPlayerScore`, `loadLeaderboardsWithCompletionHandler:` and the deprecated `loadCategoriesWithCompletionHandler:` are served from the same store instead of returning `nil`. `-[GKScore reportScoreWithCompletionHandler:]` records the score, and every reporting call now invokes its completion handler instead of dropping it. Progress only moves upwards, as on the real service, and `GKLocalPlayer`'s identifier and alias come from the store so the emulator and its own UI agree on who is signed in. Triggered by `--game-center-authenticated` / "Local Game Center sign-in", like before; nothing talks to Apple.
+
 Usability:
 
 - Opening the app picker now plays the iOS 4-style home screen unlock animation: the app icons and their labels fly in radially from outside the screen into their grid slots, with inner icons leading and outer corners settling right after.
@@ -250,6 +252,8 @@ Usability:
 - Long-pressing an app icon in the app picker opens an iOS-style “Delete” dialog. Deleting an app removes its bundle, its saved data in `touchHLE_sandbox`, and its SQLite databases in `touchHLE_sqlite`.
 
 - The app picker's Settings screen has a new “Language” dropdown in the Device section. “Auto” (the default) uses the host's language, and the other choices pass `--preferred-languages=` to the app.
+
+- The app picker has a Game Center tile. It opens a full-screen Game Center screen listing every app that reported achievements, each achievement with a progress bar and completion state, and each leaderboard's best score, plus a two-tap Reset that erases the local store. Because it reads the store rather than the running app, it also shows progress from games that are not running.
 
 - Quick Options now has a “May fix graphics issues.” switch for `--force-composition`, including an explicit off state that overrides app-specific defaults. Switches are aligned beside their labels, and the scale-hack button text no longer gets clipped. (@j92580498-max)
 

@@ -463,7 +463,10 @@ Other options:
         Report the local Game Center player as signed in. This can let games
         that require authentication at startup enter their offline content.
         Also available as "Local Game Center sign-in" in Settings > Emulation.
-        Disabled by default. Online Game Center services remain unavailable.
+        Achievements and best leaderboard scores that games report are then
+        stored locally (touchHLE_gamecenter.txt) and shown by the Game Center
+        tile in the app picker. Disabled by default. Online Game Center
+        services remain unavailable.
 
     --ignore-gl-errors
         Ignore host OpenGL errors as queried by glGetError function.

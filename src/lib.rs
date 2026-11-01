@@ -42,6 +42,7 @@ mod environment;
 pub mod font;
 mod frameworks;
 mod fs;
+mod game_center;
 mod gdb;
 mod gles;
 mod image;

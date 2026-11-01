@@ -1283,7 +1283,7 @@ fn build_store_views(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn make_button(
+pub(super) fn make_button(
     env: &mut Environment,
     delegate: id,
     parent: id,
@@ -1314,13 +1314,13 @@ fn make_button(
     button
 }
 
-fn set_label(env: &mut Environment, label: id, text: &str) {
+pub(super) fn set_label(env: &mut Environment, label: id, text: &str) {
     let text = ns_string::from_rust_string(env, text.to_string());
     () = msg![env; label setText:text];
     release(env, text);
 }
 
-fn set_button_title(env: &mut Environment, button: id, title: &str) {
+pub(super) fn set_button_title(env: &mut Environment, button: id, title: &str) {
     let title = ns_string::from_rust_string(env, title.to_string());
     () = msg![env; button setTitle:title forState:UIControlStateNormal];
     release(env, title);

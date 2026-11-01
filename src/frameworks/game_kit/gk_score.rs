@@ -7,9 +7,12 @@
 #![allow(dead_code)]
 //! `GKScore`.
 
+use super::gk_local_player::invoke_error_block;
 use crate::frameworks::foundation::ns_string;
+use crate::game_center;
 use crate::objc::{
-    autorelease, id, msg, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
+    NSZonePtr,
 };
 use std::borrow::Cow;
 
@@ -29,6 +32,39 @@ struct GKScoreHostObject {
     should_set_default_leaderboard: bool,
 }
 impl HostObject for GKScoreHostObject {}
+
+/// Build a `GKScore` describing an entry from the local Game Center store.
+///
+/// The returned object is retained: the caller takes ownership and must
+/// autorelease or release it. Used by `GKLeaderboard` to hand back scores it
+/// never received from the network.
+pub(super) fn make_local_score(
+    env: &mut crate::Environment,
+    score: &game_center::Score,
+    rank: i64,
+) -> id {
+    let leaderboard = ns_string::from_rust_string(env, score.leaderboard.clone());
+    let object: id = msg_class![env; GKScore alloc];
+    let object: id = msg![env; object initWithCategory:leaderboard];
+    release(env, leaderboard);
+
+    let formatted = ns_string::from_rust_string(env, score.formatted.clone());
+    let date = msg_class![env; NSDate dateWithTimeIntervalSince1970:(score.last_reported as f64)];
+    let date = retain(env, date);
+    let player_id = ns_string::from_rust_string(env, game_center::PLAYER_ID.to_string());
+
+    let old_formatted = env.objc.borrow::<GKScoreHostObject>(object).formatted_value;
+    release(env, old_formatted);
+    {
+        let host = env.objc.borrow_mut::<GKScoreHostObject>(object);
+        host.value = score.value;
+        host.formatted_value = formatted;
+        host.rank = rank;
+        host.date = date;
+        host.player_id = player_id;
+    }
+    object
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -52,10 +88,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithCategory:(id)category {
+    // One retain for both properties: `dealloc` only releases the second one
+    // when it differs from the first.
     retain(env, category);
-    env.objc.borrow_mut::<GKScoreHostObject>(this).category = category;
-    retain(env, category);
-    env.objc.borrow_mut::<GKScoreHostObject>(this).leaderboard_identifier = category;
+    {
+        let host = env.objc.borrow_mut::<GKScoreHostObject>(this);
+        host.category = category;
+        host.leaderboard_identifier = category;
+    }
 
     let fmt = ns_string::from_rust_string(env, "0".to_string());
     env.objc.borrow_mut::<GKScoreHostObject>(this).formatted_value = fmt;
@@ -149,7 +189,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)playerID {
-    env.objc.borrow::<GKScoreHostObject>(this).player_id
+    let player_id = env.objc.borrow::<GKScoreHostObject>(this).player_id;
+    if player_id != nil {
+        return player_id;
+    }
+    // A score a game built itself has no player attached, but it is always
+    // the local player's score, so report the local player.
+    let player_id = ns_string::from_rust_string(env, game_center::PLAYER_ID.to_string());
+    autorelease(env, player_id)
 }
 
 - (id)player {
@@ -168,20 +215,49 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<GKScoreHostObject>(this).should_set_default_leaderboard = value;
 }
 
-- (())reportScoreWithCompletionHandler:(id)_completion_handler {
-    let value = env.objc.borrow::<GKScoreHostObject>(this).value;
-    let cat   = env.objc.borrow::<GKScoreHostObject>(this).category;
-
-    let cat_str: Cow<str> = if cat != nil {
-        ns_string::to_rust_string(env, cat)
-    } else {
-        Cow::Borrowed("<nil>")
+// Apple reference (iOS 4.1, deprecated iOS 7):
+// <https://developer.apple.com/documentation/gamekit/gkscore/1621741-reportscorewithcompletionhandler>
+// "Sends a score to Game Center. [...] When the score is sent, the block is
+//  called." Scores go to the local Game Center store ([crate::game_center]);
+// the best value per leaderboard is kept, like the server would.
+- (())reportScoreWithCompletionHandler:(id)completion_handler {
+    let (value, formatted, leaderboard) = {
+        let host = env.objc.borrow::<GKScoreHostObject>(this);
+        (
+            host.value,
+            host.formatted_value,
+            if host.leaderboard_identifier != nil {
+                host.leaderboard_identifier
+            } else {
+                host.category
+            },
+        )
     };
 
+    let formatted = if formatted != nil {
+        ns_string::to_rust_string(env, formatted).into_owned()
+    } else {
+        value.to_string()
+    };
+
+    if leaderboard == nil {
+        log!(
+            "GKScore reportScoreWithCompletionHandler: no leaderboard identifier set (value={})",
+            value
+        );
+        invoke_error_block(env, completion_handler, nil);
+        return;
+    }
+
+    let leaderboard = ns_string::to_rust_string(env, leaderboard).into_owned();
+    let update = game_center::report_score(env, &leaderboard, value, &formatted);
     log!(
-        "GKScore reportScoreWithCompletionHandler: stubbed (category={}, value={})",
-        cat_str, value
+        "Game Center (local): score reported: {} = {}{}",
+        leaderboard,
+        formatted,
+        if update.new_best { " (new best)" } else { "" }
     );
+    invoke_error_block(env, completion_handler, nil);
 }
 
 - (id)description {

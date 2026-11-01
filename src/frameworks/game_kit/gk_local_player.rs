@@ -65,7 +65,7 @@ pub fn make_not_authenticated_error(env: &mut Environment) -> id {
 /// when the guest hands us a stack-allocated literal block that was never
 /// `Block_copy`-ed and has already gone out of scope. Apple's `Block_ABI`:
 /// <https://clang.llvm.org/docs/Block-ABI-Apple.html>.
-fn block_invoke(env: &mut Environment, block: id) -> Option<GuestFunction> {
+pub(crate) fn block_invoke(env: &mut Environment, block: id) -> Option<GuestFunction> {
     if block == nil {
         return None;
     }
@@ -93,7 +93,12 @@ fn release_block(env: &mut Environment, block: id) {
 
 /// Invoke an ObjC block whose underlying C function has the signature
 /// `void (^)(NSError *)`.
-fn invoke_error_block(env: &mut Environment, block: id, error: id) {
+///
+/// This runs the block synchronously, like the existing load-friends stubs do.
+/// GameKit itself calls completion handlers asynchronously; the local store is
+/// already updated by the time the handler runs, so the only observable
+/// difference is the call stack the handler sees.
+pub(crate) fn invoke_error_block(env: &mut Environment, block: id, error: id) {
     let Some(invoke) = block_invoke(env, block) else {
         return;
     };
@@ -102,6 +107,22 @@ fn invoke_error_block(env: &mut Environment, block: id, error: id) {
         &invoke,
         env,
         (block_arg, error),
+    );
+}
+
+/// Invoke an ObjC block whose underlying C function has the signature
+/// `void (^)(id result, NSError *error)`. Used by the GameKit APIs that hand
+/// the caller a result object plus an error, such as
+/// `+[GKAchievement loadAchievementsWithCompletionHandler:]`.
+pub(crate) fn invoke_two_object_block(env: &mut Environment, block: id, first: id, second: id) {
+    let Some(invoke) = block_invoke(env, block) else {
+        return;
+    };
+    let block_arg: ConstVoidPtr = Ptr::from_bits(block.to_bits()).cast_const();
+    <GuestFunction as CallFromHost<(), (ConstVoidPtr, id, id)>>::call_from_host(
+        &invoke,
+        env,
+        (block_arg, first, second),
     );
 }
 
@@ -183,12 +204,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     let player: id = msg![env; this alloc];
     let player: id = msg![env; player init];
 
-    let player_id = ns_string::from_rust_string(
-        env,
-        "GKLocalPlayer:touchHLE".to_string(),
-    );
-    let alias   = ns_string::from_rust_string(env, "Player".to_string());
-    let display = ns_string::from_rust_string(env, "Player".to_string());
+    // The identity comes from the local Game Center store, so games and the
+    // app picker's Game Center screen show the same player.
+    let player_id =
+        ns_string::from_rust_string(env, crate::game_center::PLAYER_ID.to_string());
+    let alias = ns_string::from_rust_string(env, crate::game_center::PLAYER_ALIAS.to_string());
+    let display = ns_string::from_rust_string(env, crate::game_center::PLAYER_ALIAS.to_string());
     let friends = msg_class![env; NSArray new];
 
     {
@@ -211,11 +232,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 // "The completion handler is called with a nil error if the
 //  identifier was set, or an NSError if the request failed."
 //
-// touchHLE has no Game Center connectivity, so the request always
-// fails with `GKErrorNotAuthenticated`. We still invoke the
-// completion handler so the caller can proceed.
-+ (())setDefaultLeaderboardIdentifier:(id)_identifier
+// There is no server to store the identifier, and the local store keys
+// scores by the identifier the game reports to, so it is not remembered:
+// when signed in locally the request simply succeeds.
++ (())setDefaultLeaderboardIdentifier:(id)identifier
                withCompletionHandler:(id)handler {
+    if env.options.game_center_authenticated {
+        if identifier != nil {
+            let name = ns_string::to_rust_string(env, identifier).into_owned();
+            log!("GKLocalPlayer: default leaderboard set to {}", name);
+        }
+        invoke_error_block(env, handler, nil);
+        return;
+    }
     let error = make_not_authenticated_error(env);
     invoke_error_block(env, handler, error);
 }
@@ -229,15 +258,26 @@ pub const CLASSES: ClassExports = objc_classes! {
 // The completion block signature is
 //   void (^)(NSString *leaderboardIdentifier, NSError *error)
 // which is the same ABI as `void (^)(id, id)`.
+//
+// When signed in locally, the answer is the leaderboard the game has already
+// reported scores to (or nil if it never reported one), which is the only
+// leaderboard this emulator knows about.
 + (())loadDefaultLeaderboardIdentifierWithCompletionHandler:(id)handler {
-    let Some(invoke) = block_invoke(env, handler) else {
+    if !env.options.game_center_authenticated {
+        let error = make_not_authenticated_error(env);
+        invoke_two_object_block(env, handler, nil, error);
+        return;
+    }
+    let Some(identifier) = crate::game_center::scores_for_current_app(env)
+        .first()
+        .map(|score| score.leaderboard.clone())
+    else {
+        invoke_two_object_block(env, handler, nil, nil);
         return;
     };
-    let block_arg: ConstVoidPtr = Ptr::from_bits(handler.to_bits()).cast_const();
-    let error = make_not_authenticated_error(env);
-    <GuestFunction as CallFromHost<(), (ConstVoidPtr, id, id)>>::call_from_host(
-        &invoke, env, (block_arg, nil, error),
-    );
+    let identifier_string = ns_string::from_rust_string(env, identifier);
+    autorelease(env, identifier_string);
+    invoke_two_object_block(env, handler, identifier_string, nil);
 }
 
 // MARK: - Init / dealloc

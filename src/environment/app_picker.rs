@@ -2,6 +2,7 @@
 
 mod access_prompt;
 mod archive_store;
+mod game_center_screen;
 
 use crate::bundle::Bundle;
 use crate::frameworks::core_graphics::cg_affine_transform::{
@@ -369,6 +370,10 @@ struct AppPickerDelegateHostObject {
     archive_store_fuzzy: bool,
     archive_store_queue_action: Option<NSInteger>,
     archive_store_tap: Option<CGPoint>,
+    // Actions used by the built-in local Game Center screen.
+    game_center_show: bool,
+    game_center_close: bool,
+    game_center_reset: bool,
     settings_show: bool,
     settings_hide: bool,
     scale_hack_default: bool,
@@ -670,6 +675,15 @@ const CLASSES: ClassExports = objc_classes! {
 - (())archiveStoreQueueAction:(id)sender {
     let tag: NSInteger = msg![env; sender tag];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).archive_store_queue_action = Some(tag);
+}
+- (())gameCenterShow {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).game_center_show = true;
+}
+- (())gameCenterClose {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).game_center_close = true;
+}
+- (())gameCenterReset {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).game_center_reset = true;
 }
 - (())archiveStoreTap:(id)sender {
     let view: id = msg![env; sender view];
@@ -1517,6 +1531,29 @@ fn app_picker_inner(
                 );
             }
             hide_settings_screen(env, main_run_loop, delegate, &settings);
+        } else if std::mem::take(&mut host_obj.game_center_show) {
+            game_center_screen::run_game_center(
+                env,
+                main_run_loop,
+                delegate,
+                main_view,
+                app_frame,
+            );
+            // The Game Center screen runs its own run loop, so drop any taps
+            // or swipes it collected before the home screen sees them.
+            {
+                let host = env
+                    .objc
+                    .borrow_mut::<AppPickerDelegateHostObject>(delegate);
+                host.icon_tapped = nil;
+                host.icon_touch_down = nil;
+                host.icon_touch_cancelled = false;
+                host.swipe_left = false;
+                host.swipe_right = false;
+                host.game_center_show = false;
+            }
+            press = None;
+            long_pressed_icon = None;
         } else if std::mem::take(&mut host_obj.scale_hack_default) {
             quick_options_scale_hack = None;
             update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
@@ -2866,23 +2903,28 @@ fn make_dock(
     let hairline = new_view(env, rect(12.0, 0.0, dock_width - 24.0, 1.0), hairline_color);
     () = msg![env; dock addSubview:hairline];
 
-    let count: CGFloat = 4.0;
+    let count: CGFloat = 5.0;
     let side_inset: CGFloat = 8.0;
-    let gap = ((dock_width - side_inset * 2.0 - DOCK_ICON_SIZE * count) / (count - 1.0))
+    // Shrink the icons on narrow screens so five shortcuts still fit: an
+    // iPhone-sized dock is only 308 points wide.
+    let icon_size = ((dock_width - side_inset * 2.0) / count - 8.0).clamp(36.0, DOCK_ICON_SIZE);
+    let gap = ((dock_width - side_inset * 2.0 - icon_size * count) / (count - 1.0))
         .clamp(2.0, 18.0);
-    let first_x = (dock_width - (DOCK_ICON_SIZE * count + gap * (count - 1.0))) / 2.0;
+    let first_x = (dock_width - (icon_size * count + gap * (count - 1.0))) / 2.0;
 
     let plus_image = make_icon_from_text(env, "+", 50.0, -6.0, (0.25, 0.25, 0.25, 1.0));
     let settings_image = make_settings_app_icon(env);
     let recent_placeholder = make_icon_from_text(env, "↻", 34.0, 0.0, (0.25, 0.25, 0.25, 1.0));
     let browse_image = make_browse_app_icon(env);
-    let step = DOCK_ICON_SIZE + gap;
-    make_dock_item(env, delegate, dock, first_x, plus_image, "Add .ipa", "addIpa");
+    let game_center_image = make_icon_from_text(env, "GC", 34.0, 0.0, (0.09, 0.36, 0.27, 1.0));
+    let step = icon_size + gap;
+    make_dock_item(env, delegate, dock, first_x, icon_size, plus_image, "Add .ipa", "addIpa");
     make_dock_item(
         env,
         delegate,
         dock,
         first_x + step,
+        icon_size,
         settings_image,
         "Settings",
         "settingsShow",
@@ -2894,12 +2936,32 @@ fn make_dock(
         env,
         delegate,
         dock,
+        first_x + step * 2.0,
+        icon_size,
+        browse_image,
+        "Browse",
+        "addIpa",
+    );
+    make_dock_item(
+        env,
+        delegate,
+        dock,
         first_x + step * 3.0,
+        icon_size,
+        game_center_image,
+        "Game Center",
+        "gameCenterShow",
+    );
+    make_dock_item(
+        env,
+        delegate,
+        dock,
+        first_x + step * 4.0,
+        icon_size,
         recent_image,
         recent_label,
         "openRecentApp",
     );
-    make_dock_item(env, delegate, dock, first_x + step * 2.0, browse_image, "Browse", "addIpa");
     () = msg![env; main_view addSubview:dock];
     dock
 }
@@ -2910,6 +2972,7 @@ fn make_dock_item(
     delegate: id,
     dock: id,
     x: CGFloat,
+    icon_size: CGFloat,
     image: id,
     label_text: &str,
     action: &str,
@@ -2918,12 +2981,12 @@ fn make_dock_item(
     () = msg![env; icon_button setFrame:(rect(
         x,
         DOCK_ICON_TOP,
-        DOCK_ICON_SIZE,
-        DOCK_ICON_SIZE
+        icon_size,
+        icon_size
     ))];
     () = msg![env; icon_button setImage:image forState:UIControlStateNormal];
     let image_view: id = msg![env; icon_button imageView];
-    () = msg![env; image_view setFrame:(rect(0.0, 0.0, DOCK_ICON_SIZE, DOCK_ICON_SIZE))];
+    () = msg![env; image_view setFrame:(rect(0.0, 0.0, icon_size, icon_size))];
     let layer: id = msg![env; image_view layer];
     let gravity = ns_string::get_static_str(env, "resizeAspect");
     () = msg![env; layer setContentsGravity:gravity];
@@ -2933,13 +2996,13 @@ fn make_dock_item(
                         forControlEvents:UIControlEventTouchUpInside];
     () = msg![env; dock addSubview:icon_button];
 
-    let label_width = DOCK_ICON_SIZE + 30.0;
+    let label_width = icon_size + 30.0;
     let white: id = msg_class![env; UIColor whiteColor];
     let label = new_label(
         env,
         rect(
-            x - (label_width - DOCK_ICON_SIZE) / 2.0,
-            DOCK_ICON_TOP + DOCK_ICON_SIZE + 3.0,
+            x - (label_width - icon_size) / 2.0,
+            DOCK_ICON_TOP + icon_size + 3.0,
             label_width,
             DOCK_LABEL_HEIGHT,
         ),
