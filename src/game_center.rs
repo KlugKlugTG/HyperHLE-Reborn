@@ -32,8 +32,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const STORE_FILE: &str = "touchHLE_gamecenter.txt";
 
 /// Player identifier reported by `-[GKLocalPlayer playerID]` when the local
-/// player is signed in. Shaped like a real Game Center identifier (`G:` plus
-/// digits) so games that validate the prefix keep working.
+/// player is signed in. Shaped like a real Game Center identifier, which
+/// starts with `G:`, so games that validate the prefix keep working.
 pub const PLAYER_ID: &str = "G:touchHLE";
 
 /// Alias reported by `-[GKLocalPlayer alias]` and `-displayName`.
