@@ -3529,10 +3529,141 @@ fn make_settings_app_icon(env: &mut Environment) -> id {
     make_dock_asset_icon(env, bytes)
 }
 
+/// Geometry of the Game Center dock icon, in the 72-point icon space that
+/// [make_icon] uses. It is a flat speech bubble with four bubbles inside, in
+/// the same style as the Settings and Browse icons: a dark square with a
+/// white glyph, whose corners are rounded by [Image::round_icon_corners].
+const GAME_CENTER_ICON_BODY: RoundedBox = RoundedBox {
+    left: 11.0,
+    top: 14.0,
+    right: 61.0,
+    bottom: 52.0,
+    radius: 12.0,
+};
+const GAME_CENTER_ICON_TAIL: [Point; 3] = [
+    Point { x: 19.0, y: 46.0 },
+    Point { x: 20.0, y: 63.0 },
+    Point { x: 34.0, y: 50.0 },
+];
+const GAME_CENTER_ICON_BUBBLES: [(f32, f32); 4] = [
+    (27.0, 27.5),
+    (45.0, 27.5),
+    (27.0, 40.5),
+    (45.0, 40.5),
+];
+const GAME_CENTER_ICON_BUBBLE_RADIUS: f32 = 5.5;
+
+/// A point in icon space.
+#[derive(Clone, Copy)]
+struct Point {
+    x: f32,
+    y: f32,
+}
+
+/// An axis-aligned box with rounded corners, in icon space.
+struct RoundedBox {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    radius: f32,
+}
+
+impl RoundedBox {
+    fn contains(&self, point: Point) -> bool {
+        if point.x < self.left
+            || point.x > self.right
+            || point.y < self.top
+            || point.y > self.bottom
+        {
+            return false;
+        }
+        // Clamp the point into the rectangle that the corner arcs are drawn
+        // around, then compare the distance to that clamped point.
+        let center_x = point.x.clamp(self.left + self.radius, self.right - self.radius);
+        let center_y = point.y.clamp(self.top + self.radius, self.bottom - self.radius);
+        let (dx, dy) = (point.x - center_x, point.y - center_y);
+        dx * dx + dy * dy <= self.radius * self.radius
+    }
+}
+
+/// Whether `point` is inside the white part of the Game Center icon: the
+/// bubble body plus its tail, minus the four circles, which stay dark.
+fn game_center_glyph_contains(point: Point) -> bool {
+    let inside_body = GAME_CENTER_ICON_BODY.contains(point);
+    let inside_tail = point_in_triangle(point, GAME_CENTER_ICON_TAIL);
+    if !inside_body && !inside_tail {
+        return false;
+    }
+    for (center_x, center_y) in GAME_CENTER_ICON_BUBBLES {
+        let (dx, dy) = (point.x - center_x, point.y - center_y);
+        if dx * dx + dy * dy <= GAME_CENTER_ICON_BUBBLE_RADIUS * GAME_CENTER_ICON_BUBBLE_RADIUS {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `point` lies inside the triangle `a b c`, edges included.
+fn point_in_triangle(point: Point, [a, b, c]: [Point; 3]) -> bool {
+    fn cross(from: Point, to: Point, point: Point) -> f32 {
+        (to.x - from.x) * (point.y - from.y) - (to.y - from.y) * (point.x - from.x)
+    }
+    let ab = cross(a, b, point);
+    let bc = cross(b, c, point);
+    let ca = cross(c, a, point);
+    (ab >= 0.0 && bc >= 0.0 && ca >= 0.0) || (ab <= 0.0 && bc <= 0.0 && ca <= 0.0)
+}
+
+/// Draws the Game Center dock icon.
+///
+/// The icon is rasterised here instead of being shipped as a PNG, so it
+/// follows `ui_scale` and needs no extra binary asset. Painting happens with
+/// 4x4 supersampling on top of the shared [Image] type, which then adds the
+/// same rounded corners and sheen as the other dock icons.
 fn make_game_center_app_icon(env: &mut Environment) -> id {
-    let bytes: &[u8] =
-        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/gamecenter_icon.png"));
-    make_dock_asset_icon(env, bytes)
+    const BACKGROUND: (f32, f32, f32) = (0.25, 0.25, 0.25);
+    const FOREGROUND: (f32, f32, f32) = (1.0, 1.0, 1.0);
+    const SUPERSAMPLE: u32 = 4;
+
+    // Coordinates below are icon points, so the raster size follows the UI
+    // scale.
+    let scale = env.options.ui_scale.get() as f32;
+    let side = (ICON_SIZE.width * scale).round().max(1.0) as u32;
+    let mut pixels = Vec::with_capacity((side * side * 4) as usize);
+    for y in 0..side {
+        for x in 0..side {
+            let mut covered = 0u32;
+            for sample_y in 0..SUPERSAMPLE {
+                for sample_x in 0..SUPERSAMPLE {
+                    let point = Point {
+                        x: (x as f32 + (sample_x as f32 + 0.5) / SUPERSAMPLE as f32) / scale,
+                        y: (y as f32 + (sample_y as f32 + 0.5) / SUPERSAMPLE as f32) / scale,
+                    };
+                    if game_center_glyph_contains(point) {
+                        covered += 1;
+                    }
+                }
+            }
+            let coverage = covered as f32 / (SUPERSAMPLE * SUPERSAMPLE) as f32;
+            let channel = |base: f32, glyph: f32| {
+                ((base + (glyph - base) * coverage) * 255.0).round() as u8
+            };
+            pixels.extend_from_slice(&[
+                channel(BACKGROUND.0, FOREGROUND.0),
+                channel(BACKGROUND.1, FOREGROUND.1),
+                channel(BACKGROUND.2, FOREGROUND.2),
+                255,
+            ]);
+        }
+    }
+
+    let mut image = Image::from_pixels(side, side, pixels);
+    image.round_icon_corners(/* add_sheen: */ true);
+    let cg_image = cg_image::from_image(env, image);
+    let ui_image: id = msg_class![env; UIImage imageWithCGImage:cg_image];
+    release(env, cg_image);
+    ui_image
 }
 
 fn make_browse_app_icon(env: &mut Environment) -> id {
