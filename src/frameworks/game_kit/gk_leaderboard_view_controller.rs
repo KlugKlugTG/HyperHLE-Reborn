@@ -8,11 +8,13 @@
 //! `GKLeaderboardViewController` and `GKAchievementViewController`.
 
 use crate::frameworks::foundation::NSInteger;
+use crate::frameworks::uikit::ui_application::UIInterfaceOrientation;
 use crate::frameworks::uikit::ui_view_controller::UIViewControllerHostObject;
 use crate::objc::{
     id, impl_HostObject_with_superclass, msg, nil, objc_classes, release, retain, ClassExports,
     NSZonePtr,
 };
+use crate::Environment;
 
 type GKLeaderboardTimeScope = NSInteger;
 type GKLeaderboardPlayerScope = NSInteger;
@@ -36,6 +38,9 @@ struct GKLeaderboardViewControllerHostObject {
     /// NSString* — category filter
     category: id,
     time_scope: GKLeaderboardTimeScope,
+    /// Set once the delegate has been told the user is finished, so the
+    /// dismiss callback is delivered exactly once per presentation.
+    did_finish_delivered: bool,
 }
 impl_HostObject_with_superclass!(GKLeaderboardViewControllerHostObject);
 
@@ -50,6 +55,8 @@ struct GKFriendRequestComposeViewControllerHostObject {
     message: id,
     /// NSInteger
     max_recipients: NSInteger,
+    /// See `GKLeaderboardViewControllerHostObject::did_finish_delivered`.
+    did_finish_delivered: bool,
 }
 impl_HostObject_with_superclass!(GKFriendRequestComposeViewControllerHostObject);
 
@@ -60,8 +67,23 @@ struct GKAchievementViewControllerHostObject {
     superclass: UIViewControllerHostObject,
     /// GKAchievementViewControllerDelegate — weak reference
     achievement_delegate: id,
+    /// See `GKLeaderboardViewControllerHostObject::did_finish_delivered`.
+    did_finish_delivered: bool,
 }
 impl_HostObject_with_superclass!(GKAchievementViewControllerHostObject);
+
+/// Host selector used to notify each controller's delegate on the next
+/// run-loop turn. All three controllers take no arguments and share it.
+const DID_FINISH_SELECTOR: &str = "_touchHLE_deliverDidFinish";
+
+/// Ask `controller` to notify its delegate on the next run-loop turn, unless
+/// that has already been requested.
+fn schedule_did_finish(env: &mut Environment, controller: id, selector: &str) {
+    let sel = env
+        .objc
+        .register_host_selector(selector.to_string(), &mut env.mem);
+    () = msg![env; controller performSelector:sel withObject:nil afterDelay:0.0_f64];
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -137,25 +159,61 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())viewWillAppear:(bool)_animated {
     log!("GKLeaderboardViewController viewWillAppear: stubbed");
-    // Immediately dismiss so the app doesn't hang waiting for user interaction.
-    let delegate = env.objc
-        .borrow::<GKLeaderboardViewControllerHostObject>(this)
-        .leaderboard_delegate;
-
-    if delegate != nil {
-        let sel = env.objc.register_host_selector(
-            "leaderboardViewControllerDidFinish:".to_string(),
-            &mut env.mem,
-        );
-        let responds: bool = msg![env; delegate respondsToSelector:sel];
-        if responds {
-            () = msg![env; delegate leaderboardViewControllerDidFinish:this];
-        }
-    }
+    // There is no leaderboard UI to interact with, so the delegate is told
+    // straight away that the user is done, exactly like tapping Done on a
+    // device. That notification is deferred by one run-loop turn rather than
+    // sent from here: on a device the delegate runs after the presentation
+    // has completed, and games use it to restore the status bar, resume
+    // their director and dismiss this controller. Doing that from inside
+    // `-presentModalViewController:animated:` left the game in a state it
+    // never sees on a device (this is the call that used to flip the
+    // screen when a game opened Game Center).
+    schedule_did_finish(env, this, DID_FINISH_SELECTOR);
 }
 
 - (())viewDidAppear:(bool)_animated {
-    // Already dismissed in viewWillAppear — nothing to do.
+    // Nothing to do: `schedule_did_finish` handles the dismissal.
+}
+
+- (())_touchHLE_deliverDidFinish {
+    let already_delivered = env
+        .objc
+        .borrow_mut::<GKLeaderboardViewControllerHostObject>(this)
+        .did_finish_delivered;
+    if already_delivered {
+        return;
+    }
+    env.objc
+        .borrow_mut::<GKLeaderboardViewControllerHostObject>(this)
+        .did_finish_delivered = true;
+    let delegate = env
+        .objc
+        .borrow::<GKLeaderboardViewControllerHostObject>(this)
+        .leaderboard_delegate;
+    if delegate == nil {
+        return;
+    }
+    let sel = env.objc.register_host_selector(
+        "leaderboardViewControllerDidFinish:".to_string(),
+        &mut env.mem,
+    );
+    let responds: bool = msg![env; delegate respondsToSelector:sel];
+    if responds {
+        log!("GKLeaderboardViewController: telling the delegate the user is done");
+        () = msg![env; delegate leaderboardViewControllerDidFinish:this];
+    }
+}
+
+// GameKit's real view controllers present their own chrome and handle
+// rotation themselves. This stand-in shows nothing and exists only to run the
+// delegate callback, so it must not take part in the interface rotation that
+// `UIWindow` applies when a view controller is attached to it.
+- (bool)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)_orientation {
+    false
+}
+
+- (bool)shouldAutorotate {
+    false
 }
 
 - (())presentModalViewController:(id)_vc animated:(bool)_animated {
@@ -245,26 +303,50 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())viewWillAppear:(bool)_animated {
     log!("GKFriendRequestComposeViewController viewWillAppear: stubbed");
-
-    // Эмуляция закрытия окна сразу после "открытия", чтобы игра не висела
-    let delegate = env.objc
-        .borrow::<GKFriendRequestComposeViewControllerHostObject>(this)
-        .compose_view_delegate;
-
-    if delegate != nil {
-        let sel = env.objc.register_host_selector(
-            "friendRequestComposeViewControllerDidFinish:".to_string(),
-            &mut env.mem,
-        );
-        let responds: bool = msg![env; delegate respondsToSelector:sel];
-        if responds {
-            () = msg![env; delegate friendRequestComposeViewControllerDidFinish:this];
-        }
-    }
+    // Close the compose sheet immediately so the game does not hang, but do
+    // it on the next run-loop turn, like a device does (see the leaderboard
+    // controller above).
+    schedule_did_finish(env, this, DID_FINISH_SELECTOR);
 }
 
 - (())viewDidAppear:(bool)_animated {
-    // Уже "закрыто" в viewWillAppear — ничего не делаем.
+    // Nothing to do: `schedule_did_finish` handles the dismissal.
+}
+
+- (())_touchHLE_deliverDidFinish {
+    let already_delivered = env
+        .objc
+        .borrow_mut::<GKFriendRequestComposeViewControllerHostObject>(this)
+        .did_finish_delivered;
+    if already_delivered {
+        return;
+    }
+    env.objc
+        .borrow_mut::<GKFriendRequestComposeViewControllerHostObject>(this)
+        .did_finish_delivered = true;
+    let delegate = env
+        .objc
+        .borrow::<GKFriendRequestComposeViewControllerHostObject>(this)
+        .compose_view_delegate;
+    if delegate == nil {
+        return;
+    }
+    let sel = env.objc.register_host_selector(
+        "friendRequestComposeViewControllerDidFinish:".to_string(),
+        &mut env.mem,
+    );
+    let responds: bool = msg![env; delegate respondsToSelector:sel];
+    if responds {
+        () = msg![env; delegate friendRequestComposeViewControllerDidFinish:this];
+    }
+}
+
+- (bool)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)_orientation {
+    false
+}
+
+- (bool)shouldAutorotate {
+    false
 }
 
 - (())presentModalViewController:(id)_vc animated:(bool)_animated {
@@ -317,25 +399,49 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())viewWillAppear:(bool)_animated {
     log!("GKAchievementViewController viewWillAppear: stubbed");
-    // Immediately dismiss so the app doesn't hang.
-    let delegate = env.objc
-        .borrow::<GKAchievementViewControllerHostObject>(this)
-        .achievement_delegate;
-
-    if delegate != nil {
-        let sel = env.objc.register_host_selector(
-            "achievementViewControllerDidFinish:".to_string(),
-            &mut env.mem,
-        );
-        let responds: bool = msg![env; delegate respondsToSelector:sel];
-        if responds {
-            () = msg![env; delegate achievementViewControllerDidFinish:this];
-        }
-    }
+    // Dismissed on the next run-loop turn, like a device (see the
+    // leaderboard controller above).
+    schedule_did_finish(env, this, DID_FINISH_SELECTOR);
 }
 
 - (())viewDidAppear:(bool)_animated {
-    // Already dismissed in viewWillAppear — nothing to do.
+    // Nothing to do: `schedule_did_finish` handles the dismissal.
+}
+
+- (())_touchHLE_deliverDidFinish {
+    let already_delivered = env
+        .objc
+        .borrow_mut::<GKAchievementViewControllerHostObject>(this)
+        .did_finish_delivered;
+    if already_delivered {
+        return;
+    }
+    env.objc
+        .borrow_mut::<GKAchievementViewControllerHostObject>(this)
+        .did_finish_delivered = true;
+    let delegate = env
+        .objc
+        .borrow::<GKAchievementViewControllerHostObject>(this)
+        .achievement_delegate;
+    if delegate == nil {
+        return;
+    }
+    let sel = env.objc.register_host_selector(
+        "achievementViewControllerDidFinish:".to_string(),
+        &mut env.mem,
+    );
+    let responds: bool = msg![env; delegate respondsToSelector:sel];
+    if responds {
+        () = msg![env; delegate achievementViewControllerDidFinish:this];
+    }
+}
+
+- (bool)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)_orientation {
+    false
+}
+
+- (bool)shouldAutorotate {
+    false
 }
 
 - (())presentModalViewController:(id)_vc animated:(bool)_animated {

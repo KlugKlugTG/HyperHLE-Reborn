@@ -125,9 +125,14 @@ pub(super) fn run_game_center(
             dirty = true;
         }
         if actions.back {
+            // The left navigation button doubles as Back (inside a game) and
+            // as the way out of the screen (on a tab), because there is no
+            // other exit: this screen runs its own run loop.
             if matches!(screen, Screen::Detail(_)) {
                 screen = Screen::List(list_tab);
                 dirty = true;
+            } else {
+                break;
             }
         }
         if actions.reset {
@@ -239,7 +244,7 @@ fn build_views(
         clear,
         white,
     );
-    () = msg![env; back_button setHidden:true];
+    () = msg![env; back_button setHidden:false];
     let reset_button = make_button(
         env,
         delegate,
@@ -426,7 +431,12 @@ fn render(env: &mut Environment, views: &mut GameCenterViews, screen: &Screen) {
     };
     set_label(env, views.nav_title, &nav_title);
     set_label(env, views.status, &status);
-    () = msg![env; (views.back_button) setHidden:(!matches!(screen, Screen::Detail(_)))];
+    let back_title = if matches!(screen, Screen::Detail(_)) {
+        "< Back"
+    } else {
+        "Done"
+    };
+    set_button_title(env, views.back_button, back_title);
 
     let mut cursor = 4.0;
     match screen {

@@ -147,22 +147,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setOrientation:(UIDeviceOrientation)orientation {
-    // On iOS nothing can rotate the hardware from app code; this property has
-    // been deprecated since iOS 3.0. touchHLE honours it because games use it
-    // to pick an orientation at launch, but not while a view controller is
-    // being presented, where the call comes from a delegate finishing up a
-    // modal (GameKit closes its own view controller that way) rather than
-    // from the game choosing an orientation. Rotating there flipped the
-    // screen when a game opened Game Center.
-    if env.framework_state.uikit.modal_presentation_depth > 0 {
-        log!(
-            "UIDevice setOrientation:{} ignored: a view controller is being \
-             presented, so the emulated device is not rotated.",
-            orientation
-        );
-        return;
-    }
-    log!("UIDevice setOrientation:{}: rotating the emulated device", orientation);
     env.window_mut().rotate_device(match orientation {
         UIDeviceOrientationPortrait      => DeviceOrientation::Portrait,
         UIDeviceOrientationPortraitUpsideDown => DeviceOrientation::PortraitUpsideDown,
