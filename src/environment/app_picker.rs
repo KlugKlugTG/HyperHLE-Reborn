@@ -75,23 +75,6 @@ struct AppInfo {
     icon_ui_image: Option<id>,
 }
 
-const LAST_APP_FILE: &str = "touchHLE_last_app.txt";
-
-fn last_app_record_path() -> PathBuf {
-    paths::user_data_base_path().join(LAST_APP_FILE)
-}
-
-fn read_last_app_path() -> Option<PathBuf> {
-    let value = std::fs::read_to_string(last_app_record_path()).ok()?;
-    Some(PathBuf::from(value.trim()))
-}
-
-fn remember_last_app_path(path: &Path) {
-    if let Err(error) = std::fs::write(last_app_record_path(), path.to_string_lossy().as_bytes()) {
-        log!("Warning: couldn't save last launched app path: {error}");
-    }
-}
-
 pub fn app_picker(options: Options, show_lock_screen: bool) -> Result<(PathBuf, Vec<String>), String> {
     let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
 
@@ -350,7 +333,6 @@ struct AppPickerDelegateHostObject {
     // Set by the add-app tile; kept separately from icon_tapped because the
     // picker needs to wait for a newly copied IPA to settle before reloading.
     add_ipa: bool,
-    recent_app_tapped: bool,
     status_accessory_tapped: bool,
     access_prompt_confirm: bool,
     access_prompt_cancel: bool,
@@ -374,6 +356,9 @@ struct AppPickerDelegateHostObject {
     game_center_show: bool,
     game_center_close: bool,
     game_center_reset: bool,
+    game_center_tab: Option<NSInteger>,
+    game_center_back: bool,
+    game_center_tap: Option<CGPoint>,
     settings_show: bool,
     settings_hide: bool,
     scale_hack_default: bool,
@@ -685,6 +670,18 @@ const CLASSES: ClassExports = objc_classes! {
 - (())gameCenterReset {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).game_center_reset = true;
 }
+- (())gameCenterBack {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).game_center_back = true;
+}
+- (())gameCenterTab:(id)sender {
+    let tag: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).game_center_tab = Some(tag);
+}
+- (())gameCenterTap:(id)sender {
+    let view: id = msg![env; sender view];
+    let point: CGPoint = msg![env; sender locationInView:view];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).game_center_tap = Some(point);
+}
 - (())archiveStoreTap:(id)sender {
     let view: id = msg![env; sender view];
     let point: CGPoint = msg![env; sender locationInView:view];
@@ -851,9 +848,6 @@ const CLASSES: ClassExports = objc_classes! {
         host.lock_screen_unlocked = true;
     }
 }
-- (())openRecentApp {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).recent_app_tapped = true;
-}
 
 @end
 
@@ -1008,29 +1002,6 @@ fn app_picker_inner(
     () = msg![env; swipe_right setDirection:UISwipeGestureRecognizerDirectionRight];
     () = msg![env; main_view addGestureRecognizer:swipe_right];
 
-    // Resolve the last launched app for the dock shortcut. The record is a
-    // path under the apps directory, and is ignored if that app was removed.
-    let remembered_app_path = read_last_app_path();
-    let recent_app = apps.as_mut().ok().and_then(|apps| {
-        let app = apps.iter_mut().find(|app| {
-            remembered_app_path
-                .as_ref()
-                .is_some_and(|path| path == &app.path)
-        })?;
-        let image = if let Some(icon) = app.icon.as_ref() {
-            let cg_image = cg_image::from_image(env, icon.clone());
-            msg_class![env; UIImage imageWithCGImage:cg_image]
-        } else {
-            make_icon_from_text(
-                env,
-                &app.display_name.chars().take(2).collect::<String>(),
-                28.0,
-                0.0,
-                (0.35, 0.35, 0.35, 1.0),
-            )
-        };
-        Some((app.path.clone(), app.display_name.clone(), image))
-    });
     let mut icon_grid_stuff = match &mut apps {
         Ok(ref mut apps) => {
             let mut icon_grid_stuff =
@@ -1067,13 +1038,7 @@ fn app_picker_inner(
         page_dots = make_page_dots(env, main_view, app_frame.size, grid.pages.len());
         update_page_dots(env, &page_dots, 0);
     }
-    let dock = make_dock(
-        env,
-        delegate,
-        main_view,
-        app_frame.size,
-        recent_app.as_ref().map(|(_, name, image)| (name.as_str(), *image)),
-    );
+    let dock = make_dock(env, delegate, main_view, app_frame.size);
     // Build stamp on the page-dot row, right-aligned like the one in the
     // reference home screen. It is added after the dock so nothing covers it.
     let version_label = {
@@ -1404,7 +1369,6 @@ fn app_picker_inner(
             {
                 Some(app_idx) => {
                     let app_path = apps.as_ref().unwrap()[app_idx].path.clone();
-                    remember_last_app_path(&app_path);
                     echo!("Picked: {}", app_path.display());
                     // iOS-style launch: the icon travels to the middle of the
                     // screen while the screen fades to black.
@@ -1488,12 +1452,6 @@ fn app_picker_inner(
         }
 
         let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
-        if std::mem::take(&mut host_obj.recent_app_tapped) {
-            if let Some((path, _, _)) = recent_app.as_ref() {
-                echo!("Picked last launched app: {}", path.display());
-                break path.clone();
-            }
-        }
         if std::mem::take(&mut host_obj.add_ipa) {
             // Snapshot the .ipa files that exist right now, so that when the
             // system file picker finishes, we can detect the new file and
@@ -2884,13 +2842,7 @@ const DOCK_LABEL_HEIGHT: CGFloat = 12.0;
 
 /// Builds the old-iOS dock at the bottom of the home screen. The shortcuts
 /// live outside the paged grid, so they stay in place while pages slide.
-fn make_dock(
-    env: &mut Environment,
-    delegate: id,
-    main_view: id,
-    screen_size: CGSize,
-    recent_app: Option<(&str, id)>,
-) -> id {
+fn make_dock(env: &mut Environment, delegate: id, main_view: id, screen_size: CGSize) -> id {
     let width = screen_size.width;
     let dock_inset = 6.0;
     let dock_width = width - dock_inset * 2.0;
@@ -2903,9 +2855,9 @@ fn make_dock(
     let hairline = new_view(env, rect(12.0, 0.0, dock_width - 24.0, 1.0), hairline_color);
     () = msg![env; dock addSubview:hairline];
 
-    let count: CGFloat = 5.0;
+    let count: CGFloat = 4.0;
     let side_inset: CGFloat = 8.0;
-    // Shrink the icons on narrow screens so five shortcuts still fit: an
+    // Shrink the icons on narrow screens so four shortcuts still fit: an
     // iPhone-sized dock is only 308 points wide.
     let icon_size = ((dock_width - side_inset * 2.0) / count - 8.0).clamp(36.0, DOCK_ICON_SIZE);
     let gap = ((dock_width - side_inset * 2.0 - icon_size * count) / (count - 1.0))
@@ -2914,9 +2866,8 @@ fn make_dock(
 
     let plus_image = make_icon_from_text(env, "+", 50.0, -6.0, (0.25, 0.25, 0.25, 1.0));
     let settings_image = make_settings_app_icon(env);
-    let recent_placeholder = make_icon_from_text(env, "↻", 34.0, 0.0, (0.25, 0.25, 0.25, 1.0));
     let browse_image = make_browse_app_icon(env);
-    let game_center_image = make_icon_from_text(env, "GC", 34.0, 0.0, (0.09, 0.36, 0.27, 1.0));
+    let game_center_image = make_game_center_app_icon(env);
     let step = icon_size + gap;
     make_dock_item(env, delegate, dock, first_x, icon_size, plus_image, "Add .ipa", "addIpa");
     make_dock_item(
@@ -2929,9 +2880,6 @@ fn make_dock(
         "Settings",
         "settingsShow",
     );
-    let (recent_label, recent_image) = recent_app
-        .map(|(name, image)| (name, image))
-        .unwrap_or(("Recent app", recent_placeholder));
     make_dock_item(
         env,
         delegate,
@@ -2951,16 +2899,6 @@ fn make_dock(
         game_center_image,
         "Game Center",
         "gameCenterShow",
-    );
-    make_dock_item(
-        env,
-        delegate,
-        dock,
-        first_x + step * 4.0,
-        icon_size,
-        recent_image,
-        recent_label,
-        "openRecentApp",
     );
     () = msg![env; main_view addSubview:dock];
     dock
@@ -3586,7 +3524,14 @@ fn make_dock_asset_icon(env: &mut Environment, bytes: &[u8]) -> id {
 }
 
 fn make_settings_app_icon(env: &mut Environment) -> id {
-    let bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/settings_icon.png"));
+    let bytes: &[u8] =
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/settings_icon.png"));
+    make_dock_asset_icon(env, bytes)
+}
+
+fn make_game_center_app_icon(env: &mut Environment) -> id {
+    let bytes: &[u8] =
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/gamecenter_icon.png"));
     make_dock_asset_icon(env, bytes)
 }
 

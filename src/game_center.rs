@@ -60,6 +60,18 @@ pub struct Achievement {
     pub last_reported: u64,
 }
 
+impl Achievement {
+    /// Human-readable name for the achievement.
+    ///
+    /// Apple serves achievement titles from the App Store, which is not
+    /// reachable here, so the title is derived from the identifier the game
+    /// reported to. Games that ship their own titles read them from their own
+    /// resources, so this is only what the emulator can show.
+    pub fn title(&self) -> String {
+        humanize_identifier(&self.identifier)
+    }
+}
+
 /// One leaderboard entry: the best score reported for a leaderboard.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Score {
@@ -71,6 +83,13 @@ pub struct Score {
     pub formatted: String,
     /// Unix timestamp (seconds) of the most recent report.
     pub last_reported: u64,
+}
+
+impl Score {
+    /// Human-readable name for the leaderboard, derived from its identifier.
+    pub fn title(&self) -> String {
+        humanize_identifier(&self.leaderboard)
+    }
 }
 
 /// Everything recorded for one app.
@@ -331,17 +350,24 @@ impl Store {
         now: u64,
     ) -> ScoreUpdate {
         let record = app_record(&mut self.apps, bundle_id, display_name);
+        // The first report for a leaderboard is always the best score so far,
+        // which is why it cannot be merged with the `value > score.value`
+        // check below: creating the entry already stores that value.
+        let mut new_best = false;
         let score = record
             .scores
             .entry(leaderboard.to_string())
-            .or_insert_with(|| Score {
-                leaderboard: leaderboard.to_string(),
-                value,
-                formatted: formatted.to_string(),
-                last_reported: now,
+            .or_insert_with(|| {
+                new_best = true;
+                Score {
+                    leaderboard: leaderboard.to_string(),
+                    value,
+                    formatted: formatted.to_string(),
+                    last_reported: now,
+                }
             });
-        let new_best = value > score.value;
-        if new_best {
+        if value > score.value {
+            new_best = true;
             score.value = value;
             score.formatted = formatted.to_string();
         }
@@ -357,6 +383,157 @@ fn format_percent(percent: f64) -> String {
         format!("{}", percent as i64)
     } else {
         format!("{percent}")
+    }
+}
+
+/// Turn an identifier into something a person can read.
+///
+/// Game Center identifiers are machine-oriented, e.g.
+/// `com.studio.game.achievements.first_win`, `ACH_FIRST_WIN`, `firstWin` or
+/// `level-3`. The reverse-DNS prefix and a leading generic part (`ach`,
+/// `achievements`, `lb`, `leaderboard`) carry no information for the player,
+/// so they are dropped, and what is left is split on punctuation and
+/// camel-case boundaries and capitalised.
+///
+/// Capitalisation keeps words recognisable: a mixed-case word is left alone
+/// (`iPhone`), an all-caps word stays an acronym when the identifier is mixed
+/// case and the word is short (`earn_XP`), and otherwise words are title-cased
+/// (`ACH_FIRST_WIN` becomes "First Win").
+pub fn humanize_identifier(identifier: &str) -> String {
+    let name = strip_generic_prefix(strip_reverse_dns_prefix(identifier));
+    // An identifier that is entirely upper case is shouting, not an acronym:
+    // title-casing its words reads much better.
+    let identifier_is_all_caps = !identifier.chars().any(|character| character.is_lowercase());
+
+    let characters: Vec<char> = name.chars().collect();
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut previous: Option<char> = None;
+    for (index, &character) in characters.iter().enumerate() {
+        if is_word_separator(character) {
+            push_word(&mut words, &mut current, identifier_is_all_caps);
+            previous = None;
+            continue;
+        }
+        // Split `firstWin` and `level1` into separate words.
+        let next_is_lowercase = characters
+            .get(index + 1)
+            .is_some_and(|next| next.is_lowercase());
+        let single_letter_prefix = current.chars().count() == 1;
+        let boundary = previous.is_some_and(|previous| {
+            // `iPhone` and `iOS` are single words, so a hump right after one
+            // letter is not a word break.
+            let camel_hump = previous.is_lowercase()
+                && character.is_uppercase()
+                && !(next_is_lowercase && single_letter_prefix);
+            let digit_boundary = (previous.is_alphabetic() && character.is_ascii_digit())
+                || (previous.is_ascii_digit() && character.is_alphabetic());
+            camel_hump || digit_boundary
+        });
+        if boundary {
+            push_word(&mut words, &mut current, identifier_is_all_caps);
+        }
+        current.push(character);
+        previous = Some(character);
+    }
+    push_word(&mut words, &mut current, identifier_is_all_caps);
+
+    if words.is_empty() {
+        // Nothing readable (e.g. an identifier of only separators): show the
+        // original so the player can still tell entries apart.
+        return identifier.trim().to_string();
+    }
+    words.join(" ")
+}
+
+/// Characters that separate words in an identifier.
+fn is_word_separator(character: char) -> bool {
+    matches!(character, '.' | '_' | '-' | ':' | '/' | '\\' | ' ')
+}
+
+/// Leading identifier components that only say what kind of record this is,
+/// and so are useless as part of a title.
+const GENERIC_PREFIXES: &[&str] = &["ach", "achievement", "achievements", "lb", "leaderboard"];
+
+/// Drop a leading reverse-DNS prefix such as `com.studio.game` from an
+/// identifier, always keeping the last component.
+///
+/// A component counts as part of the prefix only if it looks like a bundle
+/// identifier component (lowercase ASCII letters, digits, `-` and `_`), and
+/// the first component must be short, because it is conventionally a
+/// top-level domain such as `com`. That keeps names like `Level.3.Boss` or
+/// `game.first` intact.
+fn strip_reverse_dns_prefix(identifier: &str) -> &str {
+    let parts: Vec<&str> = identifier.split('.').collect();
+    if parts.len() < 2 {
+        return identifier;
+    }
+    let mut prefix_length = 0;
+    let mut index = 0;
+    while index + 1 < parts.len() {
+        let part = parts[index];
+        let looks_like_bundle_component = !part.is_empty()
+            && part.chars().all(|character| {
+                character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || character == '-'
+                    || character == '_'
+            });
+        if !looks_like_bundle_component || (index == 0 && part.len() > 4) {
+            break;
+        }
+        prefix_length += part.len() + 1; // + the separating dot
+        index += 1;
+    }
+    &identifier[prefix_length..]
+}
+
+/// Drop a leading `ach.`/`ach_`/`lb_`-style component, so that
+/// `ach_first_win` and `achievements.first_win` both read "First Win".
+fn strip_generic_prefix(identifier: &str) -> &str {
+    let Some(separator) = identifier.find(is_word_separator) else {
+        return identifier;
+    };
+    let head = identifier[..separator].to_lowercase();
+    let rest = &identifier[separator + separator.len_utf8()..];
+    if rest.is_empty() || !GENERIC_PREFIXES.contains(&head.as_str()) {
+        return identifier;
+    }
+    // Recursively drop further generic parts (`achievements.ach.first_win`).
+    strip_generic_prefix(rest)
+}
+
+/// Push a finished word into `words`, normalising its capitalisation first.
+fn push_word(words: &mut Vec<String>, current: &mut String, identifier_is_all_caps: bool) {
+    if current.is_empty() {
+        return;
+    }
+    let word = std::mem::take(current);
+    words.push(normalize_word(&word, identifier_is_all_caps));
+}
+
+/// Apply the capitalisation rules described on [humanize_identifier].
+fn normalize_word(word: &str, identifier_is_all_caps: bool) -> String {
+    let has_lowercase = word.chars().any(|character| character.is_lowercase());
+    let has_uppercase = word.chars().any(|character| character.is_uppercase());
+    let has_letters = word.chars().any(|character| character.is_alphabetic());
+    if has_lowercase && has_uppercase {
+        // Mixed case is a word the developer wrote deliberately, e.g. `iPhone`.
+        return word.to_string();
+    }
+    if has_letters && !has_lowercase && !identifier_is_all_caps && word.chars().count() <= 4 {
+        // A short all-caps word inside a mixed-case identifier is an acronym.
+        return word.to_string();
+    }
+    let word = if has_lowercase {
+        word.to_string()
+    } else {
+        word.to_lowercase()
+    };
+    let mut characters = word.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
     }
 }
 
@@ -501,6 +678,49 @@ pub fn summary() -> Vec<AppRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identifiers_become_readable_titles() {
+        assert_eq!(
+            humanize_identifier("com.studio.game.achievements.first_win"),
+            "First Win"
+        );
+        // A leading `ach`/`achievements`/`lb` part says nothing to the player.
+        assert_eq!(humanize_identifier("ach_first_win"), "First Win");
+        assert_eq!(humanize_identifier("ACH_FIRST_WIN"), "First Win");
+        assert_eq!(humanize_identifier("lb.best_time"), "Best Time");
+        assert_eq!(humanize_identifier("ACH_LEVEL_3_DONE"), "Level 3 Done");
+        assert_eq!(humanize_identifier("firstWin"), "First Win");
+        assert_eq!(humanize_identifier("level-3"), "Level 3");
+        assert_eq!(humanize_identifier("com.studio.game.ach.level1"), "Level 1");
+        // A dotted name that is not a bundle prefix keeps all its parts.
+        assert_eq!(humanize_identifier("Level.3.Boss"), "Level 3 Boss");
+        // A short all-caps word inside a mixed-case identifier is an acronym.
+        assert_eq!(humanize_identifier("earn_XP"), "Earn XP");
+        // Mixed case is preserved as the developer wrote it.
+        assert_eq!(humanize_identifier("buy_iPhone_case"), "Buy iPhone Case");
+        // An identifier without a bundle prefix is used as-is.
+        assert_eq!(humanize_identifier("total_score"), "Total Score");
+        // Only generic parts: nothing to strip down to.
+        assert_eq!(humanize_identifier("ach"), "Ach");
+        // Nothing readable: fall back to the original.
+        assert_eq!(humanize_identifier("___"), "___");
+        assert_eq!(humanize_identifier(""), "");
+    }
+
+    #[test]
+    fn titles_come_from_the_identifier() {
+        let achievement = Achievement {
+            identifier: "com.studio.game.ach.first_win".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(achievement.title(), "First Win");
+        let score = Score {
+            leaderboard: "com.studio.game.lb.best_time".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(score.title(), "Best Time");
+    }
 
     #[test]
     fn escapes_and_unescapes_awkward_identifiers() {
