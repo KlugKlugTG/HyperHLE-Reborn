@@ -1031,6 +1031,16 @@ pub struct State {
     pub ui_view: ui_view::State,
     ui_responder: ui_responder::State,
     pub autorotation_transform_applied: bool,
+    /// How many modal view controller presentations are in progress.
+    ///
+    /// A presented view controller's delegate usually runs before
+    /// `-presentModalViewController:animated:` returns (GameKit dismisses its
+    /// own view controllers from `-viewWillAppear:`), and such code often
+    /// touches the status bar or the device orientation. Rotation requests
+    /// see this counter and leave the emulated device alone while it is
+    /// non-zero, because rotating mid-transition leaves the app's already
+    /// laid out views sideways.
+    pub modal_presentation_depth: u32,
 }
 
 /// For use by `NSRunLoop`: handles any events that have queued up.

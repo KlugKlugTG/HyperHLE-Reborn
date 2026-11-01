@@ -245,6 +245,23 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setStatusBarOrientation:(UIInterfaceOrientation)orientation {
     // touchHLE rotates the simulated device here, because many old games call
     // this to pick their orientation and then rotate their drawing to match.
+    // On a real device this property only changes the status bar, so the
+    // rotation is a heuristic, and it is skipped in two cases where it would
+    // do more harm than good (see the comments below).
+    if env.framework_state.uikit.modal_presentation_depth > 0 {
+        // A presented view controller's delegate runs before
+        // `-presentModalViewController:animated:` returns, and what it does
+        // there (GameKit dismissing its own view controller, a pause menu
+        // restoring the status bar, ...) is not the app choosing an
+        // orientation. Rotating at that point left games drawing sideways
+        // whenever they opened Game Center.
+        log!(
+            "setStatusBarOrientation:{} ignored: a view controller is being \
+             presented, so the emulated device is not rotated.",
+            orientation
+        );
+        return;
+    }
     // Once a root view controller has been autorotated to landscape, though,
     // its view has landscape bounds and the app draws for that, so going back
     // to portrait would show its landscape frame cropped inside a portrait

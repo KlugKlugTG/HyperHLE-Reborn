@@ -106,6 +106,184 @@ impl HostObject for UIViewControllerHostObject {}
 // Apple's UIRectEdgeAll = UIRectEdgeTop|UIRectEdgeLeft|UIRectEdgeBottom|UIRectEdgeRight = 15
 const UI_RECT_EDGE_ALL: NSUInteger = 15;
 
+/// Implementation of `-presentModalViewController:animated:`.
+///
+/// Kept out of the Objective-C method so that the method can count modal
+/// presentations while this body runs, and rotation requests can then tell a
+/// launch-time orientation choice apart from a mid-presentation one.
+fn present_modal(env: &mut Environment, this: id, modal_vc: id, animated: bool) {
+    let modal_class_name = if modal_vc == nil {
+        "<nil>".to_string()
+    } else {
+        let modal_class: Class = msg![env; modal_vc class];
+        env.objc.get_class_name(modal_class).to_owned()
+    };
+    let presenter_class: Class = msg![env; this class];
+    let presenter_class_name = env.objc.get_class_name(presenter_class).to_owned();
+    log!(
+        "[(UIViewController*){:?} {} presentModalViewController:{:?} {} animated:{}]",
+        this,
+        presenter_class_name,
+        modal_vc,
+        modal_class_name,
+        animated
+    );
+    if modal_vc == nil {
+        return;
+    }
+
+    // The presenting view controller retains the presented one until it is
+    // dismissed. The reverse pointer (`presenting_view_controller`) is a weak
+    // back-reference per Apple's UIViewController documentation.
+    retain(env, modal_vc);
+    let host_obj = env.objc.borrow_mut::<UIViewControllerHostObject>(this);
+    let old_modal = std::mem::replace(&mut host_obj.presented_view_controller, modal_vc);
+    if old_modal != nil {
+        log!(
+            "WARNING: presentModalViewController: replacing existing presented vc {:?} on {:?}",
+            old_modal, this
+        );
+        let old_view = env.objc.borrow::<UIViewControllerHostObject>(old_modal).view;
+        if old_view != nil {
+            () = msg![env; old_view removeFromSuperview];
+        }
+        let old_host = env.objc.borrow_mut::<UIViewControllerHostObject>(old_modal);
+        if old_host.presenting_view_controller == this {
+            old_host.presenting_view_controller = nil;
+        }
+        release(env, old_modal);
+    }
+    env.objc.borrow_mut::<UIViewControllerHostObject>(modal_vc).presenting_view_controller = this;
+
+    // Trigger -loadView/-viewDidLoad if the view hasn't been instantiated yet.
+    let modal_view: id = msg![env; modal_vc view];
+    if modal_view == nil {
+        log!(
+            "WARNING: presentModalViewController: modal vc {:?} has no view",
+            modal_vc
+        );
+        return;
+    }
+
+    if modal_class_name == "AgeGateView" {
+        if let Some(callback) = env.objc.lookup_selector("ageGateDidCompleted") {
+            let app: id = msg_class![env; UIApplication sharedApplication];
+            let delegate: id = msg![env; app delegate];
+            if delegate != nil
+                && env
+                    .objc
+                    .object_has_method_named(&env.mem, delegate, "ageGateDidCompleted")
+            {
+                log!("AgeGateView detected: completing age gate automatically on app delegate {:?}", delegate);
+                // The app hosts its age gate in a dedicated UIWindow which it
+                // makes key *before* presenting the gate. Because we complete
+                // the gate synchronously instead of running the real
+                // present/dismiss cycle, that helper window would otherwise
+                // stay key, visible and empty on top of the game window,
+                // swallowing every touch forever. Capture it first, run the
+                // completion callback, then hide it and hand key back to the
+                // presenter's (game) window so the UI underneath is reachable.
+                let gate_window: id = msg![env; app keyWindow];
+                let presenter_view: id = msg![env; this view];
+                let presenter_window: id = if presenter_view != nil {
+                    msg![env; presenter_view window]
+                } else {
+                    nil
+                };
+                let _: () = crate::objc::msg_send_no_type_checking(env, (delegate, callback));
+                if gate_window != nil && gate_window != presenter_window {
+                    () = msg![env; gate_window setHidden:true];
+                    let restore: id = if presenter_window != nil {
+                        presenter_window
+                    } else {
+                        // Fall back to the first other visible window.
+                        let windows: id = msg![env; app windows];
+                        let count: NSUInteger = msg![env; windows count];
+                        let mut found: id = nil;
+                        let mut idx: NSUInteger = 0;
+                        while idx < count {
+                            let candidate: id = msg![env; windows objectAtIndex:idx];
+                            let hidden: bool = msg![env; candidate isHidden];
+                            if !hidden && candidate != gate_window {
+                                found = candidate;
+                                break;
+                            }
+                            idx += 1;
+                        }
+                        found
+                    };
+                    if restore != nil {
+                        () = msg![env; restore makeKeyWindow];
+                    }
+                }
+                return;
+            }
+            log!("WARNING: UIApplication delegate is nil; cannot complete age gate");
+        }
+        log!("WARNING: AgeGateView callback ageGateDidCompleted is unavailable");
+    }
+
+    // Locate a window to host the modal view. Prefer the presenting view's
+    // window, but if the controller isn't attached yet fall back to the app's
+    // key window or, failing that, the first visible window.
+    let presenter_view: id = msg![env; this view];
+    let mut window: id = if presenter_view != nil {
+        msg![env; presenter_view window]
+    } else {
+        nil
+    };
+    if window == nil {
+        let app: id = msg_class![env; UIApplication sharedApplication];
+        window = msg![env; app keyWindow];
+    }
+    if window == nil {
+        let app: id = msg_class![env; UIApplication sharedApplication];
+        let windows: id = msg![env; app windows];
+        let count: NSUInteger = msg![env; windows count];
+        let mut idx: NSUInteger = 0;
+        while idx < count {
+            let candidate: id = msg![env; windows objectAtIndex:idx];
+            let hidden: bool = msg![env; candidate isHidden];
+            if !hidden {
+                window = candidate;
+                break;
+            }
+            idx += 1;
+        }
+    }
+    if window == nil {
+        log!(
+            "WARNING: presentModalViewController: no window found for {:?}",
+            this
+        );
+        return;
+    }
+
+    env.objc
+        .borrow_mut::<UIViewControllerHostObject>(modal_vc)
+        .is_being_presented = true;
+    () = msg![env; modal_vc viewWillAppear:animated];
+    // UIWindow's -addSubview: applies the auto-rotation transform when the
+    // view has an associated UIViewController and posts the appropriate
+    // appearance hooks for the new view, so we route through the window
+    // directly instead of adding the view to the presenter's view.
+    () = msg![env; window addSubview:modal_view];
+    () = msg![env; modal_vc viewDidAppear:animated];
+    env.objc
+        .borrow_mut::<UIViewControllerHostObject>(modal_vc)
+        .is_being_presented = false;
+
+
+    // The modal hierarchy is now fully attached to a window. Any UIWebView
+    // load deferred because the view had no on-screen extent yet (e.g.
+    // Chrome's ToS screen, whose webview never receives -setFrame: again)
+    // gets another chance right now, synchronously — the NSTimer-based
+    // poll has never been observed to fire on Android.
+    crate::frameworks::uikit::ui_view::ui_web_view::retry_pending_loads_in_subtree(
+        env, modal_view,
+    );
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -607,176 +785,22 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())presentModalViewController:(id)modal_vc animated:(bool)animated {
-    let modal_class_name = if modal_vc == nil {
-        "<nil>".to_string()
-    } else {
-        let modal_class: Class = msg![env; modal_vc class];
-        env.objc.get_class_name(modal_class).to_owned()
-    };
-    let presenter_class: Class = msg![env; this class];
-    let presenter_class_name = env.objc.get_class_name(presenter_class).to_owned();
-    log!(
-        "[(UIViewController*){:?} {} presentModalViewController:{:?} {} animated:{}]",
-        this,
-        presenter_class_name,
-        modal_vc,
-        modal_class_name,
-        animated
-    );
-    if modal_vc == nil {
-        return;
-    }
-
-    // The presenting view controller retains the presented one until it is
-    // dismissed. The reverse pointer (`presenting_view_controller`) is a weak
-    // back-reference per Apple's UIViewController documentation.
-    retain(env, modal_vc);
-    let host_obj = env.objc.borrow_mut::<UIViewControllerHostObject>(this);
-    let old_modal = std::mem::replace(&mut host_obj.presented_view_controller, modal_vc);
-    if old_modal != nil {
-        log!(
-            "WARNING: presentModalViewController: replacing existing presented vc {:?} on {:?}",
-            old_modal, this
-        );
-        let old_view = env.objc.borrow::<UIViewControllerHostObject>(old_modal).view;
-        if old_view != nil {
-            () = msg![env; old_view removeFromSuperview];
-        }
-        let old_host = env.objc.borrow_mut::<UIViewControllerHostObject>(old_modal);
-        if old_host.presenting_view_controller == this {
-            old_host.presenting_view_controller = nil;
-        }
-        release(env, old_modal);
-    }
-    env.objc.borrow_mut::<UIViewControllerHostObject>(modal_vc).presenting_view_controller = this;
-
-    // Trigger -loadView/-viewDidLoad if the view hasn't been instantiated yet.
-    let modal_view: id = msg![env; modal_vc view];
-    if modal_view == nil {
-        log!(
-            "WARNING: presentModalViewController: modal vc {:?} has no view",
-            modal_vc
-        );
-        return;
-    }
-
-    if modal_class_name == "AgeGateView" {
-        if let Some(callback) = env.objc.lookup_selector("ageGateDidCompleted") {
-            let app: id = msg_class![env; UIApplication sharedApplication];
-            let delegate: id = msg![env; app delegate];
-            if delegate != nil
-                && env
-                    .objc
-                    .object_has_method_named(&env.mem, delegate, "ageGateDidCompleted")
-            {
-                log!("AgeGateView detected: completing age gate automatically on app delegate {:?}", delegate);
-                // The app hosts its age gate in a dedicated UIWindow which it
-                // makes key *before* presenting the gate. Because we complete
-                // the gate synchronously instead of running the real
-                // present/dismiss cycle, that helper window would otherwise
-                // stay key, visible and empty on top of the game window,
-                // swallowing every touch forever. Capture it first, run the
-                // completion callback, then hide it and hand key back to the
-                // presenter's (game) window so the UI underneath is reachable.
-                let gate_window: id = msg![env; app keyWindow];
-                let presenter_view: id = msg![env; this view];
-                let presenter_window: id = if presenter_view != nil {
-                    msg![env; presenter_view window]
-                } else {
-                    nil
-                };
-                let _: () = crate::objc::msg_send_no_type_checking(env, (delegate, callback));
-                if gate_window != nil && gate_window != presenter_window {
-                    () = msg![env; gate_window setHidden:true];
-                    let restore: id = if presenter_window != nil {
-                        presenter_window
-                    } else {
-                        // Fall back to the first other visible window.
-                        let windows: id = msg![env; app windows];
-                        let count: NSUInteger = msg![env; windows count];
-                        let mut found: id = nil;
-                        let mut idx: NSUInteger = 0;
-                        while idx < count {
-                            let candidate: id = msg![env; windows objectAtIndex:idx];
-                            let hidden: bool = msg![env; candidate isHidden];
-                            if !hidden && candidate != gate_window {
-                                found = candidate;
-                                break;
-                            }
-                            idx += 1;
-                        }
-                        found
-                    };
-                    if restore != nil {
-                        () = msg![env; restore makeKeyWindow];
-                    }
-                }
-                return;
-            }
-            log!("WARNING: UIApplication delegate is nil; cannot complete age gate");
-        }
-        log!("WARNING: AgeGateView callback ageGateDidCompleted is unavailable");
-    }
-
-    // Locate a window to host the modal view. Prefer the presenting view's
-    // window, but if the controller isn't attached yet fall back to the app's
-    // key window or, failing that, the first visible window.
-    let presenter_view: id = msg![env; this view];
-    let mut window: id = if presenter_view != nil {
-        msg![env; presenter_view window]
-    } else {
-        nil
-    };
-    if window == nil {
-        let app: id = msg_class![env; UIApplication sharedApplication];
-        window = msg![env; app keyWindow];
-    }
-    if window == nil {
-        let app: id = msg_class![env; UIApplication sharedApplication];
-        let windows: id = msg![env; app windows];
-        let count: NSUInteger = msg![env; windows count];
-        let mut idx: NSUInteger = 0;
-        while idx < count {
-            let candidate: id = msg![env; windows objectAtIndex:idx];
-            let hidden: bool = msg![env; candidate isHidden];
-            if !hidden {
-                window = candidate;
-                break;
-            }
-            idx += 1;
-        }
-    }
-    if window == nil {
-        log!(
-            "WARNING: presentModalViewController: no window found for {:?}",
-            this
-        );
-        return;
-    }
-
-    env.objc
-        .borrow_mut::<UIViewControllerHostObject>(modal_vc)
-        .is_being_presented = true;
-    () = msg![env; modal_vc viewWillAppear:animated];
-    // UIWindow's -addSubview: applies the auto-rotation transform when the
-    // view has an associated UIViewController and posts the appropriate
-    // appearance hooks for the new view, so we route through the window
-    // directly instead of adding the view to the presenter's view.
-    () = msg![env; window addSubview:modal_view];
-    () = msg![env; modal_vc viewDidAppear:animated];
-    env.objc
-        .borrow_mut::<UIViewControllerHostObject>(modal_vc)
-        .is_being_presented = false;
-
-
-    // The modal hierarchy is now fully attached to a window. Any UIWebView
-    // load deferred because the view had no on-screen extent yet (e.g.
-    // Chrome's ToS screen, whose webview never receives -setFrame: again)
-    // gets another chance right now, synchronously — the NSTimer-based
-    // poll has never been observed to fire on Android.
-    crate::frameworks::uikit::ui_view::ui_web_view::retry_pending_loads_in_subtree(
-        env, modal_view,
-    );
+    // Apple's documentation for `-presentModalViewController:animated:` makes
+    // no mention of rotating anything, and the presented view controller's
+    // delegate usually runs before the method returns (GameKit dismisses its
+    // own view controllers from `-viewWillAppear:`, for instance). Recording
+    // that we are inside a presentation lets `setStatusBarOrientation:` and
+    // `UIDevice -setOrientation:` tell "the app picks its orientation at
+    // launch" apart from "the app re-orients itself mid-transition", the
+    // latter being what used to flip the screen when a game opened Game
+    // Center.
+    env.framework_state.uikit.modal_presentation_depth += 1;
+    present_modal(env, this, modal_vc, animated);
+    env.framework_state.uikit.modal_presentation_depth = env
+        .framework_state
+        .uikit
+        .modal_presentation_depth
+        .saturating_sub(1);
 }
 
 - (id)modalViewController {

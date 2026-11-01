@@ -495,8 +495,17 @@ fn strip_generic_prefix(identifier: &str) -> &str {
         return identifier;
     };
     let head = identifier[..separator].to_lowercase();
-    let rest = &identifier[separator + separator.len_utf8()..];
-    if rest.is_empty() || !GENERIC_PREFIXES.contains(&head.as_str()) {
+    if !GENERIC_PREFIXES.contains(&head.as_str()) {
+        return identifier;
+    }
+    // `separator` is a byte offset, so step over the whole separator
+    // character (it may be multi-byte, e.g. a slash in a path-like id).
+    let separator_length = identifier[separator..]
+        .chars()
+        .next()
+        .map_or(0, char::len_utf8);
+    let rest = &identifier[separator + separator_length..];
+    if rest.is_empty() {
         return identifier;
     }
     // Recursively drop further generic parts (`achievements.ach.first_win`).
