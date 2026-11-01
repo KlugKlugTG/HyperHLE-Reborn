@@ -12,7 +12,9 @@
 //!
 //! Reference: <https://developer.apple.com/documentation/gamekit/gkachievement>
 
-use super::gk_local_player::{invoke_error_block, invoke_two_object_block};
+use super::gk_local_player::{
+    invoke_error_block, invoke_two_object_block, is_signed_in, make_not_authenticated_error,
+};
 use crate::frameworks::foundation::ns_string;
 use crate::frameworks::foundation::NSUInteger;
 use crate::game_center;
@@ -105,6 +107,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 // reported." We hand back what games reported to this emulator before, which
 // lets in-game achievement lists work offline.
 + (())loadAchievementsWithCompletionHandler:(id)handler {
+    if !is_signed_in(env) {
+        let error = make_not_authenticated_error(env);
+        invoke_two_object_block(env, handler, nil, error);
+        return;
+    }
     let achievements = game_center::achievements_for_current_app(env);
     log!(
         "GKAchievement loadAchievementsWithCompletionHandler: \
@@ -123,6 +130,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 // Apple: "Resets all achievement progress for the local player." Local
 // progress only, as there is no server to reset.
 + (())resetAchievementsWithCompletionHandler:(id)handler {
+    if !is_signed_in(env) {
+        let error = make_not_authenticated_error(env);
+        invoke_error_block(env, handler, error);
+        return;
+    }
     log!("GKAchievement resetAchievementsWithCompletionHandler: clearing local progress");
     game_center::reset_current_app(env);
     invoke_error_block(env, handler, nil);
@@ -131,6 +143,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 // + (void)reportAchievements:(NSArray *)achievements
 //       withCompletionHandler:(void (^)(NSError *))handler
 + (())reportAchievements:(id)achievements withCompletionHandler:(id)handler {
+    if !is_signed_in(env) {
+        let error = make_not_authenticated_error(env);
+        invoke_error_block(env, handler, error);
+        return;
+    }
     let count: NSUInteger = if achievements == nil {
         0
     } else {
@@ -236,6 +253,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // - (void)reportAchievementWithCompletionHandler:(void (^)(NSError *))completionHandler
 - (())reportAchievementWithCompletionHandler:(id)handler {
+    if !is_signed_in(env) {
+        let error = make_not_authenticated_error(env);
+        invoke_error_block(env, handler, error);
+        return;
+    }
     let (identifier, percent, banner) = {
         let host = env.objc.borrow::<GKAchievementHostObject>(this);
         (

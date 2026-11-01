@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 //! `GKScore`.
 
-use super::gk_local_player::invoke_error_block;
+use super::gk_local_player::{invoke_error_block, is_signed_in, make_not_authenticated_error};
 use crate::frameworks::foundation::ns_string;
 use crate::game_center;
 use crate::objc::{
@@ -221,6 +221,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 //  called." Scores go to the local Game Center store ([crate::game_center]);
 // the best value per leaderboard is kept, like the server would.
 - (())reportScoreWithCompletionHandler:(id)completion_handler {
+    if !is_signed_in(env) {
+        let error = make_not_authenticated_error(env);
+        invoke_error_block(env, completion_handler, error);
+        return;
+    }
     let (value, formatted, leaderboard) = {
         let host = env.objc.borrow::<GKScoreHostObject>(this);
         (

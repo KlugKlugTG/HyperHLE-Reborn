@@ -216,7 +216,13 @@ fn render(env: &mut Environment, views: &mut GameCenterViews) {
         .map(|app| app.completed_achievements())
         .sum();
 
-    let status = if apps.is_empty() {
+    let status = if !env.options.game_center_authenticated {
+        // The store keeps whatever was recorded while signed in, but nothing
+        // new arrives now: GameKit reports fail like on a signed-out device.
+        "Signed out. Turn on \"Local Game Center sign-in\" in Settings > \
+         Emulation so games can report achievements."
+            .to_string()
+    } else if apps.is_empty() {
         format!(
             "Signed in as {}. No achievements yet: play a game that reports \
              Game Center achievements.",

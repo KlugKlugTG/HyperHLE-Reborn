@@ -12,7 +12,7 @@
 //!
 //! Reference: <https://developer.apple.com/documentation/gamekit/gkleaderboard>
 
-use super::gk_local_player::invoke_two_object_block;
+use super::gk_local_player::{invoke_two_object_block, is_signed_in, make_not_authenticated_error};
 use super::gk_score::make_local_score;
 use crate::frameworks::foundation::ns_string;
 use crate::frameworks::foundation::NSRange;
@@ -83,6 +83,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 // Apple: "Loads the list of leaderboards for the current game." We can only
 // offer the leaderboards this game has already reported scores to.
 + (())loadLeaderboardsWithCompletionHandler:(id)handler {
+    if !is_signed_in(env) {
+        let error = make_not_authenticated_error(env);
+        invoke_two_object_block(env, handler, nil, error);
+        return;
+    }
     let scores = game_center::scores_for_current_app(env);
     let array: id = msg_class![env; NSMutableArray array];
     for score in &scores {
@@ -103,6 +108,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 // Deprecated before iOS 7 but still the API early games use. The payload is
 // the list of leaderboard identifiers, so it is the same local list.
 + (())loadCategoriesWithCompletionHandler:(id)handler {
+    if !is_signed_in(env) {
+        let error = make_not_authenticated_error(env);
+        invoke_two_object_block(env, handler, nil, error);
+        return;
+    }
     let scores = game_center::scores_for_current_app(env);
     let array: id = msg_class![env; NSMutableArray array];
     for score in &scores {
@@ -213,6 +223,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 // Apple: "The score for the local player." nil when the player never
 // reported a score to this leaderboard.
 - (id)localPlayerScore {
+    if !is_signed_in(env) {
+        return nil;
+    }
     let identifier = env.objc.borrow::<GKLeaderboardHostObject>(this).identifier;
     let scores = game_center::scores_for_current_app(env);
     let score = if identifier == nil {
@@ -235,6 +248,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 // Apple: "The scores are sorted from the highest to the lowest." With no
 // other players, the local player's best score is the whole leaderboard.
 - (())loadScoresWithCompletionHandler:(id)handler {
+    if !is_signed_in(env) {
+        let error = make_not_authenticated_error(env);
+        invoke_two_object_block(env, handler, nil, error);
+        return;
+    }
     let identifier = env.objc.borrow::<GKLeaderboardHostObject>(this).identifier;
     let identifier = if identifier == nil {
         None

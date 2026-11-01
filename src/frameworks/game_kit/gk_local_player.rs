@@ -28,6 +28,17 @@ const GK_ERROR_NOT_AUTHENTICATED: i32 = 6;
 /// <https://clang.llvm.org/docs/Block-ABI-Apple.html>
 const BLOCK_INVOKE_WORD_OFFSET: u32 = 3;
 
+/// Whether the local player is signed in to (local) Game Center.
+///
+/// This is the single switch every GameKit call that needs a player must
+/// check: `--game-center-authenticated` or the app picker's "Local Game
+/// Center sign-in" switch. Without it, GameKit behaves like a device where
+/// nobody signed in: calls fail with `GKErrorNotAuthenticated` and nothing is
+/// recorded in the local store.
+pub(crate) fn is_signed_in(env: &Environment) -> bool {
+    env.options.game_center_authenticated
+}
+
 /// Build an autoreleased `NSError*` describing the "not signed in to
 /// Game Center" condition. Domain = `GKErrorDomain`,
 /// code = `GKErrorNotAuthenticated`, with a localized description so
