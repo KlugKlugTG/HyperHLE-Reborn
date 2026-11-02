@@ -1691,14 +1691,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (i32)intValue {
     let st = to_rust_string(env, this);
-    let st = st.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    let (sign, rest) = match st.strip_prefix('-') {
-        Some(r) => (-1i64, r),
-        None    => (1i64, st.strip_prefix('+').unwrap_or(st)),
-    };
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    let magnitude: i64 = digits.parse().unwrap_or(0);
-    (sign * magnitude).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    decimal_prefix_value(&st).clamp(i32::MIN.into(), i32::MAX.into()) as i32
+}
+
+// https://developer.apple.com/documentation/foundation/nsstring/1414309-longlongvalue
+- (i64)longLongValue {
+    let st = to_rust_string(env, this);
+    decimal_prefix_value(&st)
 }
 
 - (id)lowercaseString {
@@ -2892,6 +2891,34 @@ fn is_match_at_position<F: Fn(u16, u16) -> bool>(
     })
 }
 
+/// The value of the decimal integer at the start of `s`, after leading
+/// whitespace and an optional sign, as read by `-intValue` and
+/// `-longLongValue`. Returns 0 if there is none and saturates on overflow
+/// (Apple: "Returns LLONG_MAX or LLONG_MIN on overflow").
+fn decimal_prefix_value(s: &str) -> i64 {
+    let s = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (negative, rest) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let mut value: i64 = 0;
+    for digit in rest.bytes().take_while(u8::is_ascii_digit) {
+        let digit = i64::from(digit - b'0');
+        let next = value.checked_mul(10).and_then(|v| {
+            if negative {
+                v.checked_sub(digit)
+            } else {
+                v.checked_add(digit)
+            }
+        });
+        match next {
+            Some(next) => value = next,
+            None => return if negative { i64::MIN } else { i64::MAX },
+        }
+    }
+    value
+}
+
 fn float_value_common<F: std::str::FromStr + Default>(env: &mut Environment, string: id) -> F {
     let st = to_rust_string(env, string);
     let st = st.trim_start();
@@ -2992,6 +3019,17 @@ fn line_range_helper(
 #[cfg(test)]
 mod ns_string_tests {
     use super::*;
+    #[test]
+    fn decimal_prefix_value_matches_long_long_value() {
+        assert_eq!(decimal_prefix_value(""), 0);
+        assert_eq!(decimal_prefix_value("abc"), 0);
+        assert_eq!(decimal_prefix_value("  \t-42xyz"), -42);
+        assert_eq!(decimal_prefix_value("+1700000000123"), 1_700_000_000_123);
+        assert_eq!(decimal_prefix_value("9223372036854775807"), i64::MAX);
+        assert_eq!(decimal_prefix_value("-9223372036854775808"), i64::MIN);
+        assert_eq!(decimal_prefix_value("99999999999999999999"), i64::MAX);
+        assert_eq!(decimal_prefix_value("-99999999999999999999"), i64::MIN);
+    }
     #[test]
     fn linerange_tests() {
         let range = |x, y| NSRange {

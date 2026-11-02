@@ -4194,6 +4194,14 @@ impl Environment {
             .mem
             .alloc_and_write_cstr(self.fs.home_directory().as_str().as_bytes());
         self.env_vars.insert(b"HOME".to_vec(), home_value_cstr);
+        // iOS points TMPDIR at the app's writable tmp/ directory, with a
+        // trailing slash like confstr(_CS_DARWIN_USER_TEMP_DIR). SQLite's
+        // unixTempFileDir() and other POSIX code look here before falling
+        // back to "." (the read-only app bundle). See NSTemporaryDirectory:
+        // https://developer.apple.com/documentation/foundation/1409211-nstemporarydirectory
+        let tmp_dir = format!("{}/", self.fs.home_directory().join("tmp").as_str());
+        let tmp_value_cstr = self.mem.alloc_and_write_cstr(tmp_dir.as_bytes());
+        self.env_vars.insert(b"TMPDIR".to_vec(), tmp_value_cstr);
     }
 
     fn get_sorted_bin_indices(&self) -> Result<Vec<usize>, String> {

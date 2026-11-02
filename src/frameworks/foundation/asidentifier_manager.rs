@@ -10,6 +10,7 @@
 //! Tracking is always reported as disabled / limited, matching a device
 //! where the user has opted out of ad tracking.
 
+use crate::abi::{CallFromHost, GuestFunction};
 use crate::frameworks::foundation::ns_string;
 use crate::objc::{id, msg, msg_class, nil, objc_classes, ClassExports, HostObject, NSZonePtr};
 
@@ -189,25 +190,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     if completion_handler == nil {
         return;
     }
-    // The completion handler is a block: ^(ATTrackingManagerAuthorizationStatus
-    // status)
-    // We call it by sending it the __FuncPtr invoke message with the status.
+    // The completion handler is a block,
+    // ^(ATTrackingManagerAuthorizationStatus status): call its invoke
+    // function (the fourth word of the block literal) with the status.
+    // https://clang.llvm.org/docs/Block-ABI-Apple.html
     let status: ATTrackingManagerAuthorizationStatus = ATTrackingManagerAuthorizationStatusDenied;
-    // Invoke the block — blocks respond to `invoke` in touchHLE's block model.
-    let sel = env.objc.lookup_selector("invokeWithUnsignedInt:").unwrap();
-    let responds: bool = msg![env; completion_handler respondsToSelector:sel];
-    if responds {
-        let _: () = msg![env; completion_handler invokeWithUnsignedInt:status];
-    } else {
-        // Fallback: try plain invoke with no arguments (some block wrappers).
-        let sel_plain = env.objc.lookup_selector("invoke").unwrap();
-        let responds_plain: bool = msg![env; completion_handler respondsToSelector:sel_plain];
-        if responds_plain {
-            let _: () = msg![env; completion_handler invoke];
-        } else {
-            log!("ATTrackingManager: completion handler {:?} does not respond to invoke — ignored", completion_handler);
-        }
-    }
+    let invoke: u32 = env.mem.read(completion_handler.cast::<u32>() + 3u32);
+    let invoke = GuestFunction::from_addr_with_thumb_bit(invoke);
+    let (): () = invoke.call_from_host(env, (completion_handler, status));
 }
 
 // -------------------------------------------------------------------------

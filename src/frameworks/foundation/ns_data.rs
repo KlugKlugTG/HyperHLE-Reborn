@@ -4,7 +4,7 @@
  * file, you can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use super::ns_string::to_rust_string;
+use super::ns_string::{self, to_rust_string};
 use super::NSUInteger;
 use crate::frameworks::foundation::ns_keyed_unarchiver::decode_current_data;
 use crate::frameworks::foundation::NSRange;
@@ -38,8 +38,42 @@ fn write_cocoa_file_read_error(env: &mut Environment, error_ptr: MutVoidPtr, cod
     env.mem.write(error_ptr.cast(), ns_error);
 }
 
+const NSDataBase64Encoding64CharacterLineLength: NSUInteger = 1 << 0;
+const NSDataBase64Encoding76CharacterLineLength: NSUInteger = 1 << 1;
+const NSDataBase64EncodingEndLineWithCarriageReturn: NSUInteger = 1 << 4;
+const NSDataBase64EncodingEndLineWithLineFeed: NSUInteger = 1 << 5;
+
 /// Standard Base64 (RFC 4648, `+/` alphabet, `=` padding), as produced by
-/// Apple's `-base64EncodedDataWithOptions:` with no options.
+/// Apple's `-base64EncodedDataWithOptions:` and
+/// `-base64EncodedStringWithOptions:`. With a line length option the output
+/// is split into lines joined by the requested line ending (CR LF if none is
+/// given), with no ending after the last line.
+/// https://developer.apple.com/documentation/foundation/nsdatabase64encodingoptions
+fn base64_encode_with_options(input: &[u8], options: NSUInteger) -> Vec<u8> {
+    let encoded = base64_encode(input);
+    let line_length = if options & NSDataBase64Encoding64CharacterLineLength != 0 {
+        64
+    } else if options & NSDataBase64Encoding76CharacterLineLength != 0 {
+        76
+    } else {
+        return encoded;
+    };
+    let mut line_ending = Vec::new();
+    if options & NSDataBase64EncodingEndLineWithCarriageReturn != 0 {
+        line_ending.push(b'\r');
+    }
+    if options & NSDataBase64EncodingEndLineWithLineFeed != 0 {
+        line_ending.push(b'\n');
+    }
+    if line_ending.is_empty() {
+        line_ending.extend_from_slice(b"\r\n");
+    }
+    encoded
+        .chunks(line_length)
+        .collect::<Vec<_>>()
+        .join(&line_ending[..])
+}
+
 fn base64_encode(input: &[u8]) -> Vec<u8> {
     const ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -360,7 +394,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (NSUInteger)length {
     env.objc.borrow::<NSDataHostObject>(this).length
 }
-- (id)base64EncodedDataWithOptions:(NSUInteger)_options {
+- (id)base64EncodedDataWithOptions:(NSUInteger)options {
     let source = {
         let host = env.objc.borrow::<NSDataHostObject>(this);
         if host.length == 0 || host.bytes.is_null() {
@@ -371,7 +405,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                 .to_vec()
         }
     };
-    let encoded = base64_encode(&source);
+    let encoded = base64_encode_with_options(&source, options);
     let len = encoded.len() as NSUInteger;
     if len == 0 {
         return msg_class![env; NSData data];
@@ -381,6 +415,23 @@ pub const CLASSES: ClassExports = objc_classes! {
         .bytes_at_mut(buffer.cast(), len)
         .copy_from_slice(&encoded);
     msg_class![env; NSData dataWithBytesNoCopy:buffer length:len freeWhenDone:true]
+}
+
+// https://developer.apple.com/documentation/foundation/nsdata/1413546-base64encodedstringwithoptions
+- (id)base64EncodedStringWithOptions:(NSUInteger)options { // NSString*
+    let data: id = msg![env; this base64EncodedDataWithOptions:options];
+    let encoded = {
+        let bytes: ConstVoidPtr = msg![env; data bytes];
+        let length: NSUInteger = msg![env; data length];
+        if length == 0 {
+            String::new()
+        } else {
+            // Base64 output is always ASCII.
+            String::from_utf8(env.mem.bytes_at(bytes.cast(), length).to_vec()).unwrap()
+        }
+    };
+    let string = ns_string::from_rust_string(env, encoded);
+    autorelease(env, string)
 }
 
 // =========================================================================
@@ -802,4 +853,31 @@ pub fn to_rust_slice(env: &mut Environment, data: id) -> &[u8] {
     }
     let casted_ptr: ConstPtr<u8> = borrowed_data.bytes.cast_const().cast();
     env.mem.bytes_at(casted_ptr, borrowed_data.length)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_line_length_options() {
+        let input = [0u8; 60]; // 80 Base64 characters
+        let plain = base64_encode_with_options(&input, 0);
+        assert_eq!(plain.len(), 80);
+        assert!(!plain.contains(&b'\r') && !plain.contains(&b'\n'));
+
+        let crlf = base64_encode_with_options(&input, NSDataBase64Encoding64CharacterLineLength);
+        assert_eq!(crlf, [&plain[..64], b"\r\n", &plain[64..]].concat());
+
+        let lf = base64_encode_with_options(
+            &input,
+            NSDataBase64Encoding76CharacterLineLength | NSDataBase64EncodingEndLineWithLineFeed,
+        );
+        assert_eq!(lf, [&plain[..76], b"\n", &plain[76..]].concat());
+
+        // No line ending after a final full line.
+        let short =
+            base64_encode_with_options(&[0u8; 48], NSDataBase64Encoding64CharacterLineLength);
+        assert_eq!(short.len(), 64);
+    }
 }
