@@ -3995,7 +3995,7 @@ fn setup_settings(
                 gles_native_switch_enabled,
             ),
             SettingsRow::Toggle(
-                "May fix graphics issues.",
+                "May fix graphics issues",
                 "forceComposition:",
             picker_settings.force_composition,
                 true,
