@@ -2,6 +2,10 @@
 #
 # Options in this file take precedence over ones in touchHLE_default_options.txt
 #
+# Tip: "Rotation fix" and "Movie player fix" are also switches in the app
+# picker's Settings > Graphics screen, so --rotation-fix and
+# --fix-movie-player don't have to be added here.
+#
 # ---
 #
 # Each line in this file specifies options for an app; there should only be one
