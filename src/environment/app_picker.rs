@@ -387,7 +387,11 @@ struct AppPickerDelegateHostObject {
     overlay_mode: Option<PerformanceOverlayMode>,
     overlay_corner: Option<PerformanceOverlayCorner>,
     cheat_engine: Option<bool>,
-    trace_gl_errors: Option<bool>,
+    /// `Some(..)` only when the user just flipped the switch: `None` means no
+    /// change is pending. The saved state is tri-state (see `PickerSettings`).
+    rotation_fix: Option<bool>,
+    /// `Some(..)` only when the user just flipped the switch.
+    fix_movie_player: Option<bool>,
     preserve_aspect_ratio: Option<bool>,
     show_lock_screen: Option<bool>,
     force_composition: Option<bool>,
@@ -425,7 +429,12 @@ struct PickerSettings {
     show_fps: bool,
     overlay_mode: PerformanceOverlayMode,
     overlay_corner: PerformanceOverlayCorner,
-    trace_gl_errors: bool,
+    /// `None` leaves these compatibility fixes to the command line and the
+    /// app-specific options files. `Some(..)` is an explicit override from the
+    /// Settings screen, including an explicit "off" that must be able to beat
+    /// an options file which enables the fix (e.g. GTA III defaults).
+    rotation_fix: Option<bool>,
+    fix_movie_player: Option<bool>,
     cheat_engine: bool,
     network: bool,
     game_center_authenticated: bool,
@@ -448,7 +457,11 @@ impl PickerSettings {
             show_fps: options.performance_overlay_enabled,
             overlay_mode: options.performance_overlay_mode.for_current_platform(),
             overlay_corner: options.performance_overlay_corner,
-            trace_gl_errors: options.trace_gl_errors,
+            // A flag passed on the command line is already an explicit choice;
+            // show it as such. Without one, the fixes stay "unset" so the
+            // app-specific defaults in the options files still apply.
+            rotation_fix: options.rotation_fix.then_some(true),
+            fix_movie_player: options.fix_movie_player.then_some(true),
             cheat_engine: quick_options_trainer_enabled(options),
             network: options.network_access,
             game_center_authenticated: options.game_center_authenticated,
@@ -497,7 +510,8 @@ impl PickerSettings {
                         settings.overlay_corner = corner;
                     }
                 }
-                "trace_gl_errors" => set_bool(value, &mut settings.trace_gl_errors),
+                "rotation_fix" => set_bool_override(value, &mut settings.rotation_fix),
+                "fix_movie_player" => set_bool_override(value, &mut settings.fix_movie_player),
                 "cheat_engine" => set_bool(value, &mut settings.cheat_engine),
                 "network" => set_bool(value, &mut settings.network),
                 "game_center_authenticated" => {
@@ -536,7 +550,8 @@ impl PickerSettings {
              show_fps={}\n\
              overlay_mode={}\n\
              overlay_corner={}\n\
-             trace_gl_errors={}\n\
+             rotation_fix={}\n\
+             fix_movie_player={}\n\
              cheat_engine={}\n\
              network={}\n\
              game_center_authenticated={}\n\
@@ -553,7 +568,8 @@ impl PickerSettings {
             self.show_fps,
             self.overlay_mode.short_name(),
             self.overlay_corner.short_name(),
-            self.trace_gl_errors,
+            optional_bool(self.rotation_fix),
+            optional_bool(self.fix_movie_player),
             self.cheat_engine,
             self.network,
             self.game_center_authenticated,
@@ -572,6 +588,26 @@ fn set_bool(value: &str, setting: &mut bool) {
         "true" => *setting = true,
         "false" => *setting = false,
         _ => (),
+    }
+}
+
+/// Reads a tri-state setting from the picker settings file. Only explicit
+/// `true`/`false` values are overrides; `default` (or an unknown value) leaves
+/// the value derived from the command line untouched, so a CLI flag is not
+/// silently cancelled by a saved "untouched switch" line.
+fn set_bool_override(value: &str, setting: &mut Option<bool>) {
+    match value {
+        "true" => *setting = Some(true),
+        "false" => *setting = Some(false),
+        _ => (),
+    }
+}
+
+fn optional_bool(value: Option<bool>) -> &'static str {
+    match value {
+        None => "default",
+        Some(true) => "true",
+        Some(false) => "false",
     }
 }
 
@@ -733,9 +769,13 @@ const CLASSES: ClassExports = objc_classes! {
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).game_center_authenticated = Some(switch_state);
 }
-- (())traceGLErrors:(id)switch { // UISwitch*
+- (())rotationFix:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).trace_gl_errors = Some(switch_state);
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).rotation_fix = Some(switch_state);
+}
+- (())moviePlayerFix:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fix_movie_player = Some(switch_state);
 }
 - (())preserveAspectRatio:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -1126,7 +1166,8 @@ fn app_picker_inner(
     let mut quick_options_show_fps = initial_quick_options_show_fps;
     let mut quick_options_overlay_mode = picker_settings.overlay_mode;
     let mut quick_options_overlay_corner = picker_settings.overlay_corner;
-    let mut quick_options_trace_gl_errors = picker_settings.trace_gl_errors;
+    let mut quick_options_rotation_fix = picker_settings.rotation_fix;
+    let mut quick_options_fix_movie_player = picker_settings.fix_movie_player;
     let mut quick_options_preserve_aspect_ratio = picker_settings.preserve_aspect_ratio;
     let mut quick_options_show_lock_screen = picker_settings.show_lock_screen;
     let mut quick_options_force_composition_override = Some(picker_settings.force_composition);
@@ -1679,8 +1720,10 @@ fn app_picker_inner(
                 quick_options_overlay_mode,
                 quick_options_overlay_corner,
             );
-        } else if let Some(trace_gl_errors) = std::mem::take(&mut host_obj.trace_gl_errors) {
-            quick_options_trace_gl_errors = trace_gl_errors;
+        } else if let Some(rotation_fix) = std::mem::take(&mut host_obj.rotation_fix) {
+            quick_options_rotation_fix = Some(rotation_fix);
+        } else if let Some(fix_movie_player) = std::mem::take(&mut host_obj.fix_movie_player) {
+            quick_options_fix_movie_player = Some(fix_movie_player);
         } else if let Some(preserve_aspect_ratio) =
             std::mem::take(&mut host_obj.preserve_aspect_ratio)
         {
@@ -1740,7 +1783,8 @@ fn app_picker_inner(
             quick_options_force_composition_override.unwrap_or(env.options.force_composition);
         picker_settings.overlay_mode = quick_options_overlay_mode;
         picker_settings.overlay_corner = quick_options_overlay_corner;
-        picker_settings.trace_gl_errors = quick_options_trace_gl_errors;
+        picker_settings.rotation_fix = quick_options_rotation_fix;
+        picker_settings.fix_movie_player = quick_options_fix_movie_player;
         picker_settings.cheat_engine = quick_options_cheat_engine;
         picker_settings.network = quick_options_network;
         picker_settings.analog_stick_tilt_controls = quick_options_analog_stick_tilt_controls;
@@ -1854,11 +1898,12 @@ fn app_picker_inner(
         option_args.push(quick_options_force_composition_argument(enabled).to_string());
     }
 
-    if quick_options_trace_gl_errors {
-        option_args.push("--trace-gl-errors".to_string());
-    } else {
-        option_args.push("--no-trace-gl-errors".to_string());
-    }
+    // The two compatibility fixes are only emitted when the Settings screen
+    // actually set them (see `quick_options_fix_arguments`).
+    option_args.extend(quick_options_fix_arguments(
+        quick_options_rotation_fix,
+        quick_options_fix_movie_player,
+    ));
     // Always passed explicitly (like `--trainer`/`--no-trainer`): the base
     // default is now OFF, so the switch has to be able to turn the native
     // driver back on, and the picker's choice should win over any
@@ -3950,7 +3995,7 @@ fn setup_settings(
                 gles_native_switch_enabled,
             ),
             SettingsRow::Toggle(
-                "May fix graphics issues.",
+                "May fix graphics issues",
                 "forceComposition:",
             picker_settings.force_composition,
                 true,
@@ -3966,10 +4011,19 @@ fn setup_settings(
                 ("Bottom left", "overlayCornerBottomLeft"),
             ],
         ),
+        // Both fixes are opt-in and may be enabled per-app in the options
+        // files. Leaving a switch alone keeps those defaults; flipping it
+        // (either way) is an explicit override for every later launch.
         SettingsRow::Toggle(
-            "Trace GL errors",
-            "traceGLErrors:",
-            picker_settings.trace_gl_errors,
+            "Rotation fix",
+            "rotationFix:",
+            picker_settings.rotation_fix.unwrap_or(false),
+            true,
+        ),
+        SettingsRow::Toggle(
+            "Movie player fix",
+            "moviePlayerFix:",
+            picker_settings.fix_movie_player.unwrap_or(false),
             true,
         ),
     ];
@@ -4811,6 +4865,40 @@ fn quick_options_force_composition_argument(enabled: bool) -> &'static str {
     }
 }
 
+fn quick_options_rotation_fix_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--rotation-fix"
+    } else {
+        "--no-rotation-fix"
+    }
+}
+
+fn quick_options_fix_movie_player_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--fix-movie-player"
+    } else {
+        "--no-fix-movie-player"
+    }
+}
+
+/// Launch arguments for the two compatibility fix switches. An untouched
+/// switch (`None`) emits nothing: `--no-rotation-fix` / `--no-fix-movie-player`
+/// are explicit overrides that would cancel the app-specific defaults in
+/// touchHLE_default_options.txt (GTA III needs both fixes).
+fn quick_options_fix_arguments(
+    rotation_fix: Option<bool>,
+    fix_movie_player: Option<bool>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(enabled) = rotation_fix {
+        args.push(quick_options_rotation_fix_argument(enabled).to_string());
+    }
+    if let Some(enabled) = fix_movie_player {
+        args.push(quick_options_fix_movie_player_argument(enabled).to_string());
+    }
+    args
+}
+
 /// Returns `(native_enabled, switch_enabled)` for the probed ANGLE state.
 fn quick_options_gles_native_state(options: &Options, angle_available: bool) -> (bool, bool) {
     (options.gles_native || !angle_available, angle_available)
@@ -4906,6 +4994,68 @@ mod quick_options_force_composition_tests {
             quick_options_force_composition_argument(false),
             "--no-force-composition"
         );
+    }
+}
+
+#[cfg(test)]
+mod quick_options_fix_tests {
+    use super::*;
+
+    #[test]
+    fn switches_emit_explicit_arguments_both_ways() {
+        assert_eq!(quick_options_rotation_fix_argument(true), "--rotation-fix");
+        assert_eq!(
+            quick_options_rotation_fix_argument(false),
+            "--no-rotation-fix"
+        );
+        assert_eq!(
+            quick_options_fix_movie_player_argument(true),
+            "--fix-movie-player"
+        );
+        assert_eq!(
+            quick_options_fix_movie_player_argument(false),
+            "--no-fix-movie-player"
+        );
+
+        assert!(quick_options_fix_arguments(None, None).is_empty());
+        assert_eq!(
+            quick_options_fix_arguments(Some(true), None),
+            vec!["--rotation-fix"]
+        );
+        assert_eq!(
+            quick_options_fix_arguments(None, Some(false)),
+            vec!["--no-fix-movie-player"]
+        );
+        assert_eq!(
+            quick_options_fix_arguments(Some(false), Some(true)),
+            vec!["--no-rotation-fix", "--fix-movie-player"]
+        );
+    }
+
+    #[test]
+    fn saved_overrides_round_trip_without_cancelling_cli_flags() {
+        // An untouched switch is saved as "default" and must not emit an
+        // argument, so app-specific defaults (e.g. GTA III) still apply.
+        let mut setting = None;
+        assert_eq!(optional_bool(setting), "default");
+        set_bool_override(optional_bool(setting), &mut setting);
+        assert_eq!(setting, None);
+
+        set_bool_override("true", &mut setting);
+        assert_eq!(setting, Some(true));
+        set_bool_override("false", &mut setting);
+        assert_eq!(setting, Some(false));
+
+        // A flag passed on the command line is an explicit choice that a
+        // saved "default" line must not erase.
+        let mut setting = Some(true);
+        set_bool_override("default", &mut setting);
+        assert_eq!(setting, Some(true));
+
+        // Unknown values must not turn an explicit override into a default
+        // (or the other way round).
+        set_bool_override("garbage", &mut setting);
+        assert_eq!(setting, Some(true));
     }
 }
 

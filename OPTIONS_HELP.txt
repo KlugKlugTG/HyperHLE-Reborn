@@ -480,7 +480,10 @@ Other options:
         (GL_INVALID_VALUE) noise can be traced back to a specific call.
         This option exists for debugging black-screen / wrong-render bugs
         and adds a glGetError() round-trip per call, so it should not be
-        left on for normal use.
+        left on for normal use. Diagnostic only: it is not exposed in the
+        app picker's Settings screen, so use the command line or an
+        app-specific options file. The picker no longer overrides it with
+        --no-trace-gl-errors.
 
     --gles-native / --no-gles-native
         Android only. OFF by default (and exposed as the "GLES Native" switch
@@ -534,10 +537,14 @@ Other options:
         enables it for GTA III. To enable it manually for a run, pass this
         flag after the app path. For example:
         touchHLE GTA3.app --fix-movie-player
+        Also available as "Movie player fix" in Settings > Graphics. The
+        switch is off on a fresh install: leaving it alone keeps the
+        app-specific defaults, flipping it (on or off) overrides them.
 
     --no-fix-movie-player
         Use the legacy MPMoviePlayerController behavior, even if the fix was
-        enabled by an app-specific options file.
+        enabled by an app-specific options file. Turning the "Movie player
+        fix" Settings switch off passes this flag.
 
     --reverse-attrib-locations
         When an OpenGL ES 2.0 app binds no attribute locations itself, give
@@ -557,8 +564,12 @@ Other options:
         should only get the compensation when UIKit really rotated their root
         view. Without this flag, HyperHLE keeps the legacy iPad/non-portrait
         heuristic. Disabled globally; the bundled default-options file enables
-        this together with --fix-movie-player for GTA III.
+        this together with --fix-movie-player for GTA III. Also available as
+        "Rotation fix" in Settings > Graphics. The switch is off on a fresh
+        install: leaving it alone keeps the app-specific defaults, flipping
+        it (on or off) overrides them.
 
     --no-rotation-fix
         Explicitly use the legacy iPad/non-portrait rotation heuristic, even if
-        the fix was enabled by an app-specific options file.
+        the fix was enabled by an app-specific options file. Turning the
+        "Rotation fix" Settings switch off passes this flag.

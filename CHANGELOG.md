@@ -253,6 +253,8 @@ Usability:
 
 - Quick Options now has a “May fix graphics issues.” switch for `--force-composition`, including an explicit off state that overrides app-specific defaults. Switches are aligned beside their labels, and the scale-hack button text no longer gets clipped. (@j92580498-max)
 
+- The app picker's Settings > Graphics now has “Rotation fix” and “Movie player fix” switches for `--rotation-fix` and `--fix-movie-player`, so those compatibility fixes no longer have to be added to `touchHLE_options.txt` by hand (the bundled file now points at the switches too). Leaving a switch alone keeps the app-specific defaults (including the GTA III ones); turning it on or off passes an explicit flag that overrides them. The diagnostic “Trace GL errors” switch is gone, so `--trace-gl-errors` from an options file is no longer overridden by the picker.
+
 ## v0.2.3 (2026-01-02)
 
 Compatibility:
