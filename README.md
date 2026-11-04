@@ -22,7 +22,7 @@ The repository does not distribute commercial apps or iOS firmware. Put an app b
 The titles below have been tested with HyperHLE-Reborn and are known to run. Compatibility may still vary with the app version, virtual device profile, host GPU/driver, and settings; this list does not guarantee that every feature or a full playthrough works. Also any update can break these games in list, report if it doesn't work
 
 - N.O.V.A. 3 (Playable)
-- Gangstar Vegas (Playable)
+- Gangstar Vegas (Ingame)
 - Geometry Dash (Playable)
 - Modern Combat 3 (Playable)
 - Asphalt 7 (Playable)
@@ -35,12 +35,13 @@ The titles below have been tested with HyperHLE-Reborn and are known to run. Com
 - Need For Speed: Most Wanted (Playable)
 - Minecraft 0.16.2 (Playable)
 - Oceanhorn (Playable)
-- Asphalt 8 (Playable)
+- Asphalt 8 1.0.0-1.4.0 (Playable)
 - GTA 3 (Ingame)
 - Granny (Ingame)
 - Talking Tom Hero Dash (Playable)
 - My Talking Hank (Playable)
 - Subway Surfers 1.118.0 (Playable)
+- Minion Rush 6.3.0 (Playable)
 - And more more games
 
 ## Build and documentation
