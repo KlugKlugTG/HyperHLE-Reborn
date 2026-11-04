@@ -133,6 +133,13 @@ fn isatty(env: &mut Environment, fd: FileDescriptor) -> i32 {
     }
 }
 
+/// Whether `mode` is a valid `access()` mode: `F_OK`, or any combination of
+/// `R_OK`, `W_OK` and `X_OK`. Anything else fails with `EINVAL`.
+/// https://pubs.opengroup.org/onlinepubs/9699919799/functions/access.html
+fn access_mode_is_valid(mode: i32) -> bool {
+    mode & !(R_OK | W_OK | X_OK) == 0
+}
+
 fn access(env: &mut Environment, path: ConstPtr<u8>, mode: i32) -> i32 {
     let binding = match env.mem.cstr_at_utf8(path) {
         Ok(s) => s.to_owned(),
@@ -171,8 +178,7 @@ fn access(env: &mut Environment, path: ConstPtr<u8>, mode: i32) -> i32 {
     } else {
         // POSIX access() accepts any combination of F_OK/R_OK/W_OK/X_OK;
         // reject unknown mode bits with EINVAL.
-        let valid_mode_bits = F_OK | R_OK | W_OK | X_OK;
-        if mode & !valid_mode_bits != mode || mode == 0 {
+        if !access_mode_is_valid(mode) {
             // Unknown mode bits: real access() returns -1 with EINVAL.
             log!(
                 "Warning: access(): unknown mode {:#x}; returning EINVAL.",
@@ -668,3 +674,25 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(sync()),
     export_c_func!(setpriority(_, _, _)),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_accepts_every_combination_of_permission_bits() {
+        // SQLite's unixTempFileDir() probes candidate directories with
+        // access(dir, 07); rejecting it made SQLite fall back to the
+        // read-only app bundle for its temporary files.
+        for mode in [F_OK, R_OK, W_OK, X_OK, R_OK | W_OK, W_OK | X_OK, 7] {
+            assert!(access_mode_is_valid(mode), "mode {mode:#x}");
+        }
+    }
+
+    #[test]
+    fn access_rejects_unknown_mode_bits() {
+        for mode in [8, 0x10, 7 | 8, -1] {
+            assert!(!access_mode_is_valid(mode), "mode {mode:#x}");
+        }
+    }
+}

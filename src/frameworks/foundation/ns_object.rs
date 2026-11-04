@@ -12,6 +12,7 @@ use super::ns_run_loop::{self, NSDefaultRunLoopMode};
 use super::ns_string::{from_rust_string, get_static_str, to_rust_string};
 use super::{NSInteger, NSTimeInterval, NSUInteger};
 // ДОБАВЛЕНЫ ИМПОРТЫ ДЛЯ ЭКСПОРТА ФУНКЦИИ И ОКРУЖЕНИЯ
+use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::foundation::ns_thread::{self, detach_new_thread_inner};
 use crate::libc::semaphore::{host_create_semaphore, host_destroy_semaphore, sem_post, sem_wait};
@@ -1521,6 +1522,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     // owner, so a no-op autorelease is safe here and avoids routing a
     // non-host-object block through the autorelease pool's release path.
     this
+}
+
+// `-[NSBlock invoke]` calls a block that takes no arguments, which lets code
+// run a block through `performSelector:@selector(invoke)` or NSInvocation
+// (Crashlytics does). The invoke pointer is the fourth word of the literal.
+// https://clang.llvm.org/docs/Block-ABI-Apple.html
+- (())invoke {
+    let invoke: u32 = env.mem.read(this.cast::<u32>() + 3u32);
+    let invoke = GuestFunction::from_addr_with_thumb_bit(invoke);
+    let (): () = invoke.call_from_host(env, (this,));
 }
 
 @end

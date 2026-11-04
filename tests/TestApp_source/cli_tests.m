@@ -6430,6 +6430,10 @@ int test_CFRunLoopTimerCreate_callout(void);
 int test_CFRunLoopTimerSetNextFireDate_NSTimer(void);
 int test_CFURLCreatePropertyFromResource(void);
 int test_stat_inode_identifies_file(void);
+int test_access_mode_bits_and_TMPDIR(void);
+int test_NSPredicate_predicateWithBlock(void);
+int test_NSString_longLongValue(void);
+int test_NSData_base64EncodedStringWithOptions(void);
 // clang-format on
 
 // clang-format off
@@ -6560,6 +6564,10 @@ struct {
     XFUNC_DEF(test_CFRunLoopTimerSetNextFireDate_NSTimer),
     FUNC_DEF(test_CFURLCreatePropertyFromResource),
     FUNC_DEF(test_stat_inode_identifies_file),
+    FUNC_DEF(test_access_mode_bits_and_TMPDIR),
+    FUNC_DEF(test_NSPredicate_predicateWithBlock),
+    FUNC_DEF(test_NSString_longLongValue),
+    FUNC_DEF(test_NSData_base64EncodedStringWithOptions),
 };
 
 // The dispatch tests that used to live here are gone with the revert of
@@ -6743,6 +6751,154 @@ int test_stat_inode_identifies_file(void) {
     result = -5;
   close(jpg);
   close(ttf);
+  return result;
+}
+// access() takes F_OK or any combination of R_OK, W_OK and X_OK, and only
+// other bits are invalid. iOS also points TMPDIR at the app's writable tmp/
+// directory. SQLite picks its temporary directory with exactly these: it
+// takes TMPDIR if access(dir, 07) succeeds, else falls back to "." (the
+// read-only app bundle), so the Firebase SDK in Subway Surfers 2.1.1 could
+// not create its temporary files.
+// https://pubs.opengroup.org/onlinepubs/9699919799/functions/access.html
+int test_access_mode_bits_and_TMPDIR(void) {
+  const char *tmpdir = getenv("TMPDIR");
+  if (tmpdir == NULL || tmpdir[0] != '/')
+    return -1;
+  if (access(tmpdir, R_OK | W_OK | X_OK) != 0)
+    return -2;
+  if (access(tmpdir, W_OK | X_OK) != 0 || access(tmpdir, F_OK) != 0)
+    return -3;
+  if (access("test_1x1_black_pixel.jpg", R_OK) != 0)
+    return -4;
+  errno = 0;
+  if (access("test_1x1_black_pixel.jpg", 8) != -1 || errno != EINVAL)
+    return -5;
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/etilqs_access_test", tmpdir);
+  FILE *file = fopen(path, "w");
+  if (file == NULL)
+    return -6;
+  fclose(file);
+  if (unlink(path) != 0)
+    return -7;
+  return 0;
+}
+
+// predicateWithBlock: evaluates the block, BOOL (^)(id evaluatedObject,
+// NSDictionary *bindings), and keeps its own copy of it. The block is built
+// by hand like in test_Block_lifetime, since TestApp is built without
+// -fblocks.
+// https://developer.apple.com/documentation/foundation/nspredicate/1416185-predicatewithblock
+@interface NSPredicate : NSObject
++ (id)predicateWithBlock:(id)block;
+- (BOOL)evaluateWithObject:(id)object;
+- (BOOL)evaluateWithObject:(id)object substitutionVariables:(id)bindings;
+@end
+
+struct PredicateTestBlock {
+  void *isa;
+  unsigned int flags, reserved;
+  BOOL (*invoke)(const struct PredicateTestBlock *, id, id);
+  const struct TestBlockDescriptor *descriptor;
+  id expected;
+};
+static id predicate_test_last_bindings;
+static BOOL predicate_test_invoke(const struct PredicateTestBlock *block,
+                                  id object, id bindings) {
+  predicate_test_last_bindings = bindings;
+  return object == block->expected;
+}
+
+int test_NSPredicate_predicateWithBlock(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  id expected = [[NSObject alloc] init];
+  id other = [[NSObject alloc] init];
+  const struct TestBlockDescriptor descriptor = {
+      0, sizeof(struct PredicateTestBlock), NULL, NULL};
+  struct PredicateTestBlock stack = {
+      NULL, 0, 0, predicate_test_invoke, &descriptor, expected};
+  NSPredicate *predicate = [[NSPredicate predicateWithBlock:(id)&stack] retain];
+  // The predicate must have copied the block off the stack.
+  memset(&stack, 0, sizeof(stack));
+  int result = 0;
+  if (![predicate evaluateWithObject:expected])
+    result = -1;
+  else if ([predicate evaluateWithObject:other])
+    result = -2;
+  else if (predicate_test_last_bindings != nil)
+    result = -3;
+  else if (![predicate evaluateWithObject:expected substitutionVariables:other])
+    result = -4;
+  else if (predicate_test_last_bindings != other)
+    result = -5;
+  [predicate release];
+  [expected release];
+  [other release];
+  [pool drain];
+  return result;
+}
+
+// -longLongValue reads a decimal number after leading whitespace, like
+// -intValue, and both saturate on overflow.
+// https://developer.apple.com/documentation/foundation/nsstring/1414309-longlongvalue
+// https://developer.apple.com/documentation/foundation/nsstring/1414104-intvalue
+@interface NSString (LongLongValueTest)
+- (int)intValue;
+- (long long)longLongValue;
+- (NSString *)stringByPaddingToLength:(NSUInteger)length
+                           withString:(NSString *)padding
+                      startingAtIndex:(NSUInteger)index;
+@end
+
+int test_NSString_longLongValue(void) {
+  if ([@"  -1700000000123abc" longLongValue] != -1700000000123LL)
+    return -1;
+  if ([@"+42" longLongValue] != 42 || [@"abc" longLongValue] != 0)
+    return -2;
+  if ([@"99999999999999999999" longLongValue] != LLONG_MAX)
+    return -3;
+  if ([@"-99999999999999999999" longLongValue] != LLONG_MIN)
+    return -4;
+  if ([@"99999999999" intValue] != INT_MAX || [@"-99999999999" intValue] != INT_MIN)
+    return -5;
+  return 0;
+}
+
+// base64EncodedStringWithOptions: (iOS 7) returns the Base64 encoding as a
+// string. With a line length option, lines are joined by the requested line
+// ending, CR LF by default, with none after the last line.
+// https://developer.apple.com/documentation/foundation/nsdata/1413546-base64encodedstringwithoptions
+@interface NSData (Base64StringTest)
++ (id)dataWithBytes:(const void *)bytes length:(NSUInteger)length;
+- (NSString *)base64EncodedStringWithOptions:(NSUInteger)options;
+@end
+
+int test_NSData_base64EncodedStringWithOptions(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  int result = 0;
+  NSData *foobar = [NSData dataWithBytes:"foobar" length:6];
+  unsigned char zeros[60] = {0};
+  NSData *long_data = [NSData dataWithBytes:zeros length:sizeof(zeros)];
+  // 80 characters: 64 + 16.
+  NSString *line = [@"" stringByPaddingToLength:64
+                                     withString:@"A"
+                                startingAtIndex:0];
+  NSString *rest = [@"" stringByPaddingToLength:16
+                                     withString:@"A"
+                                startingAtIndex:0];
+  NSString *crlf = [NSString stringWithFormat:@"%@\r\n%@", line, rest];
+  NSString *lf = [NSString stringWithFormat:@"%@\n%@", line, rest];
+  if (![[foobar base64EncodedStringWithOptions:0] isEqualToString:@"Zm9vYmFy"])
+    result = -1;
+  else if (![[[NSData dataWithBytes:"" length:0]
+                 base64EncodedStringWithOptions:0] isEqualToString:@""])
+    result = -2;
+  else if (![[long_data base64EncodedStringWithOptions:1] isEqualToString:crlf])
+    result = -3;
+  else if (![[long_data base64EncodedStringWithOptions:(1 | 32)]
+                 isEqualToString:lf])
+    result = -4;
+  [pool drain];
   return result;
 }
 // clang-format on
