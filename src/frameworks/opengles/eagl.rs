@@ -181,6 +181,12 @@ pub(super) struct GLShadowState {
     pub(super) guest_bound_attribs: HashMap<GLuint, std::collections::HashSet<String>>,
     /// Dimensions and format for PVRTC levels expanded to RGBA storage.
     pub(super) pvrtc_texture_levels: HashMap<(GLenum, GLuint, GLint), (GLsizei, GLsizei, GLenum)>,
+    /// PVRTC levels whose RGBA storage has not been materialized yet. Set by
+    /// the `glTexStorage2D` PVRTC emulation (immutable storage is skipped when
+    /// the host can't take the PVRTC internalformat) and cleared once the
+    /// level is first allocated via `glTexImage2D`, so subsequent updates can
+    /// use `glTexSubImage2D`.
+    pub(super) pvrtc_unallocated_levels: HashSet<(GLenum, GLuint, GLint)>,
     pub(super) current_vertex_array: GLuint,
     pub(super) software_vertex_arrays: HashSet<GLuint>,
     pub(super) software_vao_element_array_buffers: HashMap<GLuint, GLuint>,
@@ -206,6 +212,7 @@ impl Default for GLShadowState {
             generic_attribs_used: false,
             guest_bound_attribs: HashMap::new(),
             pvrtc_texture_levels: HashMap::new(),
+            pvrtc_unallocated_levels: HashSet::new(),
             current_vertex_array: 0,
             software_vertex_arrays: HashSet::new(),
             software_vao_element_array_buffers: HashMap::new(),
@@ -268,10 +275,43 @@ impl GLShadowState {
         level: GLint,
     ) {
         self.pvrtc_texture_levels.remove(&(target, texture, level));
+        self.pvrtc_unallocated_levels
+            .remove(&(target, texture, level));
     }
     pub(super) fn forget_pvrtc_texture(&mut self, texture: GLuint) {
         self.pvrtc_texture_levels
             .retain(|key, _| key.1 != texture);
+        self.pvrtc_unallocated_levels.retain(|key| key.1 != texture);
+    }
+    /// Mark a PVRTC level as not yet materialized: its first upload must use
+    /// `glTexImage2D` (which defines the level) instead of
+    /// `glTexSubImage2D` (which requires the level to already exist).
+    pub(super) fn record_pvrtc_unallocated_level(
+        &mut self,
+        target: GLenum,
+        texture: GLuint,
+        level: GLint,
+    ) {
+        self.pvrtc_unallocated_levels
+            .insert((target, texture, level));
+    }
+    pub(super) fn pvrtc_level_unallocated(
+        &self,
+        target: GLenum,
+        texture: GLuint,
+        level: GLint,
+    ) -> bool {
+        self.pvrtc_unallocated_levels
+            .contains(&(target, texture, level))
+    }
+    pub(super) fn mark_pvrtc_level_allocated(
+        &mut self,
+        target: GLenum,
+        texture: GLuint,
+        level: GLint,
+    ) {
+        self.pvrtc_unallocated_levels
+            .remove(&(target, texture, level));
     }
     pub(super) fn record_element_array_buffer_binding(&mut self, buffer: GLuint) {
         self.element_array_buffer = Some(buffer);

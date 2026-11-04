@@ -568,6 +568,9 @@ impl GLES for GLES2Native<'_> {
     fn is_es2(&self) -> bool {
         true
     }
+    fn pvrtc_native(&self) -> bool {
+        self.pvrtc_native
+    }
 
     unsafe fn driver_description(&self) -> String {
         let version = CStr::from_ptr(gles2::GetString(gles2::VERSION) as *const _);

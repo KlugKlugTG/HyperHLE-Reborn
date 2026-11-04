@@ -286,6 +286,9 @@ impl GLES for GLES3OnGL3<'_> {
         // `present_renderbuffer` and friends, so keep it true.
         true
     }
+    fn pvrtc_native(&self) -> bool {
+        self.pvrtc_native
+    }
     fn is_es3(&self) -> bool {
         self.advertise_es3
     }

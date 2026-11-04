@@ -437,6 +437,18 @@ pub trait GLES {
     fn is_es2(&self) -> bool {
         false
     }
+
+    /// Returns `true` if the host driver natively implements PVRTC compressed
+    /// texture formats (`GL_IMG_texture_compression_pvrtc`). When `false`, the
+    /// guest layer must emulate immutable PVRTC textures from `glTexStorage2D`
+    /// by software-decoding uploads to RGBA (see `glTexStorage2D` and
+    /// `glCompressedTexSubImage2D`). Apps targeting iPhone OS (Gameloft games,
+    /// for example) commonly allocate their texture atlases this way on the
+    /// OpenGL ES 3.0 API, where a driver without PVRTC rejects the
+    /// internalformat with `GL_INVALID_ENUM` and the texture stays black.
+    fn pvrtc_native(&self) -> bool {
+        false
+    }
     /// Returns `true` when this backend translates the guest fixed-function
     /// GLES 1.1 API into a shader-based host API. Translators need a more
     /// conservative presentation path on mobile drivers because switching
