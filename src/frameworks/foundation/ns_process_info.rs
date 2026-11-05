@@ -20,8 +20,11 @@ use super::NSTimeInterval;
 use crate::abi::{impl_GuestRet_for_large_struct, GuestArg};
 use crate::frameworks::foundation::ns_string;
 use crate::libc::mach::host::physical_memory;
+use crate::libc::sysctl::GUEST_PROCESSOR_COUNT;
 use crate::mem::SafeRead;
-use crate::objc::{id, msg, msg_class, nil, objc_classes, release, retain, ClassExports};
+use crate::objc::{
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports,
+};
 use crate::Environment;
 use std::collections::HashMap;
 
@@ -171,7 +174,28 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)environment {
     assert_process_info_singleton(env, this);
-    msg_class![env; NSDictionary dictionary]
+    // Snapshot the emulated process environment, not the host's variables.
+    let vars: Vec<(String, String)> = env
+        .env_vars
+        .iter()
+        .map(|(key, value)| {
+            (
+                String::from_utf8_lossy(key).into_owned(),
+                env.mem.cstr_at_utf8(*value).unwrap().to_string(),
+            )
+        })
+        .collect();
+    let dictionary: id = msg_class![env; NSMutableDictionary new];
+    for (key, value) in vars {
+        let key = ns_string::from_rust_string(env, key);
+        let value = ns_string::from_rust_string(env, value);
+        () = msg![env; dictionary setObject:value forKey:key];
+        release(env, key);
+        release(env, value);
+    }
+    let snapshot: id = msg![env; dictionary copy];
+    release(env, dictionary);
+    autorelease(env, snapshot)
 }
 
 // =========================================================================
@@ -185,12 +209,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (u32)processorCount {
     assert_process_info_singleton(env, this);
-    1
+    GUEST_PROCESSOR_COUNT as u32
 }
 
 - (u32)activeProcessorCount {
     assert_process_info_singleton(env, this);
-    1
+    GUEST_PROCESSOR_COUNT as u32
 }
 
 // =========================================================================

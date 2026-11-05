@@ -3753,7 +3753,36 @@ fn glIsRenderbufferOES(env: &mut Environment, renderbuffer: GLuint) -> GLboolean
         gles.IsRenderbufferOES(renderbuffer)
     })
 }
+/// BioShock's framebuffer bind in `[EAGLView CreateFramebuffer:]` returns here.
+const BIOSHOCK_CREATE_FRAMEBUFFER_RETURN: u32 = 0x187ff6c;
+/// `FES2RHI::SetRenderTarget`'s tail call for the default framebuffer, and the
+/// instruction expected at that address (`b _glBindFramebuffer`).
+const BIOSHOCK_BIND_DEFAULT_FRAMEBUFFER: (u32, u32) = (0x17bf528, 0xea04c912);
+
+/// BioShock renders to the default framebuffer unless it uses multisampling,
+/// which we don't advertise. It finds that framebuffer by querying the binding,
+/// but only after already having bound 0, which isn't a usable target on iOS.
+/// Remember the framebuffer its EAGLView made and use that instead of 0.
+fn bioshock_framebuffer(env: &mut Environment, framebuffer: GLuint) -> GLuint {
+    if env.bundle.bundle_identifier() != "com.2k.bioshock" {
+        return framebuffer;
+    }
+    let (address, instruction) = BIOSHOCK_BIND_DEFAULT_FRAMEBUFFER;
+    if env.mem.read(ConstPtr::<u32>::from_bits(address)) != instruction {
+        return framebuffer;
+    }
+    let state = &mut env.framework_state.opengles;
+    if framebuffer == 0 {
+        return state.bioshock_view_framebuffer;
+    }
+    if env.cpu.regs()[crate::cpu::Cpu::LR] == BIOSHOCK_CREATE_FRAMEBUFFER_RETURN {
+        state.bioshock_view_framebuffer = framebuffer;
+    }
+    framebuffer
+}
+
 fn glBindFramebufferOES(env: &mut Environment, target: GLenum, framebuffer: GLuint) {
+    let framebuffer = bioshock_framebuffer(env, framebuffer);
     let thread = env.current_thread;
     env.framework_state
         .opengles

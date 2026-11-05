@@ -36,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -6433,8 +6434,62 @@ int test_stat_inode_identifies_file(void);
 int test_access_mode_bits_and_TMPDIR(void);
 int test_NSPredicate_predicateWithBlock(void);
 int test_NSString_longLongValue(void);
+int test_munmap_partial_mapping(void);
+int test_NSUserDefaults_persistentDomain(void);
 int test_NSData_base64EncodedStringWithOptions(void);
 // clang-format on
+
+int test_munmap_partial_mapping(void) {
+  size_t page = (size_t)getpagesize();
+  unsigned char *mapping = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (mapping == MAP_FAILED)
+    return 1;
+  mapping[0] = 42;
+  mapping[2 * page] = 73;
+  if (munmap(mapping + page, 1))
+    return 2;
+  void *middle = mmap(mapping + page, page, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANON, -1, 0);
+  int result =
+      middle != mapping + page || mapping[0] != 42 || mapping[2 * page] != 73
+          ? 3
+          : 0;
+  if (middle != MAP_FAILED && middle != mapping + page)
+    munmap(middle, page);
+  if (munmap(mapping, 3 * page) && result == 0)
+    result = 4;
+  return result;
+}
+
+int test_NSUserDefaults_persistentDomain(void) {
+  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+  NSString *domain = [[NSBundle mainBundle] bundleIdentifier];
+  NSString *key = @"PodroidPersistentDomainTest";
+  id previous = [[defaults objectForKey:key] retain];
+  [defaults registerDefaults:@{@"PodroidRegisteredOnlyTest" : @"fallback"}];
+  [defaults setObject:@"before" forKey:key];
+  NSDictionary *snapshot = [[defaults persistentDomainForName:domain] retain];
+  int result = 0;
+  if (![[snapshot objectForKey:key] isEqual:@"before"])
+    result = 1;
+  if ([snapshot objectForKey:@"PodroidRegisteredOnlyTest"] != nil)
+    result = 2;
+  [defaults setObject:@"after" forKey:key];
+  if (![[snapshot objectForKey:key] isEqual:@"before"])
+    result = 3;
+  if ([defaults persistentDomainForName:@"PodroidMissingDomainTest"] != nil)
+    result = 4;
+  if ([defaults persistentDomainForName:@"NSRegistrationDomain"] != nil)
+    result = 5;
+  if (previous)
+    [defaults setObject:previous forKey:key];
+  else
+    [defaults removeObjectForKey:key];
+  [snapshot release];
+  [previous release];
+  return result;
+}
 
 // clang-format off
 // Tests marked XFUNC_DEF assert behaviour that PR #259 ("fix testapp
@@ -6568,6 +6623,8 @@ struct {
     FUNC_DEF(test_NSPredicate_predicateWithBlock),
     FUNC_DEF(test_NSString_longLongValue),
     FUNC_DEF(test_NSData_base64EncodedStringWithOptions),
+    FUNC_DEF(test_munmap_partial_mapping),
+    FUNC_DEF(test_NSUserDefaults_persistentDomain),
 };
 
 // The dispatch tests that used to live here are gone with the revert of

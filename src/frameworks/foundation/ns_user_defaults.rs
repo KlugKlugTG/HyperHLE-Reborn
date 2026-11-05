@@ -8,7 +8,7 @@
 //! References:
 //! - Apple's [Preferences and Settings Programming Guide](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/UserDefaults/AboutPreferenceDomains/AboutPreferenceDomains.html).
 
-use super::{ns_string, NSInteger};
+use super::{ns_string, NSInteger, NSUInteger};
 use crate::frameworks::foundation::ns_string::to_rust_string;
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, Class, ClassExports, HostObject,
@@ -136,6 +136,32 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.dealloc_object(this, &mut env.mem);
 }
 
+// A domain snapshot excludes registration defaults and other search domains.
+- (id)persistentDomainForName:(id)domain_name {
+    let name = to_rust_string(env, domain_name);
+    let dict: id = if name == env.bundle.bundle_identifier() {
+        env.objc.borrow::<NSUserDefaultsHostObject>(this).app_domain_dict
+    } else {
+        // Only preferences in the guest's Preferences directory are visible.
+        if name.is_empty() || name.contains('/') || name == "." || name == ".."
+            || name == "NSRegistrationDomain" || name == "NSArgumentDomain" {
+            return nil;
+        }
+        let path = env.fs.home_directory().join("Library").join("Preferences")
+            .join(format!("{name}.plist"));
+        let path = ns_string::from_rust_string(env, path.as_str().to_string());
+        let dict = msg_class![env; NSDictionary dictionaryWithContentsOfFile:path];
+        release(env, path);
+        dict
+    };
+    let count: NSUInteger = msg![env; dict count];
+    if count == 0 {
+        return nil;
+    }
+    let snapshot: id = msg![env; dict copy];
+    autorelease(env, snapshot)
+}
+
 - (id)dictionaryRepresentation { // NSDictionary *
     let dict = msg_class![env; NSMutableDictionary new];
     let registration_domain_dict = env.objc.borrow::<NSUserDefaultsHostObject>(this).registration_domain_dict;
@@ -239,11 +265,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; dict addEntriesFromDictionary:domain];
 }
 
-- (id)persistentDomainForName:(id)_domain_name { // NSString*
-    let dict = env.objc.borrow::<NSUserDefaultsHostObject>(this).app_domain_dict;
-    let copy: id = msg![env; dict copy];
-    autorelease(env, copy)
-}
 
 - (())removePersistentDomainForName:(id)_domain_name { // NSString*
     log_dbg!("NSUserDefaults removePersistentDomainForName: stubbed");

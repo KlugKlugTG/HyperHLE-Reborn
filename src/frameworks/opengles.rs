@@ -41,6 +41,8 @@ pub struct State {
     sync_objects: std::collections::HashMap<GLuint, gles_guest::GuestSyncObject>,
     /// Next candidate guest `GLsync` handle (0 is never handed out).
     next_sync_handle: GLuint,
+    /// See [gles_guest]'s `bioshock_framebuffer`.
+    bioshock_view_framebuffer: GLuint,
     /// The framebuffer object the guest currently has bound, per thread.
     bound_framebuffers: std::collections::HashMap<crate::ThreadId, GLuint>,
     /// Framebuffer objects whose colour attachment is a *texture*.

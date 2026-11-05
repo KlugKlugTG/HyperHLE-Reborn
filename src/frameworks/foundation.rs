@@ -1583,6 +1583,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     constant_exports: &[
         ns_calendar::CONSTANTS,
         ns_error::CONSTANTS,
+        ns_url::CONSTANTS,
         ns_exception::CONSTANTS,
         ns_file_manager::CONSTANTS,
         ns_keyed_unarchiver::CONSTANTS,
@@ -1620,6 +1621,7 @@ pub struct State {
     pub ns_undo_manager: ns_undo_manager::State,
     ns_user_defaults: ns_user_defaults::State,
     ns_url_session: ns_url_session::State,
+    ns_value: ns_value::State,
     url_protocol: url_protocol::State,
     /// Singleton for [NSURLCache sharedURLCache].
     pub url_cache_singleton: crate::objc::id,

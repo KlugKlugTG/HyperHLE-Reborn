@@ -14,6 +14,9 @@ use crate::libc::sysctl::SysInfoType::String;
 use crate::mem::{guest_size_of, ConstPtr, GuestUSize, MutPtr, MutVoidPtr, PAGE_SIZE};
 use crate::Environment;
 
+/// Number of CPUs the emulated device reports (iPhone 2G/3GS are single-core).
+pub(crate) const GUEST_PROCESSOR_COUNT: i32 = 1;
+
 static SYSCTL_VALUES: [((i32, i32), &str, SysInfoType); 38] = [
     // Generic CPU, I/O
     ((6,1), "hw.machine" , String(b"iPhone2,1")), // overridden dynamically below

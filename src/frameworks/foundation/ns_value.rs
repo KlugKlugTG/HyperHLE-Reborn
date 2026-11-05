@@ -40,6 +40,14 @@ use crate::objc::{
 };
 use crate::Environment;
 use std::cmp::Ordering;
+use std::collections::HashMap;
+
+/// Per-process cache for `-objCType` strings, so repeated calls return a
+/// stable pointer (some engines compare the pointers instead of the text).
+#[derive(Default)]
+pub struct State {
+    encodings: HashMap<&'static str, ConstPtr<u8>>,
+}
 
 #[derive(Debug)]
 pub(super) enum NSValueHostObject {
@@ -1216,6 +1224,25 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (i32)longValue {
     env.objc.borrow::<NSNumberHostObject>(this).as_int()
+}
+
+- (ConstPtr<u8>)objCType {
+    use NSNumberHostObject::*;
+    let encoding = match env.objc.borrow::<NSNumberHostObject>(this) {
+        Bool(_) | Char(_) => "c",
+        UnsignedLongLong(_) => "Q",
+        UnsignedInt(_) => "I",
+        Int(_) => "i",
+        LongLong(_) => "q",
+        Float(_) => "f",
+        Double(_) => "d",
+        Short(_) => "s",
+        UnsignedShort(_) => "S",
+    };
+    let encodings = &mut env.framework_state.foundation.ns_value.encodings;
+    *encodings
+        .entry(encoding)
+        .or_insert_with(|| env.mem.alloc_and_write_cstr(encoding.as_bytes()).cast_const())
 }
 
 - (f32)floatValue {

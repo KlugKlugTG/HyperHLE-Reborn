@@ -83,6 +83,8 @@ pub fn prep_stack_for_start(
         push_string(arg, &mut reversed_data, &mut string_ptrs, stack_base);
     }
 
+    string_ptrs.push(0); // argv terminator
+
     for arg in envp {
         push_string(arg, &mut reversed_data, &mut string_ptrs, stack_base);
     }
@@ -150,5 +152,33 @@ pub fn prep_stack_for_start(
         regs[1] = argv_ptr;
         regs[2] = envp_ptr;
         regs[3] = apple_ptr;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_vectors_have_separate_terminators() {
+        let mut mem = Mem::new();
+        let mut cpu = Cpu::new(None);
+        prep_stack_for_start(
+            &mut mem,
+            &mut cpu,
+            &["game", "-test"],
+            &["HOME=/home"],
+            &["executable_path=game"],
+            false,
+        );
+        let sp: MutPtr<u32> = Ptr::from_bits(cpu.regs()[Cpu::SP]);
+        assert_eq!(mem.read(sp), 2);
+        assert_eq!(mem.read(sp + 3), 0);
+        assert_eq!(mem.read(sp + 5), 0);
+        assert_eq!(mem.read(sp + 7), 0);
+        let env: MutPtr<u8> = Ptr::from_bits(mem.read(sp + 4));
+        assert_eq!(mem.cstr_at_utf8(env).unwrap(), "HOME=/home");
+        let apple: MutPtr<u8> = Ptr::from_bits(mem.read(sp + 6));
+        assert_eq!(mem.cstr_at_utf8(apple).unwrap(), "executable_path=game");
     }
 }
