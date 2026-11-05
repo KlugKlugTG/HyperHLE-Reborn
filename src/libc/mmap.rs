@@ -292,13 +292,26 @@ fn munmap(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize) -> i32 {
         env.libc_state.mmap.allocations.remove(&addr);
         0 // success
     } else {
-        log!(
-            "Warning: munmap({:?}, {}): unknown mapping, returning -1",
+        // Darwin's `munmap` only rejects invalid arguments: unmapping a range
+        // that holds no mapping is a successful no-op, not an error.
+        // <https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/munmap.2.html>
+        //
+        // Reporting `EINVAL` here made BioShock abort during startup: its
+        // allocator releases memory in ranges that do not line up with one of
+        // our whole `mmap` allocations (and with ranges that `mmap` with
+        // `MAP_FIXED` replaced rather than created), and it treats any
+        // `munmap` failure as fatal.
+        //
+        // Guest memory has no page protections, so keeping the range mapped is
+        // harmless: it stays valid and either gets released together with the
+        // allocation that owns it, or costs host memory until exit.
+        log_dbg!(
+            "munmap({:?}, {}): no tracked mapping at this address, treating as no-op",
             addr,
             len
         );
-        set_errno(env, EINVAL);
-        -1
+        set_errno(env, 0);
+        0
     }
 }
 
