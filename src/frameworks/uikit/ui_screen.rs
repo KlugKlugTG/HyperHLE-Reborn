@@ -5,6 +5,7 @@
  */
 //! `UIScreen`.
 
+use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::NSInteger;
 use crate::frameworks::uikit::ui_geometry::UIEdgeInsets;
@@ -12,6 +13,17 @@ use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, ClassExports, HostObject,
     TrivialHostObject, SEL,
 };
+
+pub const CONSTANTS: ConstantExports = &[
+    (
+        "_UIScreenDidConnectNotification",
+        HostConstant::NSString("UIScreenDidConnectNotification"),
+    ),
+    (
+        "_UIScreenDidDisconnectNotification",
+        HostConstant::NSString("UIScreenDidDisconnectNotification"),
+    ),
+];
 
 #[derive(Default)]
 pub struct State {

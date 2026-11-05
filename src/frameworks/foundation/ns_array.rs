@@ -465,6 +465,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
+- (())makeObjectsPerformSelector:(SEL)sel {
+    let count: NSUInteger = msg![env; this count];
+    for idx in 0..count {
+        let obj: id = msg![env; this objectAtIndex:idx];
+        let _: id = msg![env; obj performSelector:sel];
+    }
+}
+
 // Apple's
 // <https://developer.apple.com/documentation/foundation/nsarray/1415846-enumerateobjectsusingblock>:
 // iterates the receiver and, for each element, calls the supplied
@@ -1120,14 +1128,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     env.objc.dealloc_object(this, &mut env.mem)
-}
-
-- (())makeObjectsPerformSelector:(SEL)sel {
-    let count: NSUInteger = msg![env; this count];
-    for idx in 0..count {
-        let obj: id = msg![env; this objectAtIndex:idx];
-        let _: id = msg![env; obj performSelector:sel];
-    }
 }
 
 - (id)objectEnumerator { // NSEnumerator*

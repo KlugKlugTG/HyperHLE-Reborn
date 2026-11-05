@@ -1290,8 +1290,12 @@ fn wcstombs(
     pwcs: MutPtr<wchar_t>,
     n: GuestUSize,
 ) -> GuestUSize {
+    // The conversion below produces UTF-8, which is also right for ASCII text
+    // in the C locale. BioShock switches LC_CTYPE to UTF-8 before calling this.
+    // TODO: support other locales
     let ctype_locale = setlocale(env, LC_CTYPE, Ptr::null());
-    assert_eq!(env.mem.read(ctype_locale), b'C');
+    let ctype_locale = env.mem.cstr_at(ctype_locale);
+    assert!(ctype_locale == b"C" || ctype_locale.ends_with(b"UTF-8"));
     if n == 0 {
         return 0;
     }

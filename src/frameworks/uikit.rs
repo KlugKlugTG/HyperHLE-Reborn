@@ -996,6 +996,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     constant_exports: &[
         ui_application::CONSTANTS,
         ui_device::CONSTANTS,
+        ui_screen::CONSTANTS,
         ui_geometry::CONSTANTS,
         ui_keyboard::CONSTANTS,
         ui_local_notification::CONSTANTS,

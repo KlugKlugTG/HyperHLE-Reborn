@@ -61,6 +61,20 @@ static inline NSRange NSMakeRange(NSUInteger loc, NSUInteger len) {
 - (BOOL)respondsToSelector:(SEL)selector;
 @end
 
+@interface NSBundle : NSObject
++ (NSBundle *)mainBundle;
+- (id)bundleIdentifier;
+@end
+
+@interface NSUserDefaults : NSObject
++ (NSUserDefaults *)standardUserDefaults;
+- (id)objectForKey:(id)key;
+- (void)setObject:(id)value forKey:(id)key;
+- (void)removeObjectForKey:(id)key;
+- (void)registerDefaults:(id)defaults;
+- (id)persistentDomainForName:(id)domain;
+@end
+
 @interface NSAutoreleasePool : NSObject
 + (void)addObject:(id)anObject;
 - (void)addObject:(id)anObject;
