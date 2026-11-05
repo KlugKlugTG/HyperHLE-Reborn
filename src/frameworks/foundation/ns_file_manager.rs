@@ -372,6 +372,20 @@ fn copy_item_recursive(env: &mut Environment, src: &GuestPath, dst: &GuestPath) 
     }
 }
 
+/// Fills `*error` with a `NSCocoaErrorDomain` "no such file" error, if the
+/// caller asked for one. Shared by the directory-listing methods, which all
+/// report a missing or unreadable directory the same way.
+fn set_read_no_such_file_error(env: &mut Environment, error: MutPtr<id>) {
+    if error.is_null() {
+        return;
+    }
+    let domain = get_static_str(env, NSCocoaErrorDomain);
+    let ns_error = msg_class![env; NSError alloc];
+    let ns_error =
+        msg![env; ns_error initWithDomain:domain code:NSFileReadNoSuchFileError userInfo:nil];
+    env.mem.write(error, ns_error);
+}
+
 #[derive(Default)]
 pub struct State {
     default_manager: Option<id>,
@@ -457,6 +471,68 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 // MARK: - Discovering Directory Contents
+
+/// `-[NSFileManager
+/// contentsOfDirectoryAtURL:includingPropertiesForKeys:options:error:]`
+///
+/// Unlike `contentsOfDirectoryAtPath:error:`, this returns the full `NSURL`s of
+/// the directory's immediate children, not bare file names, and it honours
+/// `NSDirectoryEnumerationSkipsHiddenFiles`.
+///
+/// `keys` is only a prefetch hint for the resource values the caller intends to
+/// read later (`NSURLResourceKey`s); the returned URLs carry those values
+/// lazily anyway, so it is accepted and ignored.
+///
+/// The other enumeration options do not apply here: this method never descends
+/// into subdirectories, and package-vs-directory treatment would require the
+/// (not modelled) iOS package concept.
+- (id)contentsOfDirectoryAtURL:(id)url
+   includingPropertiesForKeys:(id)keys
+                      options:(NSUInteger)options
+                        error:(MutPtr<id>)error {
+    let _ = keys;
+
+    let path: id = if url.is_null() {
+        nil
+    } else {
+        msg![env; url path]
+    };
+    if path.is_null() {
+        set_read_no_such_file_error(env, error);
+        return nil;
+    }
+
+    let path = ns_string::to_rust_string(env, path);
+    // A trailing slash (from `URLByAppendingPathComponent:isDirectory:YES`)
+    // would otherwise produce a doubled separator when joining child names.
+    let base = path.trim_end_matches('/');
+    let base = if base.is_empty() { "/" } else { base };
+
+    let Ok(names) = env.fs.enumerate(GuestPath::new(base)) else {
+        set_read_no_such_file_error(env, error);
+        return nil;
+    };
+    let names: Vec<String> = names.map(|name| name.to_string()).collect();
+
+    let child_urls: Vec<id> = names
+        .iter()
+        .filter(|name| {
+            options & NSDirectoryEnumerationSkipsHiddenFiles == 0 || !name.starts_with('.')
+        })
+        .map(|name| {
+            let child = if base.ends_with('/') {
+                format!("{base}{name}")
+            } else {
+                format!("{base}/{name}")
+            };
+            let ns_child_path = ns_string::from_rust_string(env, child);
+            msg_class![env; NSURL fileURLWithPath:ns_child_path]
+        })
+        .collect();
+
+    let contents = ns_array::from_vec(env, child_urls);
+    autorelease(env, contents)
+}
 
 - (id)contentsOfDirectoryAtPath:(id)path
                           error:(MutPtr<id>)error {
