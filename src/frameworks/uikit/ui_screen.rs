@@ -177,6 +177,30 @@ fn new_trait_collection(
     autorelease(env, collection)
 }
 
+/// Backing object for the `id<UICoordinateSpace>` values that `UIScreen`
+/// returns. It only needs `bounds`, because conversions between the screen's
+/// own coordinate spaces are the identity.
+struct UICoordinateSpaceHostObject {
+    bounds: CGRect,
+}
+impl HostObject for UICoordinateSpaceHostObject {}
+
+/// Create the coordinate-space object for `screen`. Apple returns a
+/// long-lived object here; we return an autoreleased one because nothing in
+/// the emulator retains it.
+fn new_screen_coordinate_space(env: &mut crate::Environment, screen: id) -> id {
+    let bounds: CGRect = msg![env; screen bounds];
+    let class = env
+        .objc
+        .get_known_class("UICoordinateSpace", &mut env.mem);
+    let object = env.objc.alloc_object(
+        class,
+        Box::new(UICoordinateSpaceHostObject { bounds }),
+        &mut env.mem,
+    );
+    autorelease(env, object)
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -442,29 +466,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 @end
-
-// MARK: - Screen coordinate space
-
-/// Backing object for the `id<UICoordinateSpace>` values that `UIScreen`
-/// returns. It only needs `bounds`, because conversions between the screen's
-/// own coordinate spaces are the identity.
-struct UICoordinateSpaceHostObject {
-    bounds: CGRect,
-}
-impl HostObject for UICoordinateSpaceHostObject {}
-
-fn new_screen_coordinate_space(env: &mut crate::Environment, screen: id) -> id {
-    let bounds: CGRect = msg![env; screen bounds];
-    let class = env
-        .objc
-        .get_known_class("UICoordinateSpace", &mut env.mem);
-    let object = env.objc.alloc_object(
-        class,
-        Box::new(UICoordinateSpaceHostObject { bounds }),
-        &mut env.mem,
-    );
-    autorelease(env, object)
-}
 
 @implementation UICoordinateSpace: NSObject
 
