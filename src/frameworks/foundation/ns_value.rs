@@ -1375,26 +1375,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     from_rust_ordering(ordering)
 }
 
-// Returns the Objective-C type encoding for the wrapped number.
-- (ConstVoidPtr)objCType {
-    let typ: &[u8; 2] = match env.objc.borrow::<NSNumberHostObject>(this) {
-        NSNumberHostObject::Bool(_) | NSNumberHostObject::Char(_) => b"c\0",
-        NSNumberHostObject::UnsignedLongLong(_) => b"Q\0",
-        NSNumberHostObject::UnsignedInt(_) => b"I\0",
-        NSNumberHostObject::Int(_) => b"i\0",
-        NSNumberHostObject::LongLong(_) => b"q\0",
-        NSNumberHostObject::Float(_) => b"f\0",
-        NSNumberHostObject::Double(_) => b"d\0",
-        NSNumberHostObject::Short(_) => b"s\0",
-        NSNumberHostObject::UnsignedShort(_) => b"S\0",
-    };
-    // Переводим [u8; 2] в u16 (little-endian), так как u16 поддерживает
-    // SafeWrite
-    let typ_val = u16::from_le_bytes(*typ);
-    // Выделяем память под u16 и возвращаем указатель
-    env.mem.alloc_and_write(typ_val).cast_void().cast_const()
-}
-
 // MARK: - CGFloat accessors
 
 // On this 32-bit platform `CGFloat` is a 32-bit float, so these are

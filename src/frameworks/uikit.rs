@@ -278,10 +278,6 @@ pub const CONSTANTS: &[(&str, HostConstant)] = &[
         HostConstant::NSString("UIImagePickerControllerReferenceURL"),
     ),
     (
-        "_UIScreenDidConnectNotification",
-        HostConstant::NSString("UIScreenDidConnectNotification"),
-    ),
-    (
         "_UIPageViewControllerOptionSpineLocationKey",
         HostConstant::NSString("UIPageViewControllerOptionSpineLocationKey"),
     ),
@@ -412,15 +408,6 @@ pub const CONSTANTS: &[(&str, HostConstant)] = &[
     (
         "_UIScrollViewDecelerationRateFast",
         HostConstant::Custom(ui_scroll_view_deceleration_rate_fast),
-    ),
-    // -----------------------------------------------------------------
-    // UIScreen disconnect notification (paired with the existing
-    // UIScreenDidConnectNotification above), per
-    // <https://developer.apple.com/documentation/uikit/uiscreen/1617835-disconnect>.
-    // -----------------------------------------------------------------
-    (
-        "_UIScreenDidDisconnectNotification",
-        HostConstant::NSString("UIScreenDidDisconnectNotification"),
     ),
     (
         "_UIScreenModeDidChangeNotification",
