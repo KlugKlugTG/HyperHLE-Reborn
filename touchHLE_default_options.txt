@@ -105,6 +105,13 @@ com.polarbit.waveblazer: --landscape-left
 # Command & Conquer: Red Alert
 com.ea.candcra.row: --landscape-left
 
+# Hill Climb Racing
+# (landscape-only; it takes its layout from the window bounds and declares no
+# interface orientation, so it must start in landscape. It also draws its
+# frames already rotated for a landscape interface, so the orientation-derived
+# presentation rotation must not be applied on top of them.)
+com.fingersoft.hillclimbracing: --landscape-left --present-rotate=0
+
 # Reiner Knizia's Ra
 # (landscape-only; the root view controller only autorotates once the device
 # is already landscape when its view is added to the window)
