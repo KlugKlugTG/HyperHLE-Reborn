@@ -38,6 +38,7 @@ The titles below have been tested with HyperHLE-Reborn and are known to run. Com
 - Asphalt 8 1.0.0-1.4.0 (Playable)
 - GTA 3 (Ingame)
 - Granny (Ingame)
+- BioShock (Ingame, not tested)
 - Talking Tom Hero Dash (Playable)
 - My Talking Hank (Playable)
 - Subway Surfers 1.118.0 (Playable)
@@ -59,5 +60,7 @@ For iOS build steps and the unsigned IPAs, see [`platform/ios`](platform/ios/REA
 Join the [HyperHLE Discord server](https://discord.gg/ZpEkAV47H9) to discuss the project and contribute.
 
 ## Credits and license
+
+Thanks to the [Podroid](https://github.com/shawnw67/Podroid) fork: with it, BioShock gets through its level loads and runs in-game here.
 
 HyperHLE-Reborn carries forward work from HyperHLE and touchHLE contributors and uses open-source libraries. It is licensed under the [Mozilla Public License 2.0](LICENSE); see the individual projects for their respective notices and licenses.
