@@ -63,7 +63,7 @@ Join the [HyperHLE Discord server](https://discord.gg/ZpEkAV47H9) to discuss the
 
 Thanks to everyone who got BioShock this far in HyperHLE:
 
-- **Tog991**, developer of [HyperHLE](https://github.com/HyperHLE/HyperHLE), fixed the game's launch itself.
+- **Tog991 (goodvids56)**, developer of [HyperHLE](https://github.com/HyperHLE/HyperHLE), fixed the game's launch itself.
 - **uxazu**, creator of Aemulator, fixed the game up to the menu and half-implemented the video player.
 - The [Podroid](https://github.com/shawnw67/Podroid) fork got it through its level loads and in-game.
 
