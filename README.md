@@ -61,6 +61,10 @@ Join the [HyperHLE Discord server](https://discord.gg/ZpEkAV47H9) to discuss the
 
 ## Credits and license
 
-Thanks to the [Podroid](https://github.com/shawnw67/Podroid) fork: with it, BioShock gets through its level loads and runs in-game here.
+Thanks to everyone who got BioShock this far in HyperHLE:
+
+- **Tog991**, developer of [HyperHLE](https://github.com/HyperHLE/HyperHLE), fixed the game's launch itself.
+- **uxazu**, creator of Aemulator, fixed the game up to the menu and half-implemented the video player.
+- The [Podroid](https://github.com/shawnw67/Podroid) fork got it through its level loads and in-game.
 
 HyperHLE-Reborn carries forward work from HyperHLE and touchHLE contributors and uses open-source libraries. It is licensed under the [Mozilla Public License 2.0](LICENSE); see the individual projects for their respective notices and licenses.
