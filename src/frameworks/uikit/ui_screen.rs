@@ -180,6 +180,7 @@ fn new_trait_collection(
 /// Backing object for the `id<UICoordinateSpace>` values that `UIScreen`
 /// returns. It only needs `bounds`, because conversions between the screen's
 /// own coordinate spaces are the identity.
+#[derive(Default)]
 struct UICoordinateSpaceHostObject {
     bounds: CGRect,
 }
