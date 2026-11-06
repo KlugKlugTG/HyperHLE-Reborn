@@ -78,6 +78,14 @@ const AVAudioSessionCategoryOptionInterruptSpokenAudioAndMixWithOthers:
 const AVAudioSessionCategoryOptionAllowBluetoothA2DP: AVAudioSessionCategoryOptions = 0x20;
 const AVAudioSessionCategoryOptionAllowAirPlay: AVAudioSessionCategoryOptions = 0x40;
 
+// MARK: - Port override
+
+/// `AVAudioSessionPortOverride`, used by `-overrideOutputAudioPort:error:`.
+type AVAudioSessionPortOverride = NSUInteger;
+const AVAudioSessionPortOverrideNone: AVAudioSessionPortOverride = 0;
+/// Apple spells the speaker override as the four-character code `'spkr'`.
+const AVAudioSessionPortOverrideSpeaker: AVAudioSessionPortOverride = 0x7370_6b72;
+
 // MARK: - Interruption type
 
 type AVAudioSessionInterruptionType = NSUInteger;
@@ -460,6 +468,26 @@ pub const CLASSES: ClassExports = objc_classes! {
       withOptions:(NSUInteger)_options
             error:(MutPtr<id>)_error {
     env.objc.borrow_mut::<AVAudioSessionHostObject>(this).active = active;
+    true
+}
+
+// Apple's
+// <https://developer.apple.com/documentation/avfaudio/avaudiosession/1616527-overrideoutputaudioport>:
+// "Overrides the current audio route to the built-in speaker or back to the
+// default route." The override only affects audio routing, which the host
+// output backend chooses on its own, so accept it and report success. Apps
+// commonly use this for speaker playback and treat `NO` as a fatal error.
+- (bool)overrideOutputAudioPort:(AVAudioSessionPortOverride)port_override
+                          error:(MutPtr<id>)_error {
+    match port_override {
+        AVAudioSessionPortOverrideNone => {
+            log_dbg!("AVAudioSession overrideOutputAudioPort: default route")
+        }
+        AVAudioSessionPortOverrideSpeaker => {
+            log_dbg!("AVAudioSession overrideOutputAudioPort: built-in speaker")
+        }
+        other => log_dbg!("AVAudioSession overrideOutputAudioPort:{:?}", other),
+    }
     true
 }
 

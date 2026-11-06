@@ -405,8 +405,30 @@ pub const CLASSES: ClassExports = objc_classes! {
     )
 }
 
-// ИСПРАВЛЕНИЕ: Удалены методы инициализации с 6 аргументами,
-// так как они превышают лимит макросов ядра и всё равно не используются.
+// Apple's
+// <https://developer.apple.com/documentation/foundation/nsdecimalnumberhandler/1408725-decimalnumberhandlerwithroundingm>:
+// "Creates and returns an `NSDecimalNumberHandler` object initialized with
+// the given parameters."
++ (id)decimalNumberHandlerWithRoundingMode:(NSRoundingMode)rounding_mode
+                                     scale:(i16)scale
+                          raiseOnExactness:(bool)raise_on_exactness
+                           raiseOnOverflow:(bool)raise_on_overflow
+                          raiseOnUnderflow:(bool)raise_on_underflow
+                       raiseOnDivideByZero:(bool)raise_on_divide_by_zero {
+    let handler = env.objc.alloc_object(
+        this,
+        Box::new(NSDecimalNumberHandlerHostObject {
+            rounding_mode,
+            scale,
+            raise_on_exactness,
+            raise_on_overflow,
+            raise_on_underflow,
+            raise_on_divide_by_zero,
+        }),
+        &mut env.mem,
+    );
+    autorelease(env, handler)
+}
 
 - (())dealloc {
     env.objc.dealloc_object(this, &mut env.mem)
