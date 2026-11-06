@@ -1653,6 +1653,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
+    let superview = env.objc.borrow::<UIViewHostObject>(this).superview;
+    if superview != nil {
+        log!("Warning: {:?} was deallocated while in superview {:?}", this, superview);
+        {
+            let siblings = &mut env.objc.borrow_mut::<UIViewHostObject>(superview).subviews;
+            siblings.retain(|&sibling| sibling != this);
+        }
+        let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+        () = msg![env; layer removeFromSuperlayer];
+    }
+
     let UIViewHostObject {
         layer, subviews, gesture_recognizers,
         accessibility_label, accessibility_hint, accessibility_value,

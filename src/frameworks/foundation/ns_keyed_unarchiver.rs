@@ -880,6 +880,84 @@ pub fn decode_current_data(env: &mut Environment, unarchiver: id, is_mutable: bo
     data
 }
 
+/// Decode an NSString-style payload while unarchiving.
+pub fn decode_current_string(env: &mut Environment, unarchiver: id) -> id {
+    let bytes = {
+        let key = get_static_str(env, "NS.bytes");
+        get_value_to_decode_for_key(env, unarchiver, key)
+            .and_then(|value| value.as_data())
+            .map(|data| data.to_vec())
+    };
+    let string = {
+        let key = get_static_str(env, "NS.string");
+        get_value_to_decode_for_key(env, unarchiver, key)
+            .and_then(|value| value.as_string())
+            .map(str::to_owned)
+    };
+    let Some(string) = decode_string_fields(bytes.as_deref(), string.as_deref()) else {
+        log!(
+            "Warning: decode_current_string: NS.bytes and NS.string missing or invalid; \
+             returning empty string."
+        );
+        return from_rust_string(env, String::new());
+    };
+    from_rust_string(env, string)
+}
+
+fn decode_string_fields(bytes: Option<&[u8]>, string: Option<&str>) -> Option<String> {
+    bytes
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .or_else(|| string.map(str::to_owned))
+}
+
+#[cfg(test)]
+mod keyed_string_decode_tests {
+    use super::decode_string_fields;
+    use plist::Value;
+
+    #[test]
+    fn decodes_mutable_string_from_ns_string_field() {
+        // BioShock's table-cell nibs store mutable text under NS.string:
+        // https://github.com/shawnw67/Podroid/commit/1a31fab1.
+        let archived_string = Value::String("ALL 3 Player".to_owned());
+        assert_eq!(
+            decode_string_fields(None, archived_string.as_string()),
+            Some("ALL 3 Player".to_owned())
+        );
+    }
+
+    #[test]
+    fn uses_ns_string_when_ns_bytes_has_the_wrong_type() {
+        let wrong_bytes = Value::String("not data".to_owned());
+        let archived_string = Value::String("Player".to_owned());
+        assert_eq!(
+            decode_string_fields(wrong_bytes.as_data(), archived_string.as_string()),
+            Some("Player".to_owned())
+        );
+    }
+
+    #[test]
+    fn prefers_ns_bytes_when_both_string_fields_exist() {
+        let archived_bytes = Value::Data(b"Bytes".to_vec());
+        let archived_string = Value::String("String".to_owned());
+        assert_eq!(
+            decode_string_fields(archived_bytes.as_data(), archived_string.as_string()),
+            Some("Bytes".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_missing_or_wrongly_typed_string_fields() {
+        let wrong_bytes = Value::String("not data".to_owned());
+        let wrong_string = Value::Data(b"not a string".to_vec());
+        assert_eq!(decode_string_fields(None, None), None);
+        assert_eq!(
+            decode_string_fields(wrong_bytes.as_data(), wrong_string.as_string()),
+            None
+        );
+    }
+}
+
 fn keys_for_key(env: &mut Environment, unarchiver: id, key: &str) -> Vec<Uid> {
     let host_obj = borrow_host_obj(env, unarchiver);
     let Some(objects) = host_obj.plist.get("$objects").and_then(|v| v.as_array()) else {
