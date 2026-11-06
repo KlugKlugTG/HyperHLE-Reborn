@@ -2066,8 +2066,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithCoder:(id)coder {
     let class: Class = msg![env; coder class];
     let nib_archive_class: Class = msg_class![env; _touchHLE_NIBArchiveDecoder class];
+    let keyed_unarchiver_class: Class = msg_class![env; NSKeyedUnarchiver class];
     let new_str = if env.objc.class_is_subclass_of(class, nib_archive_class) {
         _nib_archive_decoder::decode_current_string(env, coder)
+    } else if env.objc.class_is_subclass_of(class, keyed_unarchiver_class) {
+        super::ns_keyed_unarchiver::decode_current_string(env, coder)
     } else {
         println!("Warning: _touchHLE_NSString initWithCoder: unsupported coder class, returning empty string");
         get_static_str(env, "")
@@ -2578,22 +2581,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithCapacity:(NSUInteger)_capacity { msg![env; this init] }
 
 - (id)initWithCoder:(id)coder {
-    // NIB archives store some UI strings (placeholder text, default
-    // contents of UITextField, IASK setting titles, etc.) as
-    // NSMutableString instances. Without this method, NIB decoding warns
-    // "does not respond to selector initWithCoder:" and the property
-    // becomes nil, which on Minecraft PE shows up as empty Create World
-    // text fields and a non-functional keyboard.
+    // NIB and keyed archives store some UI strings as NSMutableString.
     let class: Class = msg![env; coder class];
     let nib_archive_class: Class = msg_class![env; _touchHLE_NIBArchiveDecoder class];
-    if env.objc.class_is_subclass_of(class, nib_archive_class) {
-        let decoded = _nib_archive_decoder::decode_current_string(env, coder);
-        if decoded != nil {
-            () = msg![env; this setString:decoded];
-            release(env, decoded);
-        }
+    let keyed_unarchiver_class: Class = msg_class![env; NSKeyedUnarchiver class];
+    let decoded = if env.objc.class_is_subclass_of(class, nib_archive_class) {
+        _nib_archive_decoder::decode_current_string(env, coder)
+    } else if env.objc.class_is_subclass_of(class, keyed_unarchiver_class) {
+        super::ns_keyed_unarchiver::decode_current_string(env, coder)
     } else {
         println!("Warning: _touchHLE_NSMutableString initWithCoder: unsupported coder class, returning empty string");
+        return this;
+    };
+    if decoded != nil {
+        () = msg![env; this setString:decoded];
+        release(env, decoded);
     }
     this
 }
