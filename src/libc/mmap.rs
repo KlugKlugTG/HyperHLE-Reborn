@@ -280,9 +280,26 @@ fn munmap(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize) -> i32 {
     }
 
     if let Some(&expected_len) = env.libc_state.mmap.allocations.get(&addr) {
+        if len < expected_len {
+            // Unmapping part of a mapping cannot be modelled: the rest of the
+            // block still belongs to the caller. Freeing the whole block here
+            // would hand the surviving bytes to a later `mmap` while the guest
+            // still writes to them - two owners of one address range, which is
+            // exactly how a guest heap ends up with corrupted chunk headers.
+            // Keep the mapping whole; the caller releases it when it unmaps
+            // the range it still owns.
+            log_dbg!(
+                "munmap({:?}, {}): partial unmap of a {}-byte mapping, keeping the mapping",
+                addr,
+                len,
+                expected_len
+            );
+            set_errno(env, 0);
+            return 0;
+        }
         if expected_len != len {
             log_dbg!(
-                "munmap({:?}, {}): length mismatch (expected {}), proceeding anyway",
+                "munmap({:?}, {}): length exceeds the {}-byte mapping, unmapping it whole",
                 addr,
                 len,
                 expected_len
