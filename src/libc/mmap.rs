@@ -24,6 +24,159 @@ const MAP_FAILED: MutVoidPtr = MutVoidPtr::from_bits(0xFFFFFFFF);
 pub struct State {
     /// Keeping track of `mmap` allocations
     allocations: HashMap<MutVoidPtr, GuestUSize>,
+    /// Page ranges that a partial `munmap` released out of a larger mapping.
+    ///
+    /// The pages stay backed by the mapping that owns them, so the rest of that
+    /// mapping keeps working and keeps its contents, but a later `mmap` that
+    /// passes such a range as its address *hint* gets the range back. That is
+    /// what Darwin does with a free hint, and it is how callers that release
+    /// part of a mapping and immediately map something else over the hole -
+    /// Boehm GC's `GC_unmap`/`GC_remap`, and the `munmap`/`mmap` pair in
+    /// `TestApp`'s `test_munmap_partial_mapping` - expect `mmap` to behave.
+    unmapped: Vec<UnmappedRange>,
+}
+
+/// A contiguous page range that [State::unmapped] remembers, together with the
+/// base address of the mapping it was carved out of.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct UnmappedRange {
+    /// Base address of the mapping that still backs these pages.
+    base: MutVoidPtr,
+    start: GuestUSize,
+    end: GuestUSize,
+}
+
+/// Round `addr` down and `addr + len` up to whole pages, the way `munmap`
+/// rounds its arguments. Returns `None` if the range is empty or overflows.
+fn page_range(addr: MutVoidPtr, len: GuestUSize) -> Option<(GuestUSize, GuestUSize)> {
+    let mask = PAGE_SIZE_ALIGN_MASK;
+    let start = addr.to_bits() & !mask;
+    let end = addr.to_bits().checked_add(len)?.checked_add(mask)? & !mask;
+    (end > start).then_some((start, end))
+}
+
+/// Remember that the guest released `[start, end)` out of the mapping of
+/// `mapping_len` bytes at `base`. The range is clamped to that mapping, and
+/// adjacent ranges of the same mapping are merged so that a later hint
+/// covering several of them is recognised.
+fn record_unmapped_range(
+    unmapped: &mut Vec<UnmappedRange>,
+    base: MutVoidPtr,
+    mapping_len: GuestUSize,
+    start: GuestUSize,
+    end: GuestUSize,
+) {
+    let mapping_end = base.to_bits().saturating_add(mapping_len);
+    let start = start.max(base.to_bits());
+    let end = end.min(mapping_end);
+    if start >= end {
+        return;
+    }
+    unmapped.push(UnmappedRange { base, start, end });
+    unmapped.sort_unstable_by_key(|range| (range.start, range.end));
+
+    let mut merged: Vec<UnmappedRange> = Vec::with_capacity(unmapped.len());
+    for range in unmapped.drain(..) {
+        match merged.last_mut() {
+            Some(last) if last.base == range.base && range.start <= last.end => {
+                last.end = last.end.max(range.end);
+            }
+            _ => merged.push(range),
+        }
+    }
+    *unmapped = merged;
+}
+
+/// Whether `[start, end)` is completely covered by remembered ranges whose
+/// mapping is still alive. Any gap, or a range whose mapping has since been
+/// released, means the address is not free and a hint must not be honoured.
+fn is_fully_unmapped(
+    unmapped: &[UnmappedRange],
+    allocations: &HashMap<MutVoidPtr, GuestUSize>,
+    start: GuestUSize,
+    end: GuestUSize,
+) -> bool {
+    let mut covered_until = start;
+    for range in unmapped {
+        if range.end <= covered_until {
+            continue;
+        }
+        if range.start > covered_until {
+            return false;
+        }
+        if !allocations.contains_key(&range.base) {
+            return false;
+        }
+        covered_until = range.end;
+        if covered_until >= end {
+            return true;
+        }
+    }
+    false
+}
+
+/// Forget that `[start, end)` was ever unmapped, e.g. because the guest mapped
+/// it again or because the mapping that backed it is gone.
+fn clear_unmapped_ranges(unmapped: &mut Vec<UnmappedRange>, start: GuestUSize, end: GuestUSize) {
+    let mut kept: Vec<UnmappedRange> = Vec::with_capacity(unmapped.len() + 1);
+    for range in unmapped.drain(..) {
+        if range.end <= start || range.start >= end {
+            kept.push(range);
+            continue;
+        }
+        if range.start < start {
+            kept.push(UnmappedRange {
+                base: range.base,
+                start: range.start,
+                end: start,
+            });
+        }
+        if range.end > end {
+            kept.push(UnmappedRange {
+                base: range.base,
+                start: end,
+                end: range.end,
+            });
+        }
+    }
+    *unmapped = kept;
+}
+
+/// `mmap`'s address argument is a hint: the implementation should place the
+/// mapping there if the range is free and ignore it otherwise. The only address
+/// space we know to be free is what the guest released with a partial `munmap`,
+/// so honour the hint when the whole range was released that way: zero it (the
+/// mapping is fresh) and stop remembering it as free.
+fn honour_address_hint(
+    mem: &mut Mem,
+    allocations: &HashMap<MutVoidPtr, GuestUSize>,
+    unmapped: &mut Vec<UnmappedRange>,
+    addr: MutVoidPtr,
+    len: GuestUSize,
+) -> bool {
+    if addr.is_null() {
+        return false;
+    }
+    let mask = PAGE_SIZE_ALIGN_MASK;
+    // Only exact, page-aligned hints can be honoured: the guest expects the
+    // mapping to start at the address it asked for.
+    if addr.to_bits() & mask != 0 {
+        return false;
+    }
+    let Some((start, end)) = page_range(addr, len) else {
+        return false;
+    };
+    if !is_fully_unmapped(unmapped, allocations, start, end) {
+        return false;
+    }
+    clear_unmapped_ranges(unmapped, start, end);
+    mem.bytes_at_mut(addr.cast(), end - start).fill(0);
+    log_dbg!(
+        "mmap: honouring address hint {:?} for {} bytes (released by an earlier partial munmap)",
+        addr,
+        len
+    );
+    true
 }
 
 /// For files, our implementation of mmap is really simple:
@@ -51,6 +204,22 @@ fn mmap(
 
     if (flags & MAP_FIXED) != 0 {
         return mmap_fixed(env, addr, len, flags, fd, offset);
+    }
+
+    // Darwin returns the hint address when the pages it names are free. The
+    // only free address space we can describe is what the guest itself released
+    // with a partial `munmap`, so try that before falling back to the heap.
+    let mmap_state = &mut env.libc_state.mmap;
+    if (flags & MAP_ANON) != 0
+        && honour_address_hint(
+            &mut env.mem,
+            &mmap_state.allocations,
+            &mut mmap_state.unmapped,
+            addr,
+            len,
+        )
+    {
+        return addr;
     }
 
     // TODO: use vm_allocate() instead
@@ -132,6 +301,10 @@ fn mmap(
     }
 
     track_allocation(&mut env.libc_state.mmap.allocations, ptr, len);
+    // A brand-new mapping cannot inherit "these pages are free" records from a
+    // previous mapping that the allocator recycled the address from.
+    let end = ptr.to_bits().saturating_add(len);
+    clear_unmapped_ranges(&mut env.libc_state.mmap.unmapped, ptr.to_bits(), end);
 
     ptr
 }
@@ -185,6 +358,10 @@ fn mmap_fixed(
             return MAP_FAILED;
         }
     };
+
+    // The mapped range is now in use again, so it is not free address space.
+    let end = addr.to_bits().saturating_add(len);
+    clear_unmapped_ranges(&mut env.libc_state.mmap.unmapped, addr.to_bits(), end);
 
     if (flags & MAP_ANON) == 0 {
         let new_offset = posix_io::lseek(env, fd, offset, SEEK_SET);
@@ -250,6 +427,36 @@ fn map_fixed_zeroed(
     Ok((len, is_new_mapping))
 }
 
+/// The tracked mapping that contains `addr`, as `(base, length)`.
+///
+/// Guests release ranges that start inside a mapping rather than at its base
+/// (a partial `munmap`), and some release a range they previously carved out of
+/// a mapping, so this looks for the containing mapping rather than requiring an
+/// exact base match.
+fn owning_mapping(env: &Environment, addr: MutVoidPtr) -> Option<(MutVoidPtr, GuestUSize)> {
+    let bits = addr.to_bits();
+    env.libc_state
+        .mmap
+        .allocations
+        .iter()
+        .find(|(base, len)| {
+            let start = base.to_bits();
+            let end = start.saturating_add(**len);
+            bits >= start && bits < end
+        })
+        .map(|(base, len)| (*base, *len))
+}
+
+/// Release a whole tracked mapping, and forget any ranges remembered as free
+/// inside it: those pages are no longer backed by anything.
+fn release_mapping(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize) {
+    let start = addr.to_bits();
+    let end = start.saturating_add(len);
+    clear_unmapped_ranges(&mut env.libc_state.mmap.unmapped, start, end);
+    env.libc_state.mmap.allocations.remove(&addr);
+    env.mem.free(addr);
+}
+
 fn munmap(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
@@ -264,14 +471,13 @@ fn munmap(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize) -> i32 {
         // the caller means); otherwise treat the call as a successful no-op.
         // This matches Linux's munmap(NULL-adjacent) tolerance and keeps the
         // guest allocator's state consistent.
-        if let Some(&expected_len) = env.libc_state.mmap.allocations.get(&addr) {
+        if let Some(expected_len) = env.libc_state.mmap.allocations.get(&addr).copied() {
             log_dbg!(
                 "munmap({:?}, 0): zero length, unmapping whole {}-byte mapping",
                 addr,
                 expected_len
             );
-            env.mem.free(addr);
-            env.libc_state.mmap.allocations.remove(&addr);
+            release_mapping(env, addr, expected_len);
         } else {
             log_dbg!("munmap({:?}, 0): unknown mapping, treating as no-op", addr);
         }
@@ -279,35 +485,46 @@ fn munmap(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize) -> i32 {
         return 0;
     }
 
-    if let Some(&expected_len) = env.libc_state.mmap.allocations.get(&addr) {
-        if len < expected_len {
-            // Unmapping part of a mapping cannot be modelled: the rest of the
-            // block still belongs to the caller. Freeing the whole block here
-            // would hand the surviving bytes to a later `mmap` while the guest
-            // still writes to them - two owners of one address range, which is
-            // exactly how a guest heap ends up with corrupted chunk headers.
-            // Keep the mapping whole; the caller releases it when it unmaps
-            // the range it still owns.
-            log_dbg!(
-                "munmap({:?}, {}): partial unmap of a {}-byte mapping, keeping the mapping",
-                addr,
-                len,
-                expected_len
-            );
-            set_errno(env, 0);
-            return 0;
+    let owner = owning_mapping(env, addr);
+    if let Some((base, mapping_len)) = owner {
+        if addr == base && len >= mapping_len {
+            if len > mapping_len {
+                log_dbg!(
+                    "munmap({:?}, {}): length exceeds the {}-byte mapping, unmapping it whole",
+                    addr,
+                    len,
+                    mapping_len
+                );
+            }
+            release_mapping(env, addr, mapping_len);
+            return 0; // success
         }
-        if expected_len != len {
-            log_dbg!(
-                "munmap({:?}, {}): length exceeds the {}-byte mapping, unmapping it whole",
-                addr,
-                len,
-                expected_len
+
+        // Unmapping part of a mapping (or a range inside one) cannot free host
+        // memory: the pages around it still belong to the caller, and freeing
+        // the whole block here would hand the surviving bytes to a later `mmap`
+        // while the guest still writes to them - two owners of one address
+        // range, which is exactly how a guest heap ends up with corrupted chunk
+        // headers. Remember the range instead, so that an `mmap` passing it as a
+        // hint can reuse it the way Darwin reuses free address space.
+        if let Some((start, end)) = page_range(addr, len) {
+            record_unmapped_range(
+                &mut env.libc_state.mmap.unmapped,
+                base,
+                mapping_len,
+                start,
+                end,
             );
         }
-        env.mem.free(addr);
-        env.libc_state.mmap.allocations.remove(&addr);
-        0 // success
+        log_dbg!(
+            "munmap({:?}, {}): partial unmap of the {}-byte mapping at {:?}, remembering the range as free",
+            addr,
+            len,
+            mapping_len,
+            base
+        );
+        set_errno(env, 0);
+        0
     } else {
         // Darwin's `munmap` only rejects invalid arguments: unmapping a range
         // that holds no mapping is a successful no-op, not an error.
@@ -556,8 +773,7 @@ mod map_fixed_tests {
     }
 
     #[test]
-    fn rejects_bad_arguments() {
-        let mut mem = new_test_mem();
+    fn rejects_bad_arguments() {        let mut mem = new_test_mem();
         let mut allocations = HashMap::new();
         let unaligned: MutVoidPtr = Ptr::from_bits(0x2000_0010);
         assert_eq!(
@@ -579,5 +795,146 @@ mod map_fixed_tests {
             Err(EINVAL)
         );
         assert!(allocations.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod partial_munmap_tests {
+    use super::*;
+    use crate::mem::Ptr;
+
+    /// A three-page anonymous mapping whose middle page the guest releases with
+    /// `munmap`, exactly like `TestApp`'s `test_munmap_partial_mapping`.
+    fn three_page_mapping_with_hole() -> (Mem, HashMap<MutVoidPtr, GuestUSize>, Vec<UnmappedRange>, MutVoidPtr)
+    {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(PAGE_SIZE);
+        let mut allocations = HashMap::new();
+        let mapping: MutVoidPtr = mem.alloc(PAGE_SIZE * 3);
+        allocations.insert(mapping, PAGE_SIZE * 3);
+        mem.bytes_at_mut(mapping.cast(), PAGE_SIZE * 3).fill(0xAB);
+
+        let mut unmapped = Vec::new();
+        let (start, end) = page_range(
+            Ptr::from_bits(mapping.to_bits() + PAGE_SIZE),
+            PAGE_SIZE,
+        )
+        .unwrap();
+        record_unmapped_range(&mut unmapped, mapping, PAGE_SIZE * 3, start, end);
+        (mem, allocations, unmapped, mapping)
+    }
+
+    #[test]
+    fn a_hint_inside_the_unmapped_range_is_honoured() {
+        let (mut mem, allocations, mut unmapped, mapping) = three_page_mapping_with_hole();
+        let middle: MutVoidPtr = Ptr::from_bits(mapping.to_bits() + PAGE_SIZE);
+
+        assert!(honour_address_hint(
+            &mut mem,
+            &allocations,
+            &mut unmapped,
+            middle,
+            PAGE_SIZE
+        ));
+
+        // The reclaimed page is fresh (zeroed) and no longer recorded as free.
+        assert!(mem
+            .bytes_at(middle.cast(), PAGE_SIZE)
+            .iter()
+            .all(|&b| b == 0));
+        assert!(unmapped.is_empty());
+
+        // The pages around it still belong to the original mapping and keep
+        // their contents.
+        let bytes = mem.bytes_at(mapping.cast(), PAGE_SIZE * 3);
+        let page = PAGE_SIZE as usize;
+        assert!(bytes[..page].iter().all(|&b| b == 0xAB));
+        assert!(bytes[page * 2..].iter().all(|&b| b == 0xAB));
+    }
+
+    #[test]
+    fn a_hint_outside_the_unmapped_range_is_not_honoured() {
+        let (mut mem, allocations, mut unmapped, mapping) = three_page_mapping_with_hole();
+
+        // The first page was never released, so the hint must be ignored.
+        assert!(!honour_address_hint(
+            &mut mem,
+            &allocations,
+            &mut unmapped,
+            mapping,
+            PAGE_SIZE
+        ));
+        // Neither may a hint that is not page-aligned, nor one that spans more
+        // than the released page.
+        assert!(!honour_address_hint(
+            &mut mem,
+            &allocations,
+            &mut unmapped,
+            Ptr::from_bits(mapping.to_bits() + PAGE_SIZE + 4),
+            PAGE_SIZE
+        ));
+        assert!(!honour_address_hint(
+            &mut mem,
+            &allocations,
+            &mut unmapped,
+            Ptr::from_bits(mapping.to_bits() + PAGE_SIZE),
+            PAGE_SIZE * 2
+        ));
+
+        // The released page is still recorded as free.
+        assert_eq!(unmapped.len(), 1);
+        assert!(mem.bytes_at(mapping.cast(), PAGE_SIZE * 3)[PAGE_SIZE as usize] == 0xAB);
+    }
+
+    #[test]
+    fn adjacent_released_pages_merge_into_one_range() {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(PAGE_SIZE);
+        let mut allocations = HashMap::new();
+        let mapping: MutVoidPtr = mem.alloc(PAGE_SIZE * 3);
+        allocations.insert(mapping, PAGE_SIZE * 3);
+
+        let mut unmapped = Vec::new();
+        for page in 0..2 {
+            let addr = Ptr::from_bits(mapping.to_bits() + (page + 1) * PAGE_SIZE);
+            let (start, end) = page_range(addr, PAGE_SIZE).unwrap();
+            record_unmapped_range(&mut unmapped, mapping, PAGE_SIZE * 3, start, end);
+        }
+
+        assert_eq!(unmapped.len(), 1);
+        assert_eq!(unmapped[0].start, mapping.to_bits() + PAGE_SIZE);
+        assert_eq!(unmapped[0].end, mapping.to_bits() + PAGE_SIZE * 3);
+
+        // Both pages can be claimed with a single hint.
+        assert!(honour_address_hint(
+            &mut mem,
+            &allocations,
+            &mut unmapped,
+            Ptr::from_bits(mapping.to_bits() + PAGE_SIZE),
+            PAGE_SIZE * 2
+        ));
+        assert!(unmapped.is_empty());
+    }
+
+    #[test]
+    fn releasing_the_whole_mapping_forgets_its_released_ranges() {
+        let (mut mem, mut allocations, mut unmapped, mapping) = three_page_mapping_with_hole();
+
+        let start = mapping.to_bits();
+        let end = start + PAGE_SIZE * 3;
+        clear_unmapped_ranges(&mut unmapped, start, end);
+        allocations.remove(&mapping);
+        mem.free(mapping);
+
+        assert!(unmapped.is_empty());
+        // A hint at the old address must not be honoured once the mapping is
+        // gone: the address space may be handed out to something else.
+        assert!(!honour_address_hint(
+            &mut mem,
+            &allocations,
+            &mut unmapped,
+            Ptr::from_bits(start + PAGE_SIZE),
+            PAGE_SIZE
+        ));
     }
 }
