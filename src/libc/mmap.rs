@@ -296,11 +296,10 @@ fn munmap(env: &mut Environment, addr: MutVoidPtr, len: GuestUSize) -> i32 {
         // that holds no mapping is a successful no-op, not an error.
         // <https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/munmap.2.html>
         //
-        // Reporting `EINVAL` here made BioShock abort during startup: its
-        // allocator releases memory in ranges that do not line up with one of
-        // our whole `mmap` allocations (and with ranges that `mmap` with
-        // `MAP_FIXED` replaced rather than created), and it treats any
-        // `munmap` failure as fatal.
+        // Allocators such as BioShock's release memory in ranges that do not
+        // line up with one of our whole `mmap` allocations, or with ranges that
+        // an `mmap` with `MAP_FIXED` replaced rather than created, and some of
+        // them treat any `munmap` failure as fatal.
         //
         // Guest memory has no page protections, so keeping the range mapped is
         // harmless: it stays valid and either gets released together with the

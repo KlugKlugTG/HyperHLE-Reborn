@@ -908,6 +908,19 @@ pub fn write(
         let buffer_slice = env.mem.bytes_at(buffer.cast(), size);
         let msg = String::from_utf8_lossy(buffer_slice);
         print!("{}", msg);
+        if fd == STDERR_FILENO {
+            // A guest's C library and assertion machinery report failures
+            // straight to fd 2: dlmalloc prints "free(): invalid pointer" and
+            // friends, and libc prints uncaught-abort reasons. The host
+            // process's stdout is not captured into touchHLE_log.txt, so a
+            // crash report would lose the one line that explains it. Mirror
+            // stderr into the file log; stdout is left alone because games
+            // print there constantly.
+            let text = msg.trim_end_matches('\n');
+            if !text.is_empty() {
+                log_file_only!("[guest stderr] {}", text);
+            }
+        }
         return size as GuestISize;
     }
 
