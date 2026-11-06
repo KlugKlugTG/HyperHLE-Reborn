@@ -78,6 +78,7 @@ pub mod store_kit;
 pub mod system_configuration;
 pub mod tw_tweet_compose_view_controller;
 pub mod uikit;
+pub mod video_toolbox;
 pub mod watch_connectivity;
 pub mod web_kit;
 pub mod xsapitcui;

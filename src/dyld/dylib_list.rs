@@ -244,6 +244,7 @@ pub const DYLIB_LIST: &[&super::HostDylib] = &[
     &LIBRESOLV,
     &CORE_AUDIO,
     &frameworks::media_toolbox::DYLIB,
+    &frameworks::video_toolbox::DYLIB,
     &frameworks::web_kit::DYLIB,
     &CF_NETWORK,
     &MOBILE_CORE_SERVICES,
