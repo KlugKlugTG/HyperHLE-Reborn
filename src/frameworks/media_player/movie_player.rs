@@ -337,6 +337,11 @@ struct MPMoviePlayerControllerHostObject {
     /// default, -1) means "at the natural end of the movie".
     end_playback_time: f64,
     playback_state: MPMoviePlaybackState,
+    /// `currentPlaybackRate`: how fast the playback clock advances, where 1.0
+    /// is normal speed. Only meaningful while `playback_state` is
+    /// `MPMoviePlaybackStatePlaying`; Apple documents that the property reads
+    /// back as 0.0 whenever the movie is paused or stopped.
+    playback_rate: f64,
     load_state: MPMovieLoadState,
     /// Natural dimensions reported by the supported H.264 video track.
     video_info: Option<MovieVideoInfo>,
@@ -472,9 +477,12 @@ fn effective_end_time(host: &MPMoviePlayerControllerHostObject) -> f64 {
 /// for `MPMovieRepeatModeOne`, otherwise stops at the end of the movie (or at
 /// `endPlaybackTime`, if set).
 fn playback_position(host: &MPMoviePlayerControllerHostObject) -> f64 {
+    // The clock runs at `currentPlaybackRate`, so a 2.0 rate makes
+    // `currentPlaybackTime` advance twice as fast.
     let elapsed = host
         .clock_started
-        .map_or(0.0, |started| started.elapsed().as_secs_f64());
+        .map_or(0.0, |started| started.elapsed().as_secs_f64())
+        * host.playback_rate;
     let position = host.clock_offset + elapsed;
     if host.duration <= 0.0 && explicit_end_time(host).is_none() {
         position
@@ -730,7 +738,15 @@ fn schedule_playback_finish(
             let remaining = (end - playback_position(host))
                 .max(0.0)
                 .min(31_536_000.0);
-            start_at + Duration::from_secs_f64(remaining)
+            // `remaining` is in movie seconds; the clock advances at
+            // `currentPlaybackRate`, so the wall-clock delay shrinks (or
+            // grows) with the rate.
+            let rate = if host.playback_rate.is_finite() && host.playback_rate > 0.0 {
+                host.playback_rate
+            } else {
+                1.0
+            };
+            start_at + Duration::from_secs_f64(remaining / rate)
         } else {
             start_at + Duration::from_millis(150)
         }
@@ -913,6 +929,12 @@ fn schedule_playback(env: &mut Environment, this: id, start_at: Instant) {
         let starting_from_stop = host.playback_state == MPMoviePlaybackStateStopped
             && host.clock_started.is_none();
         host.playback_state = MPMoviePlaybackStatePlaying;
+        // `play` starts at normal speed unless the app already asked for a
+        // different `currentPlaybackRate`. The property reads back as 0.0
+        // outside the playing state, so a stale 0.0 must not stall the clock.
+        if !host.playback_rate.is_finite() || host.playback_rate <= 0.0 {
+            host.playback_rate = 1.0;
+        }
         if starting_from_stop
             && host.initial_playback_time.is_finite()
             && host.initial_playback_time > 0.0
@@ -964,6 +986,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         initial_playback_time: -1.0,
         end_playback_time: -1.0,
         playback_state: MPMoviePlaybackStateStopped,
+        playback_rate: 1.0,
         load_state: MPMovieLoadStateUnknown,
         video_info: None,
         natural_size: PLACEHOLDER_NATURAL_SIZE,
@@ -1043,6 +1066,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         host.ready_for_display = false;
         let was = host.playback_state == MPMoviePlaybackStatePlaying;
         host.playback_state = MPMoviePlaybackStateStopped;
+        host.playback_rate = 1.0;
         (old, was)
     };
     retain(env, url);
@@ -1237,6 +1261,57 @@ pub const CLASSES: ClassExports = objc_classes! {
         .load_state
 }
 
+// Apple's
+// <https://developer.apple.com/documentation/mediaplayer/mpmovieplayercontroller/1620773-currentplaybackrate>:
+// "The current playback rate for the movie. ... A value of 0.0 means the
+// movie is paused; 1.0 is normal playback. ... This property is set to 0.0
+// when the movie is paused or stopped."
+- (f32)currentPlaybackRate {
+    let host = env
+        .objc
+        .borrow::<MPMoviePlayerControllerHostObject>(this);
+    if host.playback_state == MPMoviePlaybackStatePlaying {
+        host.playback_rate as f32
+    } else {
+        0.0
+    }
+}
+- (())setCurrentPlaybackRate:(f32)rate {
+    // Negative and non-finite rates are meaningless for playback; iOS
+    // clamps to 0.0 (paused) rather than storing garbage in the clock.
+    let rate = if rate.is_finite() {
+        rate.max(0.0) as f64
+    } else {
+        0.0
+    };
+    let (previous_state, was_finish_scheduled) = {
+        let host = env
+            .objc
+            .borrow_mut::<MPMoviePlayerControllerHostObject>(this);
+        if host.playback_state == MPMoviePlaybackStatePlaying {
+            // Rebase the clock so that the new rate only affects time
+            // from now on — time already played keeps its value.
+            host.clock_offset = playback_position(host);
+            host.clock_started = Some(Instant::now());
+        }
+        host.playback_rate = rate;
+        (host.playback_state, host.finish_scheduled)
+    };
+    let was_playing = previous_state == MPMoviePlaybackStatePlaying;
+    if rate == 0.0 {
+        if was_playing {
+            () = msg![env; this pause];
+        }
+    } else if previous_state == MPMoviePlaybackStatePaused {
+        // Setting a non-zero rate while paused resumes playback.
+        () = msg![env; this play];
+    } else if was_playing && was_finish_scheduled {
+        // The pending end of playback was computed for the old rate.
+        cancel_pending_playback_finish(env, this);
+        schedule_playback_finish(env, this, Instant::now(), true);
+    }
+}
+
 - (CGSize)naturalSize {
     env.objc
         .borrow::<MPMoviePlayerControllerHostObject>(this)
@@ -1378,6 +1453,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         host.clock_offset = 0.0;
         host.clock_started = None;
         host.playback_state = MPMoviePlaybackStateStopped;
+        host.playback_rate = 1.0;
     }
     State::get(env).videos.remove(&this);
     let use_movie_player_fix = fix_movie_player_enabled(env);
@@ -1852,6 +1928,7 @@ pub(super) fn handle_players(env: &mut Environment) {
             host.playback_state = MPMoviePlaybackStateStopped;
             host.clock_offset = 0.0;
             host.clock_started = None;
+            host.playback_rate = 1.0;
             host.finish_scheduled = false;
             State::get(env).videos.remove(&player);
             if use_movie_player_fix {
