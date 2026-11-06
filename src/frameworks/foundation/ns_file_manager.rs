@@ -472,20 +472,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // MARK: - Discovering Directory Contents
 
-/// `-[NSFileManager
-/// contentsOfDirectoryAtURL:includingPropertiesForKeys:options:error:]`
-///
-/// Unlike `contentsOfDirectoryAtPath:error:`, this returns the full `NSURL`s of
-/// the directory's immediate children, not bare file names, and it honours
-/// `NSDirectoryEnumerationSkipsHiddenFiles`.
-///
-/// `keys` is only a prefetch hint for the resource values the caller intends to
-/// read later (`NSURLResourceKey`s); the returned URLs carry those values
-/// lazily anyway, so it is accepted and ignored.
-///
-/// The other enumeration options do not apply here: this method never descends
-/// into subdirectories, and package-vs-directory treatment would require the
-/// (not modelled) iOS package concept.
+// `-[NSFileManager
+// contentsOfDirectoryAtURL:includingPropertiesForKeys:options:error:]`
+//
+// Unlike `contentsOfDirectoryAtPath:error:`, this returns the full `NSURL`s of
+// the directory's immediate children, not bare file names, and it honours
+// `NSDirectoryEnumerationSkipsHiddenFiles`.
+//
+// `keys` is only a prefetch hint for the resource values the caller intends to
+// read later (`NSURLResourceKey`s); the returned URLs carry those values
+// lazily anyway, so it is accepted and ignored.
+//
+// The other enumeration options do not apply here: this method never descends
+// into subdirectories, and package-vs-directory treatment would require the
+// (not modelled) iOS package concept.
 - (id)contentsOfDirectoryAtURL:(id)url
    includingPropertiesForKeys:(id)keys
                       options:(NSUInteger)options
