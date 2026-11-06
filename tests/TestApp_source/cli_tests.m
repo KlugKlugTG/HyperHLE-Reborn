@@ -46,14 +46,6 @@
 
 #import "SyncTester.h"
 
-@interface NSBundle : NSObject
-+ (instancetype)mainBundle;
-+ (instancetype)bundleWithPath:(NSString *)path;
-+ (instancetype)bundleWithIdentifier:(NSString *)identifier;
-- (NSString *)pathForResource:(NSString *)name ofType:(NSString *)extension;
-- (NSString *)bundleIdentifier;
-@end
-
 @interface NSObject (PerformSelectorOnMainThreadTest)
 - (void)performSelectorOnMainThread:(SEL)selector
                          withObject:(id)object

@@ -63,7 +63,11 @@ static inline NSRange NSMakeRange(NSUInteger loc, NSUInteger len) {
 
 @interface NSBundle : NSObject
 + (NSBundle *)mainBundle;
+// `NSString` is declared further down this header, so these use `id`.
++ (instancetype)bundleWithPath:(id)path;
++ (instancetype)bundleWithIdentifier:(id)identifier;
 - (id)bundleIdentifier;
+- (id)pathForResource:(id)name ofType:(id)extension;
 @end
 
 @interface NSUserDefaults : NSObject
@@ -92,6 +96,11 @@ static inline NSRange NSMakeRange(NSUInteger loc, NSUInteger len) {
 @interface NSDictionary<KeyType, ObjectType> : NSObject
 + (instancetype)dictionaryWithObjects:(NSArray<ObjectType> *)objects
                               forKeys:(NSArray<KeyType> *)keys;
+// Required by the `@{key: value}` literal syntax: Clang looks up this
+// selector to type-check a dictionary literal.
++ (instancetype)dictionaryWithObjects:(const id [])objects
+                              forKeys:(const id [])keys
+                                count:(NSUInteger)count;
 - (NSUInteger)count;
 - (ObjectType)objectForKey:(KeyType)aKey;
 - (BOOL)isEqualToDictionary:(NSDictionary *)otherDictionary;
