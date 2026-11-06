@@ -93,6 +93,23 @@ pub fn NSStringFromCGRect(env: &mut Environment, rect: CGRect) -> id {
     autorelease(env, s)
 }
 
+// Apple's
+// <https://developer.apple.com/documentation/uikit/1624473-nsstringfromuiedgeinsets>:
+// "Returns a string formatted to contain the data from an edge insets data
+// structure", e.g. `{1, 2, 3, 4}` for top, left, bottom, right.
+pub fn NSStringFromUIEdgeInsets(env: &mut Environment, insets: UIEdgeInsets) -> id {
+    // `UIEdgeInsets` is `repr(packed)`, so reading the fields into locals
+    // before formatting avoids taking references to unaligned fields.
+    let UIEdgeInsets {
+        top,
+        left,
+        bottom,
+        right,
+    } = insets;
+    let s = ns_string::from_rust_string(env, format!("{{{top}, {left}, {bottom}, {right}}}"));
+    autorelease(env, s)
+}
+
 fn NSDefaultMallocZone(env: &mut Environment) -> MutVoidPtr {
     if let Some(ptr) = env.framework_state.uikit.ui_geometry.default_malloc_zone {
         return ptr;
@@ -110,6 +127,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(NSStringFromCGPoint(_)),
     export_c_func!(NSStringFromCGSize(_)),
     export_c_func!(NSStringFromCGRect(_)),
+    export_c_func!(NSStringFromUIEdgeInsets(_)),
     export_c_func!(NSDefaultMallocZone()),
 ];
 

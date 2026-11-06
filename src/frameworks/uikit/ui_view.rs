@@ -1167,6 +1167,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setTranslatesAutoresizingMaskIntoConstraints:(bool)_translates { }
 - (bool)translatesAutoresizingMaskIntoConstraints { true }
 - (())setNeedsLayout { }
+// Apple's
+// <https://developer.apple.com/documentation/uikit/uiview/1622450-setneedsupdateconstraints>:
+// "Sets whether the view needs to update its constraints." Auto Layout is not
+// emulated, so marking the view dirty and the follow-up passes are no-ops;
+// implementing them keeps subclasses that drive them from warning.
+- (())setNeedsUpdateConstraints { }
+- (())updateConstraintsIfNeeded { }
+- (())updateConstraints { }
 - (())addConstraint:(id)_constraint { }
 - (())addConstraints:(id)_constraints { }
 - (())removeConstraint:(id)_constraint { }

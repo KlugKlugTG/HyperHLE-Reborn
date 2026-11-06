@@ -421,6 +421,73 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg_class![env; CADisplayLink displayLinkWithTarget:target selector:selector]
 }
 
+// Apple's
+// <https://developer.apple.com/documentation/uikit/uiscreen/1617810-coordinatespace>:
+// "The current coordinate space of the screen. ... use this coordinate space
+// with the `UICoordinateSpace` protocol methods to convert between the
+// screen's coordinate system and other coordinate systems." The screen space
+// always has its origin at the top-left corner and `bounds` as its extent.
+- (id)coordinateSpace {
+    new_screen_coordinate_space(env, this)
+}
+
+// Apple's
+// <https://developer.apple.com/documentation/uikit/uiscreen/1617823-fixedcoordinatespace>:
+// "The fixed coordinate space of the screen. ... unlike the coordinateSpace
+// property, this coordinate space does not change when the interface
+// rotates." The built-in screen always reports portrait-oriented bounds, so
+// both properties describe the same space.
+- (id)fixedCoordinateSpace {
+    new_screen_coordinate_space(env, this)
+}
+
+@end
+
+// MARK: - Screen coordinate space
+
+/// Backing object for the `id<UICoordinateSpace>` values that `UIScreen`
+/// returns. It only needs `bounds`, because conversions between the screen's
+/// own coordinate spaces are the identity.
+struct UICoordinateSpaceHostObject {
+    bounds: CGRect,
+}
+impl HostObject for UICoordinateSpaceHostObject {}
+
+fn new_screen_coordinate_space(env: &mut crate::Environment, screen: id) -> id {
+    let bounds: CGRect = msg![env; screen bounds];
+    let class = env
+        .objc
+        .get_known_class("UICoordinateSpace", &mut env.mem);
+    let object = env.objc.alloc_object(
+        class,
+        Box::new(UICoordinateSpaceHostObject { bounds }),
+        &mut env.mem,
+    );
+    autorelease(env, object)
+}
+
+@implementation UICoordinateSpace: NSObject
+
+- (CGRect)bounds {
+    env.objc.borrow::<UICoordinateSpaceHostObject>(this).bounds
+}
+
+// The only coordinate spaces this emulator hands out describe the same
+// screen-sized, origin-at-zero space, so converting between them, or between
+// them and themselves, never changes the value.
+- (CGPoint)convertPoint:(CGPoint)point toCoordinateSpace:(id)_space {
+    point
+}
+- (CGPoint)convertPoint:(CGPoint)point fromCoordinateSpace:(id)_space {
+    point
+}
+- (CGRect)convertRect:(CGRect)rect toCoordinateSpace:(id)_space {
+    rect
+}
+- (CGRect)convertRect:(CGRect)rect fromCoordinateSpace:(id)_space {
+    rect
+}
+
 @end
 
 @implementation UITraitCollection: NSObject
