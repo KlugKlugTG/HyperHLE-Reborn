@@ -88,7 +88,7 @@ fn next_transaction_identifier(env: &mut Environment, prefix: &str) -> (String, 
 }
 
 /// Read a guest NSString as an owned Rust string (empty if nil).
-fn identifier_string(env: &mut Environment, string: id) -> String {
+pub(super) fn identifier_string(env: &mut Environment, string: id) -> String {
     if string == nil {
         return String::new();
     }
@@ -501,28 +501,41 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
     ensure_purchase_history_loaded(env);
+    // IAP emulation is a cheat, so it is deliberately more generous than iOS:
+    // it answers a restore with *purchased* transactions for every product the
+    // game knows about (everything it ever asked StoreKit for, plus anything
+    // recorded in the local purchase history). Games routinely ignore restored
+    // transactions for consumables such as credits or boosters, so a plain
+    // restore hands over nothing; a fresh-looking purchase does.
     let purchased = State::get(env).purchased.clone();
-    let mut restored: Vec<id> = Vec::new();
+    let mut identifiers: Vec<String> = Vec::new();
     for purchase in &purchased {
-        let payment = payment_for_identifier(env, &purchase.product_identifier);
-        let original_identifier =
-            ns_string::from_rust_string(env, purchase.transaction_identifier.clone());
-        let original_transaction = make_transaction(
+        if !identifiers.contains(&purchase.product_identifier) {
+            identifiers.push(purchase.product_identifier.clone());
+        }
+    }
+    for identifier in crate::frameworks::store_kit::offered_identifier_snapshot() {
+        if !identifiers.contains(&identifier) {
+            identifiers.push(identifier);
+        }
+    }
+    if identifiers.is_empty() {
+        log!(
+            "SKPaymentQueue restoreCompletedTransactions: IAP emulation ON, but the game has not asked StoreKit about any product yet."
+        );
+    }
+    let mut restored: Vec<id> = Vec::new();
+    for identifier in &identifiers {
+        let payment = payment_for_identifier(env, identifier);
+        let (transaction_identifier_string, transaction_identifier) =
+            next_transaction_identifier(env, "iap");
+        remember_purchase(env, identifier, &transaction_identifier_string);
+        let transaction = make_transaction(
             env,
             SK_PAYMENT_TRANSACTION_STATE_PURCHASED,
             payment,
-            original_identifier,
-            nil,
-        );
-        release(env, original_identifier);
-        autorelease(env, original_transaction);
-        let (_, transaction_identifier) = next_transaction_identifier(env, "restore");
-        let transaction = make_transaction(
-            env,
-            SK_PAYMENT_TRANSACTION_STATE_RESTORED,
-            payment,
             transaction_identifier,
-            original_transaction,
+            nil,
         );
         release(env, transaction_identifier);
         // The pending queue owns one reference; the pool guards delivery.
@@ -535,7 +548,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         restored.push(transaction);
     }
     log!(
-        "SKPaymentQueue restoreCompletedTransactions: IAP emulation ON; restoring {} purchase(s).",
+        "SKPaymentQueue restoreCompletedTransactions: IAP emulation ON; delivering {} emulated purchase(s) as purchased.",
         restored.len()
     );
     deliver_transactions(env, this, &restored);

@@ -18,6 +18,40 @@ use crate::dyld::{ConstantExports, HostConstant};
 /// This does not enable actual network access or emulate remote game servers.
 static IAP_EMULATION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Product identifiers the guest has asked StoreKit about.
+///
+/// The IAP emulation can turn these into *purchased* transactions, which is
+/// what actually hands items over: games routinely ignore restored
+/// transactions for consumables (credits, boosters), so a shop whose store
+/// preflight never completes can still be paid out.
+static OFFERED_IDENTIFIERS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::OnceLock::new();
+
+fn offered_identifiers() -> &'static std::sync::Mutex<Vec<String>> {
+    OFFERED_IDENTIFIERS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Remember a product identifier requested via `SKProductsRequest`.
+pub fn remember_offered_identifier(identifier: &str) {
+    if identifier.is_empty() {
+        return;
+    }
+    let Ok(mut list) = offered_identifiers().lock() else {
+        return;
+    };
+    if !list.iter().any(|existing| existing == identifier) {
+        list.push(identifier.to_string());
+    }
+}
+
+/// Every product identifier the guest has asked about so far.
+pub fn offered_identifier_snapshot() -> Vec<String> {
+    offered_identifiers()
+        .lock()
+        .map(|list| list.clone())
+        .unwrap_or_default()
+}
+
 /// `SKPaymentTransactionStatePurchased` — the transaction succeeded.
 pub const SK_PAYMENT_TRANSACTION_STATE_PURCHASED: crate::frameworks::foundation::NSInteger = 1;
 /// `SKPaymentTransactionStateFailed` — the transaction did not go through.

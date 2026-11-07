@@ -103,6 +103,11 @@ fn deliver_products_response(env: &mut Environment, this: id) {
         let count: crate::frameworks::foundation::NSUInteger = msg![env; array count];
         for i in 0..count {
             let identifier: id = msg![env; array objectAtIndex:i];
+            // Remember what the game asked for: the IAP emulation can later
+            // hand these over as purchased transactions even when the shop's
+            // remote product list never arrives.
+            let identifier_text = super::sk_payment_queue::identifier_string(env, identifier);
+            crate::frameworks::store_kit::remember_offered_identifier(&identifier_text);
             let product = make_product(env, identifier);
             () = msg![env; products addObject:product];
             requested += 1;
