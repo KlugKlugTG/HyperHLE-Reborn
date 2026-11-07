@@ -435,7 +435,29 @@ pub const CLASSES: ClassExports = objc_classes! {
         //  here we use whichever is clearer contextually.)
         let should = msg![env; vc shouldAutorotateToInterfaceOrientation:orientation];
         log_dbg!("[{:?} shouldAutorotateToInterfaceOrientation:{:?}] => {:?}", vc, orientation, should);
-        if should {
+        if should
+            && crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS")
+            && env.options.present_rotate == Some(0)
+        {
+            // The app is set up to report the *interface-oriented* screen size
+            // (landscape UIScreen.bounds) and its presentation is not rotated
+            // (`--present-rotate=0`), so the app builds its whole view
+            // hierarchy in the orientation it draws in and there is nothing to
+            // rotate: its window already has the landscape size, its views are
+            // laid out from UIScreen.bounds in that same space, and the
+            // renderbuffer matches.
+            //
+            // Rotating here anyway is what broke Asphalt Xtreme's hit-testing:
+            // the transform (plus the frame the rotation re-applies) swapped
+            // the root view's bounds to portrait while the app kept laying its
+            // UI out for 480x320, so every tap was converted into a rotated
+            // 320x480 space and landed on the wrong control.
+            log!(
+                "TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1 with --present-rotate=0: \
+                 interface is already upright, skipping autorotation of view {:?}.",
+                view
+            );
+        } else if should {
             log_dbg!("App requested autorotation; applying orientation transform to view {:?}.", view);
             let transform = match orientation {
                 UIInterfaceOrientationLandscapeLeft => CGAffineTransform::make_rotation(-std::f32::consts::FRAC_PI_2),

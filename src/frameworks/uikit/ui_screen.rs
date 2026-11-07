@@ -246,11 +246,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (CGRect)bounds {
     let (width, height) = screen_size_for_current_orientation(env);
     if crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS") {
-        log!(
-            "TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1: UIScreen bounds reporting {}x{}",
-            width,
-            height
-        );
+        // `-bounds` is called hundreds of times during app launch, and every
+        // `log!` costs a logcat round trip plus a write to the log file, so
+        // report the override once instead of on every call.
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| {
+            log!(
+                "TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1: UIScreen bounds reporting {}x{}",
+                width,
+                height
+            );
+        });
     }
     CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
