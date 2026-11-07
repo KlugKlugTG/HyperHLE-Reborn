@@ -94,19 +94,19 @@ mod tests {
     /// `invalidate_caches` must make the next lookup observe the new value.
     #[test]
     fn invalidate_caches_refreshes_flags() {
-        const NAME: &str = "TOUCHHLE_TEST_FLAG_FOR_CACHE_INVALIDATION";
-        std::env::remove_var(NAME);
+        // The macro takes a literal, so the name cannot come from a constant.
+        std::env::remove_var("TOUCHHLE_TEST_FLAG_FOR_CACHE_INVALIDATION");
         crate::env_flags::invalidate_caches();
-        assert!(!crate::env_flag_cached!(NAME));
+        assert!(!crate::env_flag_cached!("TOUCHHLE_TEST_FLAG_FOR_CACHE_INVALIDATION"));
 
-        std::env::set_var(NAME, "1");
+        std::env::set_var("TOUCHHLE_TEST_FLAG_FOR_CACHE_INVALIDATION", "1");
         // Still cached from the previous generation.
-        assert!(!crate::env_flag_cached!(NAME));
+        assert!(!crate::env_flag_cached!("TOUCHHLE_TEST_FLAG_FOR_CACHE_INVALIDATION"));
         crate::env_flags::invalidate_caches();
-        assert!(crate::env_flag_cached!(NAME));
+        assert!(crate::env_flag_cached!("TOUCHHLE_TEST_FLAG_FOR_CACHE_INVALIDATION"));
 
-        std::env::remove_var(NAME);
+        std::env::remove_var("TOUCHHLE_TEST_FLAG_FOR_CACHE_INVALIDATION");
         crate::env_flags::invalidate_caches();
-        assert!(!crate::env_flag_cached!(NAME));
+        assert!(!crate::env_flag_cached!("TOUCHHLE_TEST_FLAG_FOR_CACHE_INVALIDATION"));
     }
 }
