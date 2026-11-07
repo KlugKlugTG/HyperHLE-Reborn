@@ -14,6 +14,7 @@ use crate::frameworks::uikit::ui_view::ui_window::{
     UIKeyboardDidHideNotification, UIKeyboardDidShowNotification, UIKeyboardWillHideNotification,
     UIKeyboardWillShowNotification,
 };
+use crate::frameworks::uikit::ui_view::ui_alert_view;
 use crate::impl_HostObject_with_superclass;
 use crate::objc::{
     id, msg, msg_class, msg_super, nil, objc_classes, release, retain, todo_objc_setter,
@@ -148,6 +149,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     let _: () = msg![env; text_label setTextAlignment:UITextAlignmentLeft];
     let text_color: id = msg_class![env; UIColor blackColor];
     let _: () = msg![env; text_label setTextColor:text_color];
+    // UIKit's default text field font is the 17-point system font. It has to
+    // be set eagerly: `UILabel` draws nothing at all without a font, so a
+    // field whose app never sets one showed an empty box with the typed text
+    // invisible inside it.
+    let default_font: id = msg_class![env; UIFont systemFontOfSize:17.0];
+    let _: () = msg![env; text_label setFont:default_font];
 
     env.objc.borrow_mut::<UITextFieldHostObject>(this).text_label = text_label;
     let _: () = msg![env; this addSubview:text_label];
@@ -163,6 +170,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     // ВЫНЕСЕННАЯ ПЕРЕМЕННАЯ ДЛЯ ИЗБЕЖАНИЯ ОШИБОК КОМПИЛЯЦИИ E0283
     let clear_color: id = msg_class![env; UIColor clearColor];
     let _: () = msg![env; text_label setBackgroundColor:clear_color];
+    let text_color: id = msg_class![env; UIColor blackColor];
+    let _: () = msg![env; text_label setTextColor:text_color];
+    let default_font: id = msg_class![env; UIFont systemFontOfSize:17.0];
+    let _: () = msg![env; text_label setFont:default_font];
 
     env.objc.borrow_mut::<UITextFieldHostObject>(this).text_label = text_label;
     let _: () = msg![env; this addSubview:text_label];
@@ -527,6 +538,25 @@ pub const CLASSES: ClassExports = objc_classes! {
 };
 
 pub fn handle_text(env: &mut Environment, text_field: id, text: String) {
+    // Android's IME sends the "done"/return action as text ending in a newline
+    // rather than as a separate return event. For an alert that is waiting for
+    // input, that means "the user finished typing": insert whatever came
+    // before the newline and confirm the alert.
+    let (text, confirm) = match text.split_once('\n') {
+        Some((head, _)) if ui_alert_view::is_active_text_field(env, text_field) => {
+            (head.to_string(), true)
+        }
+        _ => (text, false),
+    };
+    if !text.is_empty() {
+        insert_text(env, text_field, text);
+    }
+    if confirm {
+        let _ = ui_alert_view::handle_return(env, text_field);
+    }
+}
+
+fn insert_text(env: &mut Environment, text_field: id, text: String) {
     let txt = ns_string::from_rust_string(env, text);
     let text_label = env
         .objc
@@ -621,6 +651,12 @@ pub fn handle_backspace(env: &mut Environment, text_field: id) {
 }
 
 pub fn handle_return(env: &mut Environment, text_field: id) {
+    // An alert that is waiting for text has no buttons to tap: its return key
+    // stands in for the default button. See ui_alert_view::handle_return.
+    if crate::frameworks::uikit::ui_view::ui_alert_view::handle_return(env, text_field) {
+        return;
+    }
+
     let delegate: id = env
         .objc
         .borrow::<UITextFieldHostObject>(text_field)

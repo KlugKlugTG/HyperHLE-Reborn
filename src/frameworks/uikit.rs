@@ -1005,6 +1005,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
 #[derive(Default)]
 pub struct State {
     ui_accelerometer: ui_accelerometer::State,
+    ui_alert_view: ui_view::ui_alert_view::State,
     ui_application: ui_application::State,
     ui_color: ui_color::State,
     ui_device: ui_device::State,
