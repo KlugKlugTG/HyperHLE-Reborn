@@ -52,10 +52,16 @@ pub enum VType {
     U32,
     I32,
     F32,
+    /// IEEE 754 double. Modern-ish games store money and timers as `double`
+    /// (`CFNumber`/`NSNumber` round-trips, engine math), and a 32-bit scan
+    /// can never match one.
+    F64,
+    U64,
+    I64,
 }
 
 impl VType {
-    pub const ALL: [VType; 8] = [
+    pub const ALL: [VType; 11] = [
         VType::Auto,
         VType::I32,
         VType::U32,
@@ -64,6 +70,9 @@ impl VType {
         VType::I8,
         VType::U8,
         VType::F32,
+        VType::F64,
+        VType::U64,
+        VType::I64,
     ];
 
     pub fn size(self) -> GuestUSize {
@@ -72,6 +81,7 @@ impl VType {
             VType::U8 | VType::I8 => 1,
             VType::U16 | VType::I16 => 2,
             VType::U32 | VType::I32 | VType::F32 => 4,
+            VType::F64 | VType::U64 | VType::I64 => 8,
         }
     }
 
@@ -107,6 +117,15 @@ impl VType {
                 }
                 value.to_bits() as u64
             }
+            VType::F64 => {
+                let value = text.parse::<f64>().ok()?;
+                if !value.is_finite() {
+                    return None;
+                }
+                value.to_bits()
+            }
+            VType::U64 => text.parse::<u64>().ok()?,
+            VType::I64 => text.parse::<i64>().ok()? as u64,
         };
         Some(self.mask_bits(bits))
     }
@@ -117,6 +136,7 @@ impl VType {
             VType::U8 | VType::I8 => value & 0xFF,
             VType::U16 | VType::I16 => value & 0xFFFF,
             VType::U32 | VType::I32 | VType::F32 => value & 0xFFFFFFFF,
+            VType::F64 | VType::U64 | VType::I64 => value,
         }
     }
 
@@ -131,6 +151,9 @@ impl VType {
             VType::U32 => format!("{}", bits as u32),
             VType::I32 => format!("{}", bits as u32 as i32),
             VType::F32 => format!("{:.4}", f32::from_bits(bits as u32)),
+            VType::F64 => format!("{:.4}", f64::from_bits(bits)),
+            VType::U64 => format!("{}", bits),
+            VType::I64 => format!("{}", bits as i64),
         }
     }
 
@@ -144,6 +167,9 @@ impl VType {
             VType::U32 => "U32",
             VType::I32 => "I32",
             VType::F32 => "F32",
+            VType::F64 => "F64",
+            VType::U64 => "U64",
+            VType::I64 => "I64",
         }
     }
 
@@ -237,9 +263,15 @@ pub struct Trainer {
 
 const HACKS_DIR: &str = "touchHLE_hacks";
 const GLOBAL_HACKS_FILE: &str = "hacks.txt";
-/// Don't try to search allocations larger than this (they are rarely game
-/// state and scanning them is slow).
-const MAX_SCAN_ALLOCATION: GuestUSize = 64 * 1024 * 1024;
+/// Don't try to search regions larger than this. The cap exists because the
+/// scan is synchronous: it runs on the emulator thread while the game is
+/// paused between frames, so a multi-gigabyte region would look like a hang.
+///
+/// 64 MiB was too low in practice: engines that keep the player profile or
+/// their asset bookkeeping in one big `mmap` (Asphalt 8 among them) put the
+/// interesting numbers in a region this large or larger, and the trainer then
+/// silently never looked at them at all.
+const MAX_SCAN_ALLOCATION: GuestUSize = 512 * 1024 * 1024;
 /// Hard cap on stored search results (memory + UI sanity).
 const MAX_RESULTS: usize = 500_000;
 /// Confirmation expires rather than leaving a hidden armed bulk operation.
@@ -1001,6 +1033,12 @@ fn search_all(
     }
 
     let mut results = Vec::new();
+    // One entry per address and bit pattern: the first type in `auto_types()`
+    // order that matches exactly wins. A narrow exact match is preferred over
+    // a wider one because writing it cannot clobber the neighbouring bytes,
+    // and the address is what locates the field. That does not hide 64-bit
+    // storage: a `double` or an integer above 2^32 has a bit pattern no
+    // 32-bit type can produce, so only its 64-bit type matches at all.
     let mut seen = HashSet::new();
     for &t in auto_types() {
         // E.g. searching for 600 must not also search for U8(88), and
@@ -1025,6 +1063,10 @@ fn paths_hacks_dir() -> PathBuf {
 
 /// Types probed by an Auto search, in coverage order.
 fn auto_types() -> &'static [VType] {
+    // Ordered 32-bit integers first: that is what games store money in, so it
+    // wins the per-address tie-break in `search_all`. The 64-bit types have to
+    // be in here, or AUTO can never match a `double`/`long long` value that no
+    // 32-bit pattern can produce (Asphalt 8 stores its gold as one of those).
     &[
         VType::I32,
         VType::U32,
@@ -1033,6 +1075,9 @@ fn auto_types() -> &'static [VType] {
         VType::I8,
         VType::U8,
         VType::F32,
+        VType::F64,
+        VType::U64,
+        VType::I64,
     ]
 }
 

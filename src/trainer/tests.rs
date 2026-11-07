@@ -57,6 +57,67 @@ fn float_input_is_numeric_not_an_integer_bit_pattern() {
 }
 
 #[test]
+fn sixty_four_bit_types_parse_format_and_scan() {
+    // Money stored as a double or as a 64-bit integer is invisible to a
+    // 32-bit-only scanner; these are the types that fix that.
+    assert_eq!(VType::F64.parse("9873"), Some(9873.0f64.to_bits()));
+    assert_eq!(VType::F64.parse("12.5"), Some(12.5f64.to_bits()));
+    assert_eq!(VType::U64.parse("18446744073709551615"), Some(u64::MAX));
+    assert_eq!(VType::I64.parse("-9223372036854775808"), Some(i64::MIN as u64));
+    for invalid in ["NaN", "inf", "", "1e400"] {
+        assert_eq!(VType::F64.parse(invalid), None, "{invalid:?}");
+    }
+    assert_eq!(VType::U64.parse("-1"), None);
+    assert_eq!(VType::U64.parse("18446744073709551616"), None);
+
+    assert_eq!((VType::F64.size(), VType::U64.size(), VType::I64.size()), (8, 8, 8));
+    assert_eq!(VType::F64.format(9873.0f64.to_bits()), "9873.0000");
+    assert_eq!(VType::U64.format(u64::MAX), "18446744073709551615");
+    assert_eq!(VType::I64.format((-5i64) as u64), "-5");
+
+    let (mut mem, base) = memory(64);
+    let double = result(&mut mem, base, VType::F64, "9873");
+    let long = result(&mut mem, base + 16, VType::U64, "9873");
+    for (t, expected) in [(VType::F64, double.addr), (VType::U64, long.addr)] {
+        let hits = search_all(&mem, t, "9873", None);
+        assert!(hits.iter().any(|r| r.addr == expected), "{t:?}");
+    }
+    // AUTO has to consider the 64-bit types too, otherwise a value stored as
+    // `double` is only findable when the user guesses the exact type first.
+    // 9873.0 has a bit pattern no narrower type can produce, so AUTO must
+    // report it as the F64 it is.
+    let hits = search_all(&mem, VType::Auto, "9873", None);
+    assert!(hits.iter().any(|r| r.addr == double.addr && r.vtype == VType::F64));
+    // The same value in eight bytes is also an exact match for the narrower
+    // types at that address (the upper bytes are zero). AUTO keeps the first
+    // one in `auto_types()` order, which is a 32-bit integer: a narrow write
+    // cannot clobber the neighbouring bytes. The address is what matters here.
+    assert!(hits.iter().any(|r| r.addr == long.addr));
+    assert!(!hits.iter().any(|r| r.addr == long.addr && r.vtype.size() > 4));
+    // ... and a refine from AUTO must keep working on them.
+    let refined = search_all(&mem, VType::Auto, "9873", Some(&hits));
+    assert!(refined.iter().any(|r| r.addr == double.addr));
+    assert!(refined.iter().any(|r| r.addr == long.addr));
+    // A value that does not fit in 32 bits has no narrower interpretation at
+    // all, so AUTO must report its 64-bit type.
+    let big = result(&mut mem, base + 32, VType::U64, "5000000000");
+    let auto = search_all(&mem, VType::Auto, "5000000000", None);
+    assert!(auto.iter().any(|r| r.addr == big.addr && r.vtype == VType::U64));
+    assert!(!auto.iter().any(|r| r.addr == big.addr && r.vtype != VType::U64));
+}
+
+#[test]
+fn sixty_four_bit_values_can_be_written_and_frozen() {
+    let (mut mem, base) = memory(64);
+    let hit = result(&mut mem, base, VType::F64, "135");
+    assert_eq!(VType::F64.read_at(&mem, base), Some(135.0f64.to_bits()));
+    assert!(VType::F64.write_at(&mut mem, hit.addr, 999999.0f64.to_bits()));
+    assert_eq!(VType::F64.read_at(&mem, base), Some(999999.0f64.to_bits()));
+    // A 64-bit value must not spill past the end of guest memory.
+    assert!(!VType::U64.write_at(&mut mem, u32::MAX - 3, 1));
+}
+
+#[test]
 fn auto_search_does_not_find_truncated_values() {
     let (mut mem, base) = memory(64);
     let integer = result(&mut mem, base, VType::I32, "600");

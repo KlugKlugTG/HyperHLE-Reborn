@@ -207,6 +207,9 @@ pub(super) fn number(t: VType, bits: u64) -> f64 {
         VType::U32 => bits as u32 as f64,
         VType::I32 => bits as i32 as f64,
         VType::F32 => f32::from_bits(bits as u32) as f64,
+        VType::F64 => f64::from_bits(bits),
+        VType::U64 => bits as f64,
+        VType::I64 => bits as i64 as f64,
     }
 }
 
@@ -281,6 +284,10 @@ pub(super) fn encoding(t: VType) -> u8 {
     match t {
         VType::I8 => b'c', VType::U8 => b'C', VType::I16 => b's', VType::U16 => b'S',
         VType::I32 => b'i', VType::U32 => b'I', VType::F32 => b'f', VType::Auto => 0,
+        // Objective-C type encodings: `d` double, `q` long long, `Q` unsigned
+        // long long. They are used to match a value against nearby property
+        // metadata, so the letters have to be the real ones.
+        VType::F64 => b'd', VType::I64 => b'q', VType::U64 => b'Q',
     }
 }
 
