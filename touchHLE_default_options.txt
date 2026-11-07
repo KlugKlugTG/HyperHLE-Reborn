@@ -392,3 +392,14 @@ com.foursakenmedia.civilwar: --reverse-attrib-locations
 
 # Illusia: draws in landscape but never declares or requests an orientation.
 com.gamevil.illusia: --landscape-left
+
+# Asphalt Xtreme (Gameloft, landscape-only, iOS 6+): the engine builds its
+# full-screen EAGL view from UIScreen.bounds while the view is still detached
+# from the window, and never rebuilds the surface afterwards. With the
+# iOS-accurate portrait UIScreen.bounds that produces a portrait renderbuffer
+# (e.g. 640x960) while the game lays its landscape UI (480x320) out inside it:
+# the right-hand side of every screen is clipped and the presenter then
+# stretches the portrait buffer into the landscape viewport. Reporting
+# landscape UIScreen.bounds makes the app allocate the renderbuffer the size it
+# actually draws for, which is what the rotated window gives it on real iOS.
+com.gameloft.asphaltmotorsports: --landscape-uiscreen-bounds
