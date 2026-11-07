@@ -9,7 +9,7 @@
 //! Resources:
 //! - [View Controller Programming Guide for iOS (Legacy)](https://developer.apple.com/library/archive/documentation/WindowsViews/Conceptual/ViewControllerPGforiOSLegacy/BasicViewControllers/BasicViewControllers.html)
 
-use crate::frameworks::core_graphics::{CGRect, CGSize};
+use crate::frameworks::core_graphics::{CGFloat, CGRect, CGSize};
 use crate::frameworks::foundation::ns_objc_runtime::NSStringFromClass;
 use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str, to_rust_string};
 use crate::frameworks::foundation::NSUInteger;
@@ -100,11 +100,26 @@ pub(crate) struct UIViewControllerHostObject {
     /// `UIRectEdgeAll` = 0xF on iOS 7+). See
     /// <https://developer.apple.com/documentation/uikit/uiviewcontroller/1621515-edgesforextendedlayout>.
     edges_for_extended_layout: NSUInteger,
+    /// Non-retained delegate for the game-side `-mDelegate`/`-setMDelegate:`
+    /// pair (see the Rockstar account hooks below).
+    m_delegate: id,
 }
 impl HostObject for UIViewControllerHostObject {}
 
 // Apple's UIRectEdgeAll = UIRectEdgeTop|UIRectEdgeLeft|UIRectEdgeBottom|UIRectEdgeRight = 15
 const UI_RECT_EDGE_ALL: NSUInteger = 15;
+
+/// The view that view-geometry messages forwarded from the controller should
+/// act on. Returns [nil] when the controller has no usable view, and never
+/// returns the controller itself (which would recurse).
+fn geometry_target_view(env: &mut Environment, this: id) -> id {
+    let view: id = msg![env; this view];
+    if view == this {
+        nil
+    } else {
+        view
+    }
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -1095,6 +1110,101 @@ pub const CLASSES: ClassExports = objc_classes! {
     if view != nil {
         () = msg![env; view removeFromSuperview];
     }
+}
+
+// MARK: - View geometry sent to a controller
+//
+// A handful of apps keep a view controller and a view in the same variable and
+// then treat the value as a view: GTA: San Andreas lays out its Rockstar Social
+// Club screen that way (it asks for `isHidden`/`alpha`, sets a frame, removes
+// the object from its superview and reads its autoresizing mask). On iOS those
+// messages belong to the view, so forward them to this controller's view
+// instead of answering every call with "does not respond to selector".
+//
+// https://developer.apple.com/documentation/uikit/uiviewcontroller/1621460-view
+
+- (bool)isHidden {
+    let view = geometry_target_view(env, this);
+    if view == nil { return false; }
+    msg![env; view isHidden]
+}
+
+- (())setHidden:(bool)hidden {
+    let view = geometry_target_view(env, this);
+    if view == nil { return; }
+    () = msg![env; view setHidden:hidden];
+}
+
+- (CGFloat)alpha {
+    let view = geometry_target_view(env, this);
+    if view == nil { return 1.0; }
+    msg![env; view alpha]
+}
+
+- (())setAlpha:(CGFloat)alpha {
+    let view = geometry_target_view(env, this);
+    if view == nil { return; }
+    () = msg![env; view setAlpha:alpha];
+}
+
+- (CGRect)frame {
+    let view = geometry_target_view(env, this);
+    if view == nil { return CGRect::default(); }
+    msg![env; view frame]
+}
+
+- (())setFrame:(CGRect)frame {
+    let view = geometry_target_view(env, this);
+    if view == nil { return; }
+    () = msg![env; view setFrame:frame];
+}
+
+- (())removeFromSuperview {
+    let view = geometry_target_view(env, this);
+    if view == nil { return; }
+    () = msg![env; view removeFromSuperview];
+}
+
+- (NSUInteger)autoresizingMask {
+    let view = geometry_target_view(env, this);
+    if view == nil { return 0; }
+    msg![env; view autoresizingMask]
+}
+
+- (())setAutoresizingMask:(NSUInteger)mask {
+    let view = geometry_target_view(env, this);
+    if view == nil { return; }
+    () = msg![env; view setAutoresizingMask:mask];
+}
+
+// MARK: - Rockstar Social Club account hooks
+//
+// GTA: San Andreas drives its Social Club sign-in through
+// `SocialClubViewController`, a plain `UIViewController` subclass, and sends it
+// these selectors. They are not UIKit API, but the app treats them as part of
+// the object's contract, and every one of them used to end in a "does not
+// respond to selector" warning. Keep the sign-in offline: the SDK has no
+// network backend here, so the hooks are no-ops and the game falls back to its
+// signed-out path.
+
+- (())startRunningInBackground {
+    log_dbg!("[(UIViewController*){:?} startRunningInBackground] (stubbed: Social Club is offline)", this);
+}
+
+- (())stopRunningInBackground {
+}
+
+- (())attemptAutoSignIn {
+    log_dbg!("[(UIViewController*){:?} attemptAutoSignIn] (stubbed: Social Club is offline)", this);
+}
+
+- (id)mDelegate {
+    env.objc.borrow::<UIViewControllerHostObject>(this).m_delegate
+}
+
+- (())setMDelegate:(id)delegate {
+    // UIKit convention: delegates are not retained.
+    env.objc.borrow_mut::<UIViewControllerHostObject>(this).m_delegate = delegate;
 }
 
 @end
