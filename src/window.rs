@@ -1589,6 +1589,20 @@ impl Window {
             };
             // Clamp touches in letterbox bars to the nearest visible edge.
             let (x, y) = geometry::normalize_viewport_coords((in_x, in_y), (vx, vy, vw, vh));
+            // `TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1` (e.g. Asphalt Xtreme) makes
+            // UIScreen.bounds report the interface-oriented size, and the window
+            // it is forced to match is landscape too. The presenter's device
+            // rotation is cancelled by the autorotation transform the window
+            // applies to the view, so the presented image is already in
+            // interface space: the touch must be mapped into that same space,
+            // without the portrait-space rotation below, and scaled by the
+            // interface size rather than the portrait one.
+            let interface_space = crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS");
+            if interface_space {
+                log_once!(
+                    "TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1: mapping touches in interface space [this log will only be shown once]"
+                );
+            }
             // rotate
             //
             // If the final EAGL presentation is not being rotated, the touch
@@ -1599,7 +1613,8 @@ impl Window {
             // PERF: cache the read-once debug toggles; this runs per SDL
             // touch event, and each std::env::var_os is a global-lock environ
             // scan with allocation.
-            let [x, y] = if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION")
+            let [x, y] = if interface_space
+                || crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION")
                 || crate::env_flag_cached!("TOUCHHLE_DISABLE_TOUCH_ROTATION")
             {
                 log_once!(
@@ -1612,7 +1627,15 @@ impl Window {
             };
 
             // back to pixels
-            let (out_w, out_h) = window.size_unrotated_unscaled();
+            let (out_w, out_h) = if interface_space {
+                size_for_orientation_from_size(
+                    window.screen_size(),
+                    window.device_orientation,
+                    NonZeroU32::new(1).unwrap(),
+                )
+            } else {
+                window.size_unrotated_unscaled()
+            };
             let mut out_x = (x + 0.5) * out_w as f32;
             let mut out_y = (y + 0.5) * out_h as f32;
 

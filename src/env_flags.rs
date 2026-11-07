@@ -95,13 +95,13 @@ mod tests {
     #[test]
     fn invalidate_caches_refreshes_flags() {
         // The macro takes a literal, so the name cannot come from a constant.
+        // Other tests in this binary also call invalidate_caches(), so only
+        // assert on states, never on a value still being cached.
         std::env::remove_var("TOUCHHLE_TEST_FLAG_FOR_CACHE_INVALIDATION");
         crate::env_flags::invalidate_caches();
         assert!(!crate::env_flag_cached!("TOUCHHLE_TEST_FLAG_FOR_CACHE_INVALIDATION"));
 
         std::env::set_var("TOUCHHLE_TEST_FLAG_FOR_CACHE_INVALIDATION", "1");
-        // Still cached from the previous generation.
-        assert!(!crate::env_flag_cached!("TOUCHHLE_TEST_FLAG_FOR_CACHE_INVALIDATION"));
         crate::env_flags::invalidate_caches();
         assert!(crate::env_flag_cached!("TOUCHHLE_TEST_FLAG_FOR_CACHE_INVALIDATION"));
 
