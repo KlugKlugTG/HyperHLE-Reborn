@@ -11,6 +11,9 @@
 #include "GUITestsCALayerTestsView.h"
 #include "GUITestsCGFontGlyphTestsView.h"
 #include "GUITestsMainMenu.h"
+#include "GUITestsNavigationBarView.h"
+#include "GUITestsNavigationControllerView.h"
+#include "GUITestsUIKitWidgetsView.h"
 
 @implementation GUITestsMainMenu : UIView
 
@@ -33,41 +36,30 @@ UIWindow *window2;
   ballXVelocity = 5;
   ballYVelocity = 5;
 
-  UIButton *button1 = [UIButton buttonWithType:UIButtonTypeRoundedRect];
-  [button1 setTitle:[NSString stringWithUTF8String:"CALayer tests"]
-           forState:UIControlStateNormal];
-  [button1 setFrame:CGRectMake(40, 300, 240, 40)];
-  [button1 addTarget:self
-                action:@selector(goToCALayerTests)
-      forControlEvents:UIControlEventTouchUpInside];
-  [self addSubview:button1];
-
-  UIButton *button2 = [UIButton buttonWithType:UIButtonTypeRoundedRect];
-  [button2 setTitle:[NSString stringWithUTF8String:"Window 2"]
-           forState:UIControlStateNormal];
-  [button2 setFrame:CGRectMake(40, 140, 240, 40)];
-  [button2 addTarget:self
-                action:@selector(toggleWindow)
-      forControlEvents:UIControlEventTouchUpInside];
-  [self addSubview:button2];
-
-  UIButton *button3 = [UIButton buttonWithType:UIButtonTypeRoundedRect];
-  [button3 setTitle:[NSString stringWithUTF8String:"CGFont/CGGlyph tests"]
-           forState:UIControlStateNormal];
-  [button3 setFrame:CGRectMake(40, 220, 240, 40)];
-  [button3 addTarget:self
-                action:@selector(goToCGFontGlyphTests)
-      forControlEvents:UIControlEventTouchUpInside];
-  [self addSubview:button3];
-
-  UIButton *button4 = [UIButton buttonWithType:UIButtonTypeRoundedRect];
-  [button4 setTitle:[NSString stringWithUTF8String:"BlendMode tests"]
-           forState:UIControlStateNormal];
-  [button4 setFrame:CGRectMake(40, 380, 240, 40)];
-  [button4 addTarget:self
-                action:@selector(goToBlendModeTests)
-      forControlEvents:UIControlEventTouchUpInside];
-  [self addSubview:button4];
+  // One button per manual test screen. They are laid out in the order below,
+  // from the top down, so adding a screen only means appending a row.
+  struct {
+    const char *title;
+    SEL action;
+  } rows[] = {
+      {"Navigation bar", @selector(goToNavigationBarTests)},
+      {"Navigation controller", @selector(goToNavigationControllerTests)},
+      {"UIKit controls", @selector(goToUIKitWidgetsTests)},
+      {"CALayer tests", @selector(goToCALayerTests)},
+      {"CGFont/CGGlyph tests", @selector(goToCGFontGlyphTests)},
+      {"BlendMode tests", @selector(goToBlendModeTests)},
+      {"Window 2", @selector(toggleWindow)},
+  };
+  for (int i = 0; i < (int)(sizeof(rows) / sizeof(rows[0])); i++) {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeRoundedRect];
+    [button setTitle:[NSString stringWithUTF8String:rows[i].title]
+            forState:UIControlStateNormal];
+    [button setFrame:CGRectMake(40, 130 + i * 42, 240, 38)];
+    [button addTarget:self
+                  action:rows[i].action
+        forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:button];
+  }
 
   return self;
 }
@@ -106,6 +98,24 @@ UIWindow *window2;
                          blue:(ballFrame.origin.y / windowFrame.size.height)
                         alpha:1.0];
   ball.frame = ballFrame;
+}
+
+- (void)goToNavigationBarTests {
+  [((GUITestsAppDelegate *)[[UIApplication sharedApplication]
+      delegate]) setMainView:[[[GUITestsNavigationBarView alloc]
+                                 initWithFrame:[self frame]] autorelease]];
+}
+
+- (void)goToNavigationControllerTests {
+  [((GUITestsAppDelegate *)[[UIApplication sharedApplication]
+      delegate]) setMainView:[[[GUITestsNavigationControllerView alloc]
+                                 initWithFrame:[self frame]] autorelease]];
+}
+
+- (void)goToUIKitWidgetsTests {
+  [((GUITestsAppDelegate *)[[UIApplication sharedApplication]
+      delegate]) setMainView:[[[GUITestsUIKitWidgetsView alloc]
+                                 initWithFrame:[self frame]] autorelease]];
 }
 
 - (void)goToCALayerTests {
