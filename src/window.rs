@@ -1599,9 +1599,7 @@ impl Window {
             // interface size rather than the portrait one.
             let interface_space = crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS");
             if interface_space {
-                log_once!(
-                    "TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1: mapping touches in interface space [this log will only be shown once]"
-                );
+                log_once!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS=1: mapping touches in interface space");
             }
             // rotate
             //
@@ -1613,13 +1611,13 @@ impl Window {
             // PERF: cache the read-once debug toggles; this runs per SDL
             // touch event, and each std::env::var_os is a global-lock environ
             // scan with allocation.
-            let [x, y] = if interface_space
-                || crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION")
+            let [x, y] = if interface_space {
+                // Logged above; the presented frame is already in interface space.
+                [x, y]
+            } else if crate::env_flag_cached!("TOUCHHLE_DISABLE_PRESENT_ROTATION")
                 || crate::env_flag_cached!("TOUCHHLE_DISABLE_TOUCH_ROTATION")
             {
-                log_once!(
-                    "TOUCHHLE_DISABLE_TOUCH_ROTATION: not rotating touch hit-test coordinates [this log will only be shown once]"
-                );
+                log_once!("TOUCHHLE_DISABLE_TOUCH_ROTATION: not rotating touch hit-test coordinates");
                 [x, y]
             } else {
                 let matrix = window.rotation_matrix().inverse().unwrap();
