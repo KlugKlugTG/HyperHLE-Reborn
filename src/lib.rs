@@ -653,6 +653,14 @@ fn run_session<T: Iterator<Item = String>>(
         let parse_result = options.parse_argument(&option_arg);
         assert!(parse_result == Ok(true));
     }
+    // Options that tweak the emulated device profile work by setting
+    // `TOUCHHLE_*` environment variables, and several subsystems cache those
+    // flags for the lifetime of the process. The app picker runs the same
+    // UIKit/OpenGL ES code as the app and can read them before this point
+    // (`UIScreen.bounds` reading `TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS`), so make
+    // every cached flag re-read the environment now that all options for this
+    // app are known.
+    crate::env_flags::invalidate_caches();
 
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Environment::new(bundle, fs, options.clone(), app_args.unwrap_or_default())

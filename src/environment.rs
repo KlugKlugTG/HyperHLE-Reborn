@@ -490,6 +490,10 @@ impl Environment {
                 // if sound is silent.
             }
         }
+        // A compatibility profile above may have changed the environment after
+        // the caches were last refreshed (the app picker also runs the same
+        // code), so make the cached `TOUCHHLE_*` flags re-read it.
+        crate::env_flags::invalidate_caches();
         // Enforces the one (real) Environment limit. See `with_yielder` for
         // why this is needed.
         if ENVIRONMENT_INSTANCE_EXISTS.swap(true, std::sync::atomic::Ordering::SeqCst) {
