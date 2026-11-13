@@ -15,6 +15,7 @@ pub mod cg_color_space;
 pub mod cg_context;
 pub mod cg_data_provider;
 pub mod cg_font;
+pub mod cg_function;
 pub mod cg_geometry;
 pub mod cg_gradient;
 pub mod cg_image;
@@ -31,6 +32,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         cg_color_space::CLASSES,
         cg_context::CLASSES,
         cg_font::CLASSES,
+        cg_function::CLASSES,
         cg_gradient::CLASSES,
         cg_image::CLASSES,
         cg_layer::CLASSES,
@@ -52,6 +54,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         cg_context::FUNCTIONS,
         cg_data_provider::FUNCTIONS,
         cg_font::FUNCTIONS,
+        cg_function::FUNCTIONS,
         cg_geometry::FUNCTIONS,
         cg_gradient::FUNCTIONS,
         cg_image::FUNCTIONS,
