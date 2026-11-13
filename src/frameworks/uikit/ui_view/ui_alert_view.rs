@@ -41,6 +41,11 @@ pub struct UIAlertViewHostObject {
     text_field: id,
     /// Panel of real views that hosts the text field while the alert is up.
     panel: id,
+    /// `-isHidden` / `-setHidden:`. The alert is not a real view, so this is
+    /// only stored, and forwarded to the text-input panel when one exists.
+    hidden: bool,
+    /// `-alpha` / `-setAlpha:`, clamped to 0.0..=1.0 like `UIView`.
+    alpha: CGFloat,
 }
 impl HostObject for UIAlertViewHostObject {}
 
@@ -66,9 +71,9 @@ pub struct State {
 /// `-[UIAlertView show]` returns immediately, and the guest has to keep running
 /// for the typed characters to reach it.
 fn show_text_alert(env: &mut crate::Environment, alert: id) -> bool {
-    let (text_field, title, message) = {
+    let (text_field, title, message, hidden, alpha) = {
         let host = env.objc.borrow::<UIAlertViewHostObject>(alert);
-        (host.text_field, host.title, host.message)
+        (host.text_field, host.title, host.message, host.hidden, host.alpha)
     };
     if text_field == nil {
         return false;
@@ -176,6 +181,10 @@ fn show_text_alert(env: &mut crate::Environment, alert: id) -> bool {
             env.window().current_rotation(),
         );
         let _: () = msg![env; panel setTransform:panel_transform];
+
+        // Apply any hidden/alpha the app set before `-show`.
+        let _: () = msg![env; panel setHidden:hidden];
+        let _: () = msg![env; panel setAlpha:alpha];
 
         let _: () = msg![env; window addSubview:panel];
 
@@ -359,6 +368,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         subviews:            Vec::new(),
         text_field:          nil,
         panel:               nil,
+        hidden:              false,
+        alpha:               1.0,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -376,8 +387,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     retain(env, title);
     retain(env, message);
     {
-        // ИСПРАВЛЕНИЕ: Добавлен `mut`, так как изменение полей `RefMut` требует
-        // мутабельности переменной
         let host = env.objc.borrow_mut::<UIAlertViewHostObject>(this);
         host.title    = title;
         host.message  = message;
@@ -399,8 +408,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    // ИСПРАВЛЕНИЕ: Блокируем `host` в узком scope, чтобы снять заимствование до
-    // `release`
+    // Блокируем `host` в узком scope, чтобы снять заимствование до `release`
     let (title, message, buttons, subviews, panel) = {
         let host = env.objc.borrow::<UIAlertViewHostObject>(this);
         (host.title, host.message, host.button_titles, host.subviews.clone(), host.panel)
@@ -459,8 +467,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (NSInteger)cancelButtonIndex { env.objc.borrow::<UIAlertViewHostObject>(this).cancel_button_index }
 - (())setCancelButtonIndex:(NSInteger)index { env.objc.borrow_mut::<UIAlertViewHostObject>(this).cancel_button_index = index; }
 - (NSInteger)firstOtherButtonIndex {
-    // ИСПРАВЛЕНИЕ: Скоуп не даст возникнуть ошибке заимствования на `msg![env;
-    // ...]`
     let (buttons, cancel) = {
         let host = env.objc.borrow::<UIAlertViewHostObject>(this);
         (host.button_titles, host.cancel_button_index)
@@ -509,9 +515,36 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())removeFromSuperview {
     log_dbg!("UIAlertView removeFromSuperview: ignored");
 }
-- (())setHidden:(bool)_hidden {
-    log_dbg!("UIAlertView setHidden: ignored");
+
+// hidden / alpha — stored, and forwarded to the text-input panel if it exists.
+- (bool)isHidden {
+    env.objc.borrow::<UIAlertViewHostObject>(this).hidden
 }
+- (())setHidden:(bool)hidden {
+    let panel = {
+        let host = env.objc.borrow_mut::<UIAlertViewHostObject>(this);
+        host.hidden = hidden;
+        host.panel
+    };
+    if panel != nil {
+        let _: () = msg![env; panel setHidden:hidden];
+    }
+}
+- (CGFloat)alpha {
+    env.objc.borrow::<UIAlertViewHostObject>(this).alpha
+}
+- (())setAlpha:(CGFloat)alpha {
+    let alpha = alpha.clamp(0.0, 1.0);
+    let panel = {
+        let host = env.objc.borrow_mut::<UIAlertViewHostObject>(this);
+        host.alpha = alpha;
+        host.panel
+    };
+    if panel != nil {
+        let _: () = msg![env; panel setAlpha:alpha];
+    }
+}
+
 - (CGRect)frame {
     CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 0.0, height: 0.0 } }
 }
@@ -545,17 +578,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())sizeToFit {
-    // 1. Получаем текущий frame
     let frame: CGRect = msg![env; this frame];
 
-    // 2. ВАЖНО: Выносим размер в отдельную переменную.
     // Макрос msg! не принимает "frame.size" как аргумент после двоеточия.
     let current_size = frame.size;
 
-    // 3. Запрашиваем подходящий размер
     let new_size: CGSize = msg![env; this sizeThatFits:current_size];
 
-    // 4. Формируем новый frame и применяем его
     let new_frame = CGRect { origin: frame.origin, size: new_size };
     let _: () = msg![env; this setFrame:new_frame];
 }
