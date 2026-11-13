@@ -26,6 +26,7 @@ struct CGFunctionCallbacks {
 }
 unsafe impl SafeRead for CGFunctionCallbacks {}
 
+#[derive(Default)]
 pub struct CGFunctionHostObject {
     info: MutVoidPtr,
     domain_dimension: GuestUSize,
