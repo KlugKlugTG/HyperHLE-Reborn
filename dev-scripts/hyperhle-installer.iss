@@ -26,7 +26,7 @@
   #define OutputDir "."
 #endif
 
-#define AppName "HyperHLE"
+#define AppName "HyperHLE-Reborn-Fork-V2"
 #define AppExeName "touchHLE.exe"
 
 [Setup]
@@ -35,12 +35,13 @@ AppId={{240E0CC4-02F5-4DEB-A0F8-902393AEB609}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=HyperHLE Reborn contributors
+AppPublisher=HyperHLE-Reborn contributors
 AppPublisherURL=https://github.com/KlugKlugTG/HyperHLE-Reborn
 AppSupportURL=https://github.com/KlugKlugTG/HyperHLE-Reborn/issues
 AppUpdatesURL=https://github.com/KlugKlugTG/HyperHLE-Reborn/releases
 VersionInfoVersion={#AppNumericVersion}
-DefaultDirName={autopf}\{#AppName}
+; Keep the historical install path so existing installations stay in place.
+DefaultDirName={autopf}\HyperHLE
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest

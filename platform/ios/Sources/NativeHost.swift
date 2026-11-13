@@ -1021,11 +1021,11 @@ private enum JITMethod {
     var unavailableMessage: String {
         switch self {
         case .permanent, .stikDebug:
-            return "Games need JIT, and without it HyperHLE closes the moment one starts. "
+            return "Games need JIT, and without it HyperHLE-Reborn-Fork-V2 closes the moment one starts. "
                 + "Enable JIT in StikDebug, then start the game again."
         case .external:
-            return "Games need JIT, and without it HyperHLE closes the moment one starts. "
-                + "Enable JIT for HyperHLE in TrollStore, or with AltJIT, then start the "
+            return "Games need JIT, and without it HyperHLE-Reborn-Fork-V2 closes the moment one starts. "
+                + "Enable JIT for HyperHLE-Reborn-Fork-V2 in TrollStore, or with AltJIT, then start the "
                 + "game again."
         }
     }
@@ -1036,9 +1036,9 @@ private enum JITMethod {
         case .permanent:
             return "This install has permanent JIT, so there is nothing to enable."
         case .stikDebug:
-            return "JIT must be enabled again whenever HyperHLE starts as a new app process."
+            return "JIT must be enabled again whenever HyperHLE-Reborn-Fork-V2 starts as a new app process."
         case .external:
-            return "StikDebug needs iOS 17.4 or newer. Enable JIT for HyperHLE in TrollStore, "
+            return "StikDebug needs iOS 17.4 or newer. Enable JIT for HyperHLE-Reborn-Fork-V2 in TrollStore, "
                 + "or with AltJIT, each time it starts as a new app process."
         }
     }
@@ -1071,7 +1071,7 @@ private struct EnableJITButton: View {
         } label: {
             Label("Enable JIT", systemImage: "bolt.fill")
         }
-        .accessibilityHint("Opens StikDebug and enables JIT for HyperHLE")
+        .accessibilityHint("Opens StikDebug and enables JIT for HyperHLE-Reborn-Fork-V2")
         .alert("StikDebug Not Available", isPresented: $showingUnavailableAlert) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -1423,7 +1423,7 @@ private struct AboutView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
 
                         VStack(spacing: 4) {
-                            Text("HyperHLE")
+                            Text("HyperHLE-Reborn-Fork-V2")
                                 .font(.title2.bold())
                             Text("High-level emulator for early iPhone OS apps")
                                 .font(.subheadline)
@@ -1446,15 +1446,15 @@ private struct AboutView: View {
                 }
 
                 Section("About") {
-                    Text("HyperHLE plays older 32-bit iPhone games on modern devices, without including any Apple software. It is an experimental community project, and no games are included.")
+                    Text("HyperHLE-Reborn-Fork-V2 plays supported 32-bit iPhone OS apps on modern devices using high-level emulation. It includes no Apple software or games.")
 
                     Link(destination: URL(string: "https://github.com/KlugKlugTG/HyperHLE-Reborn")!) {
-                        Label("HyperHLE-Reborn on GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
+                        Label("HyperHLE-Reborn-Fork-V2 on GitHub", systemImage: "chevron.left.forwardslash.chevron.right")
                     }
                 }
 
                 Section {
-                    Text("HyperHLE is a fork of touchHLE. This iOS app, its build system and its packaging come from Applesauce, an unaffiliated iOS port of touchHLE and HyperHLE.")
+                    Text("HyperHLE-Reborn-Fork-V2 is the display name of this HyperHLE build. The iOS host, build system, and packaging are based on Applesauce, an unaffiliated iOS port of touchHLE and HyperHLE.")
 
                     Text("None of those projects is connected to this build or endorses it, so please report problems here rather than to them.")
 

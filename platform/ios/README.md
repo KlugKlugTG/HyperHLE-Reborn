@@ -1,14 +1,18 @@
-# HyperHLE for iOS
+# HyperHLE-Reborn-Fork-V2 for iOS
 
-A native iOS app that runs the HyperHLE core on modern iPhones and iPads. It
-plays supported 32-bit iPhone OS games through high-level emulation and the
-Dynarmic JIT. No games or Apple software are included.
+The iOS app is displayed as **HyperHLE-Reborn-Fork-V2** and runs the HyperHLE
+core on modern iPhones and iPads. It plays supported 32-bit iPhone OS games
+through high-level emulation and Dynarmic JIT; no games or Apple software are
+included.
 
 The iOS app, its build scripts and its packaging come from
 [Applesauce](https://github.com/johnny901901901/Applesauce), an unaffiliated
 iOS port of touchHLE and HyperHLE. This directory is that host app, rebranded
 and built against this repository's core. Applesauce is not connected to this
 fork, so report problems here rather than there.
+
+The home-screen label is **HyperHLE-Reborn-Fork-V2**. The `.app` bundle path and
+release filenames retain their historical `HyperHLE` names for build tooling.
 
 ## Downloads
 
@@ -43,10 +47,10 @@ Dynarmic needs executable memory, so JIT has to be enabled whenever the app
 starts as a new process:
 
 - **StikDebug (iOS 17.4+):** pair StikDebug with your device, connect its
-  loopback VPN, then tap the bolt button in the HyperHLE library.
-- **TrollStore (iOS 15.0–17.0):** use TrollStore's **Enable JIT** on HyperHLE
+  loopback VPN, then tap the bolt button in the HyperHLE-Reborn-Fork-V2 library.
+- **TrollStore (iOS 15.0–17.0):** use TrollStore's **Enable JIT** on HyperHLE-Reborn-Fork-V2
   before starting a game.
-- **AltJIT:** in AltStore, long-press HyperHLE under **My Apps** and choose
+- **AltJIT:** in AltStore, long-press HyperHLE-Reborn-Fork-V2 under **My Apps** and choose
   **Enable JIT**.
 
 ## Importing games

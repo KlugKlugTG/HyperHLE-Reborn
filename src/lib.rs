@@ -133,7 +133,7 @@ static GLOBAL: CountingMiMalloc = CountingMiMalloc;
 
 pub use touchHLE_version::*;
 
-pub const DISPLAY_NAME: &str = "HyperHLE-Reborn";
+pub const DISPLAY_NAME: &str = "HyperHLE-Reborn-Fork-V2";
 
 #[cfg(target_os = "ios")]
 static HOST_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
