@@ -133,7 +133,7 @@ enum {
 
 @implementation GUITestsUIKitWidgetsView
 
-UILabel *status;
+static UILabel *status;
 UIActivityIndicatorView *spinner;
 UIProgressView *progress;
 UISlider *slider;

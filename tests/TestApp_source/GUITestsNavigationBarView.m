@@ -58,7 +58,7 @@
 UINavigationBar *navBar;
 UINavigationItem *rootItem;
 UIToolbar *toolbar;
-UILabel *status;
+static UILabel *status;
 
 - (void)log:(const char *)message {
   printf("NAVBAR-TEST: %s\n", message);

@@ -102,7 +102,7 @@ static id gNavigationControllerView = NULL;
 @implementation GUITestsNavigationControllerView : UIView
 
 UINavigationController *navController;
-UILabel *status;
+static UILabel *status;
 
 - (instancetype)initWithFrame:(CGRect)frame {
   [super initWithFrame:frame];
