@@ -326,6 +326,92 @@ pub const CLASSES: ClassExports = objc_classes! {
     label
 }
 
+// ---- Deprecated iOS 2.x cell text/image API (replaced by textLabel / imageView
+// in iOS 3.0). Forwarded to the default subviews. ----
+
+- (id)text {
+    let label = env.objc.borrow::<UITableViewCellHostObject>(this).text_label;
+    if label == nil { return nil; }
+    msg![env; label text]
+}
+- (())setText:(id)text {
+    let label: id = msg![env; this textLabel];
+    () = msg![env; label setText:text];
+}
+
+- (id)font {
+    let label = env.objc.borrow::<UITableViewCellHostObject>(this).text_label;
+    if label == nil { return nil; }
+    msg![env; label font]
+}
+- (())setFont:(id)font {
+    let label: id = msg![env; this textLabel];
+    () = msg![env; label setFont:font];
+}
+
+- (id)textColor {
+    let label = env.objc.borrow::<UITableViewCellHostObject>(this).text_label;
+    if label == nil { return nil; }
+    msg![env; label textColor]
+}
+- (())setTextColor:(id)color {
+    let label: id = msg![env; this textLabel];
+    () = msg![env; label setTextColor:color];
+}
+
+// Old name for UILabel's highlightedTextColor.
+- (id)selectedTextColor {
+    let label = env.objc.borrow::<UITableViewCellHostObject>(this).text_label;
+    if label == nil { return nil; }
+    msg![env; label highlightedTextColor]
+}
+- (())setSelectedTextColor:(id)color {
+    let label: id = msg![env; this textLabel];
+    () = msg![env; label setHighlightedTextColor:color];
+}
+
+- (i32)textAlignment {
+    let label = env.objc.borrow::<UITableViewCellHostObject>(this).text_label;
+    if label == nil { return 0; } // UITextAlignmentLeft
+    msg![env; label textAlignment]
+}
+- (())setTextAlignment:(i32)alignment {
+    let label: id = msg![env; this textLabel];
+    () = msg![env; label setTextAlignment:alignment];
+}
+
+- (i32)lineBreakMode {
+    let label = env.objc.borrow::<UITableViewCellHostObject>(this).text_label;
+    if label == nil { return 4; } // UILineBreakModeTailTruncation (UILabel default)
+    msg![env; label lineBreakMode]
+}
+- (())setLineBreakMode:(i32)mode {
+    let label: id = msg![env; this textLabel];
+    () = msg![env; label setLineBreakMode:mode];
+}
+
+- (id)image {
+    let iv = env.objc.borrow::<UITableViewCellHostObject>(this).image_view;
+    if iv == nil { return nil; }
+    msg![env; iv image]
+}
+- (())setImage:(id)image {
+    let iv: id = msg![env; this imageView];
+    () = msg![env; iv setImage:image];
+    // The text label's x offset depends on whether an image is present.
+    layout_cell_contents(env, this);
+}
+
+- (id)selectedImage {
+    let iv = env.objc.borrow::<UITableViewCellHostObject>(this).image_view;
+    if iv == nil { return nil; }
+    msg![env; iv highlightedImage]
+}
+- (())setSelectedImage:(id)image {
+    let iv: id = msg![env; this imageView];
+    () = msg![env; iv setHighlightedImage:image];
+}
+
 - (id)imageView {
     let existing = env.objc.borrow::<UITableViewCellHostObject>(this).image_view;
     if existing != nil {
