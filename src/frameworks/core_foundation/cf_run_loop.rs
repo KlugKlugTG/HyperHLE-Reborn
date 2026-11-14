@@ -165,13 +165,27 @@ fn CFRunLoopContainsObserver(
     false
 }
 
+/// `Boolean CFRunLoopContainsTimer(CFRunLoopRef rl, CFRunLoopTimerRef timer,
+///     CFRunLoopMode mode)`
+///
+/// Returns whether `timer` is scheduled in `rl`. touchHLE's run loop keeps a
+/// single timer list and ignores modes (see [CFRunLoopRunInMode] and
+/// `-[NSRunLoop addTimer:forMode:]`), so the mode is ignored here too.
+///
+/// This used to be a stub that always answered `false`. Apps use it to decide
+/// whether a timer still has to be invalidated: HYBRID (#424) only invalidates
+/// and releases its per-stream audio poll timer when the run loop still
+/// contains it, so the stub left the timer scheduled. It then fired after the
+/// stream had been freed, the poll queried the deleted source (source 0),
+/// OpenAL reported `AL_INVALID_NAME`, and the app's own error check called
+/// `assert(0)` — the reported random in-game crash.
 fn CFRunLoopContainsTimer(
-    _env: &mut Environment,
-    _rl: CFRunLoopRef,
-    _timer: CFRunLoopTimerRef,
+    env: &mut Environment,
+    rl: CFRunLoopRef,
+    timer: CFRunLoopTimerRef,
     _mode: CFRunLoopMode,
 ) -> bool {
-    false
+    ns_run_loop::contains_timer(env, rl, timer)
 }
 
 fn CFRunLoopIsWaiting(_env: &mut Environment, _rl: CFRunLoopRef) -> bool {

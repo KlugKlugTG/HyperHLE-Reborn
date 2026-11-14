@@ -6421,6 +6421,7 @@ int test_NSNotificationCenter_addObserver_nilName_removeObserver() {
 
 int test_CFRunLoopTimerCreate_callout(void);
 int test_CFRunLoopTimerSetNextFireDate_NSTimer(void);
+int test_CFRunLoopContainsTimer(void);
 int test_CFURLCreatePropertyFromResource(void);
 int test_stat_inode_identifies_file(void);
 int test_access_mode_bits_and_TMPDIR(void);
@@ -6609,6 +6610,7 @@ struct {
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
     XFUNC_DEF(test_CFRunLoopTimerCreate_callout),
     XFUNC_DEF(test_CFRunLoopTimerSetNextFireDate_NSTimer),
+    FUNC_DEF(test_CFRunLoopContainsTimer),
     FUNC_DEF(test_CFURLCreatePropertyFromResource),
     FUNC_DEF(test_stat_inode_identifies_file),
     FUNC_DEF(test_access_mode_bits_and_TMPDIR),
@@ -6680,6 +6682,36 @@ int test_CFRunLoopTimerCreate_callout(void) {
   CFRunLoopTimerInvalidate(timer);
   if (result == 0 && CFRunLoopTimerIsValid(timer))
     result = -6;
+  CFRelease(timer);
+  [pool drain];
+  return result;
+}
+
+
+// CFRunLoopContainsTimer reports whether a timer is currently scheduled in the
+// run loop, and invalidating it unschedules it. HYBRID checks this before
+// invalidating and releasing its per-stream audio poll timers; a stub that
+// always answered false left them scheduled, and they later fired on freed
+// audio streams (issue #424).
+// https://developer.apple.com/documentation/corefoundation/1542503-cfrunloopcontainstimer
+int test_CFRunLoopContainsTimer(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  CFStringRef mode = CFSTR("TestAppContainsTimerMode");
+  CFRunLoopTimerContext context = {0};
+  CFRunLoopTimerRef timer =
+      CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 100.0, 0, 0, 0,
+                           cf_timer_callout, &context);
+  int result = 0;
+  if (CFRunLoopContainsTimer(CFRunLoopGetCurrent(), timer, mode))
+    result = -1; // not added yet
+  CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, mode);
+  if (result == 0 &&
+      !CFRunLoopContainsTimer(CFRunLoopGetCurrent(), timer, mode))
+    result = -2; // scheduled now
+  CFRunLoopTimerInvalidate(timer);
+  if (result == 0 &&
+      CFRunLoopContainsTimer(CFRunLoopGetCurrent(), timer, mode))
+    result = -3; // invalidating removes it from the run loop
   CFRelease(timer);
   [pool drain];
   return result;

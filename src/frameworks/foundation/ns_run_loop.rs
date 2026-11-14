@@ -303,6 +303,21 @@ pub fn remove_audio_queue(env: &mut Environment, run_loop: id, queue: AudioQueue
     }
 }
 
+/// For use by Core Foundation: is `timer` currently scheduled in `run_loop`?
+///
+/// touchHLE's run loop keeps a single timer list and ignores modes, exactly
+/// like `-[NSRunLoop addTimer:forMode:]` above, so callers that pass a mode
+/// (e.g. `CFRunLoopContainsTimer`) don't need to match it.
+pub(crate) fn contains_timer(env: &Environment, run_loop: id, timer: id) -> bool {
+    if run_loop == nil || timer == nil {
+        return false;
+    }
+    env.objc
+        .borrow::<NSRunLoopHostObject>(run_loop)
+        .timers
+        .contains(&timer)
+}
+
 /// For use by NSTimer so it can remove itself once it's invalidated.
 pub(crate) fn remove_timer(env: &mut Environment, run_loop: id, timer: id) {
     log_dbg!("Removing timer {:?} from run loop {:?}", timer, run_loop);
