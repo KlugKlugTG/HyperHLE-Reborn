@@ -36,7 +36,7 @@ The titles below have been tested with HyperHLE-Reborn and are known to run. Com
 - Need For Speed: Most Wanted (Playable)
 - Minecraft 0.16.2 (Playable)
 - Oceanhorn (Playable)
-- Asphalt 8 1.0.0-1.4.0 (Playable)
+- Asphalt 8 1.0.0-1.7.2 (Playable)
 - GTA 3 (Ingame)
 - Granny (Ingame)
 - BioShock (Ingame, not tested)
