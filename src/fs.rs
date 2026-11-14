@@ -391,6 +391,26 @@ pub fn resolve_path<'a>(path: &'a GuestPath, relative_to: Option<&'a GuestPath>)
         }
     }
 
+    // --- Canonical `/private/…` spelling (iPhone OS layout) ---
+    // On iPhone OS the writable system trees really live under `/private`:
+    // `/var` is a symlink to `/private/var`, `/etc` to `/private/etc` and
+    // `/tmp` to `/private/var/tmp` (see Apple's "File System Programming
+    // Guide", iOS directory layout, and `man 1 hier`). Frameworks hand out the
+    // canonical spelling: Unity's `Application.persistentDataPath` is
+    // `/private/var/mobile/Applications/<uuid>/Documents` on iOS, while
+    // `Application.dataPath` uses `/var/mobile/Applications/…`. Both must name
+    // the same files. touchHLE's virtual filesystem keeps those trees at the
+    // root, so drop the `/private` prefix here — this is the one place every
+    // lookup, creation and enumeration goes through.
+    if components.len() >= 2
+        && components[0].eq_ignore_ascii_case("private")
+        && (components[1].eq_ignore_ascii_case("var")
+            || components[1].eq_ignore_ascii_case("etc")
+            || components[1].eq_ignore_ascii_case("tmp"))
+    {
+        components.remove(0);
+    }
+
     log_dbg!("=> {:?}", components);
 
     components
@@ -2184,5 +2204,43 @@ mod tests {
         assert!(fs
             .resolve_case_insensitive_path(GuestPath::new("Data/not-present"))
             .is_none());
+    }
+
+    #[test]
+    fn resolves_canonical_private_paths_like_iphone_os() {
+        // `/var` is a symlink to `/private/var` on iPhone OS, so both spellings
+        // must resolve to the same file. Unity's `Application.persistentDataPath`
+        // returns the `/private/var/…` form (see issue #426, Cat Simulator 2015).
+        assert_eq!(
+            resolve_path(
+                GuestPath::new("/private/var/mobile/Applications/UUID"),
+                None
+            ),
+            vec!["var", "mobile", "Applications", "UUID"]
+        );
+        assert_eq!(
+            resolve_path(GuestPath::new("/private/etc/hosts"), None),
+            vec!["etc", "hosts"]
+        );
+        // A component that merely starts with "private" must not be rewritten.
+        assert_eq!(
+            resolve_path(GuestPath::new("/privateer/var"), None),
+            vec!["privateer", "var"]
+        );
+
+        let fs = case_test_fs();
+        let via_private: String = fs
+            .resolve_case_insensitive_path(GuestPath::new(
+                "/private/var/mobile/applications/uuid/granny.app/Data/data.unity3d",
+            ))
+            .unwrap()
+            .into();
+        assert_eq!(
+            via_private,
+            "/Var/Mobile/Applications/UUID/Granny.app/Data/data.unity3d"
+        );
+        assert!(fs.exists(GuestPath::new(
+            "/private/Var/Mobile/Applications/UUID/Granny.app/Data/data.unity3d"
+        )));
     }
 }
