@@ -2,6 +2,7 @@
 
 mod access_prompt;
 mod archive_store;
+mod classic;
 
 use crate::bundle::Bundle;
 use crate::frameworks::core_graphics::cg_affine_transform::{
@@ -493,6 +494,14 @@ struct AppPickerDelegateHostObject {
     // Set by the add-app tile; kept separately from icon_tapped because the
     // picker needs to wait for a newly copied IPA to settle before reloading.
     add_ipa: bool,
+    /// Taps on the status-bar clock. Five quick ones switch to the classic
+    /// home screen.
+    clock_taps: u32,
+    clock_last_tap: Option<Instant>,
+    classic_requested: bool,
+    classic_exit_requested: bool,
+    classic_quick_options_show: bool,
+    classic_quick_options_hide: bool,
     recent_app_tapped: bool,
     status_accessory_tapped: bool,
     access_prompt_confirm: bool,
@@ -975,6 +984,43 @@ const CLASSES: ClassExports = objc_classes! {
 
 - (())addIpa {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).add_ipa = true;
+}
+
+- (())clockTapped {
+    /// Taps needed to reveal the classic home screen.
+    const TAPS: u32 = 5;
+    /// Taps further apart than this start a new sequence.
+    const WINDOW: Duration = Duration::from_secs(2);
+    let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
+    let now = Instant::now();
+    let quick = host_obj
+        .clock_last_tap
+        .is_some_and(|last| now.duration_since(last) <= WINDOW);
+    host_obj.clock_taps = if quick { host_obj.clock_taps + 1 } else { 1 };
+    host_obj.clock_last_tap = Some(now);
+    if host_obj.clock_taps >= TAPS {
+        host_obj.clock_taps = 0;
+        host_obj.clock_last_tap = None;
+        host_obj.classic_requested = true;
+    }
+}
+
+- (())classicQuickOptionsShow {
+    env.objc
+        .borrow_mut::<AppPickerDelegateHostObject>(this)
+        .classic_quick_options_show = true;
+}
+
+- (())classicQuickOptionsHide {
+    env.objc
+        .borrow_mut::<AppPickerDelegateHostObject>(this)
+        .classic_quick_options_hide = true;
+}
+
+- (())classicExit {
+    env.objc
+        .borrow_mut::<AppPickerDelegateHostObject>(this)
+        .classic_exit_requested = true;
 }
 
 - (())statusAccessoryTapped {
@@ -1567,6 +1613,9 @@ fn app_picker_inner(
     let mut long_pressed_icon: Option<id> = None;
     // Index of the app whose delete dialog is open, if any.
     let mut pending_delete: Option<usize> = None;
+    // Classic home screen (clock gesture) and its quick-options page.
+    let mut classic_home: Option<classic::ClassicHome> = None;
+    let mut classic_quick: Option<(id, classic::QuickOptionsState)> = None;
 
     // The status bar clock and battery only need refreshing now and then.
     let mut status_time = status_bar_time_string();
@@ -2234,6 +2283,92 @@ fn app_picker_inner(
         if picker_settings != last_saved_picker_settings {
             picker_settings.save();
             last_saved_picker_settings = picker_settings.clone();
+        }
+
+        // Classic home screen and its quick-options page.
+        {
+            let (classic_req, classic_exit, quick_show, quick_hide) = {
+                let mut host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+                (
+                    std::mem::take(&mut host_obj.classic_requested),
+                    std::mem::take(&mut host_obj.classic_exit_requested),
+                    std::mem::take(&mut host_obj.classic_quick_options_show),
+                    std::mem::take(&mut host_obj.classic_quick_options_hide),
+                )
+            };
+            let current_state = || classic::QuickOptionsState {
+                scale_hack: quick_options_scale_hack,
+                orientation: quick_options_orientation,
+                network: quick_options_network,
+                analog_sticks: quick_options_analog_stick_tilt_controls,
+                memory_limit_mb: quick_options_memory_limit_mb,
+                show_fps: quick_options_show_fps,
+                quick_menu: quick_options_quick_menu,
+            };
+            if classic_req && classic_home.is_none() {
+                if let Some(wallpaper) = wallpaper_view {
+                    () = msg![env; wallpaper setHidden:true];
+                }
+                for view in chrome_views.iter() {
+                    () = msg![env; (*view) setHidden:true];
+                }
+                classic_home = Some(classic::install_home(
+                    env,
+                    delegate,
+                    main_view,
+                    app_frame.size,
+                    crate::branding(),
+                ));
+            }
+            if classic_exit {
+                if let Some((view, _)) = classic_quick.take() {
+                    () = msg![env; view removeFromSuperview];
+                }
+                if let Some(home) = classic_home.take() {
+                    home.remove(env);
+                }
+                if let Some(wallpaper) = wallpaper_view {
+                    () = msg![env; wallpaper setHidden:false];
+                }
+                for view in chrome_views.iter() {
+                    () = msg![env; (*view) setHidden:false];
+                }
+            }
+            if quick_hide {
+                if let Some((view, _)) = classic_quick.take() {
+                    () = msg![env; view removeFromSuperview];
+                }
+            }
+            if quick_show && classic_home.is_some() {
+                if let Some((view, _)) = classic_quick.take() {
+                    () = msg![env; view removeFromSuperview];
+                }
+                let state = current_state();
+                let view = classic::make_quick_options(
+                    env,
+                    delegate,
+                    main_view,
+                    app_frame,
+                    &state,
+                );
+                classic_quick = Some((view, state));
+            } else if let Some((view, state)) = classic_quick.take() {
+                // Keep the highlighted choices in sync with the settings.
+                let current = current_state();
+                if current == state {
+                    classic_quick = Some((view, state));
+                } else {
+                    () = msg![env; view removeFromSuperview];
+                    let view = classic::make_quick_options(
+                        env,
+                        delegate,
+                        main_view,
+                        app_frame,
+                        &current,
+                    );
+                    classic_quick = Some((view, current));
+                }
+            }
         }
 
         // Detect .ipa files copied in by the "+" tile flow and refresh the
@@ -3177,6 +3312,21 @@ fn make_status_bar(
         height: 1.0,
     })];
     () = msg![env; bar addSubview:time];
+
+    // The clock doubles as a discreet tap target (see the delegate's
+    // `clockTapped`), centred on the time label so it doesn't steal the
+    // status-bar accessory on the right.
+    {
+        let target: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+        () = msg![env; target setFrame:(rect(width / 2.0 - 56.0, 0.0, 112.0, height))];
+        let clear: id = msg_class![env; UIColor clearColor];
+        () = msg![env; target setBackgroundColor:clear];
+        let selector = env.objc.lookup_selector("clockTapped").unwrap();
+        () = msg![env; target addTarget:delegate
+                                  action:selector
+                        forControlEvents:UIControlEventTouchUpInside];
+        () = msg![env; bar addSubview:target];
+    }
 
     // Battery: a white rounded shell with a black inside and a charge bar.
     let battery = new_view(env, rect(width - BATTERY_RIGHT_INSET, 5.0, 24.0, 11.0), white);
