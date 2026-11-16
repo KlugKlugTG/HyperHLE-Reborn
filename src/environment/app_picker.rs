@@ -3321,7 +3321,7 @@ fn make_status_bar(
         () = msg![env; target setFrame:(rect(width / 2.0 - 56.0, 0.0, 112.0, height))];
         let clear: id = msg_class![env; UIColor clearColor];
         () = msg![env; target setBackgroundColor:clear];
-        let selector = env.objc.lookup_selector("clockTapped").unwrap();
+        let selector = env.objc.register_host_selector("clockTapped".to_string(), &mut env.mem);
         () = msg![env; target addTarget:delegate
                                   action:selector
                         forControlEvents:UIControlEventTouchUpInside];

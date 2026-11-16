@@ -159,7 +159,7 @@ pub(super) fn install_home(
     () = msg![env; label setFont:font];
     // UIControlContentHorizontalAlignmentRight.
     () = msg![env; version setContentHorizontalAlignment:2];
-    let selector = env.objc.lookup_selector("classicExit").unwrap();
+    let selector = env.objc.register_host_selector("classicExit".to_string(), &mut env.mem);
     () = msg![env; version addTarget:delegate
                         action:selector
               forControlEvents:UIControlEventTouchUpInside];
@@ -202,7 +202,7 @@ fn make_button_row(
         () = msg![env; button setTitle:text forState:UIControlStateNormal];
         () = msg![env; button setFrame:frame];
         () = msg![env; button layoutSubviews];
-        let selector = env.objc.lookup_selector(action).unwrap();
+        let selector = env.objc.register_host_selector(action.to_string(), &mut env.mem);
         () = msg![env; button addTarget:delegate
                                 action:selector
                       forControlEvents:UIControlEventTouchUpInside];
@@ -240,7 +240,10 @@ pub(super) fn make_quick_options(
     let label: id = msg![env; close titleLabel];
     let font: id = msg_class![env; UIFont systemFontOfSize:(22.0 as CGFloat)];
     () = msg![env; label setFont:font];
-    let selector = env.objc.lookup_selector("classicQuickOptionsHide").unwrap();
+    let selector = env.objc.register_host_selector(
+        "classicQuickOptionsHide".to_string(),
+        &mut env.mem,
+    );
     () = msg![env; close addTarget:delegate
                            action:selector
                  forControlEvents:UIControlEventTouchUpInside];
@@ -318,7 +321,7 @@ pub(super) fn make_quick_options(
             Row::LabelAndChoices(_, choices) => {
                 make_choices_row(env, delegate, main_view, width, control_y, block, choices);
             }
-            Row::LabelAndSwitch(action, _, on) => {
+            Row::LabelAndSwitch(_, action, on) => {
                 let switch: id = msg_class![env; UISwitch alloc];
                 let switch: id = msg![env; switch initWithFrame:(rect(
                     width / 2.0 - 47.0,
@@ -328,7 +331,7 @@ pub(super) fn make_quick_options(
                 ))];
                 let is_on: bool = *on;
                 () = msg![env; switch setOn:is_on];
-                let selector = env.objc.lookup_selector(action).unwrap();
+                let selector = env.objc.register_host_selector(action.to_string(), &mut env.mem);
                 () = msg![env; switch addTarget:delegate
                                         action:selector
                               forControlEvents:UIControlEventValueChanged];
@@ -392,12 +395,12 @@ fn make_choices_row(
             };
             let tag = super::memory_limit_tag(size);
             () = msg![env; button setTag:tag];
-            let selector = env.objc.lookup_selector("memoryLimit:").unwrap();
+            let selector = env.objc.register_host_selector("memoryLimit:".to_string(), &mut env.mem);
             () = msg![env; button addTarget:delegate
                                     action:selector
                           forControlEvents:UIControlEventTouchUpInside];
         } else {
-            let selector = env.objc.lookup_selector(action).unwrap();
+            let selector = env.objc.register_host_selector(action.to_string(), &mut env.mem);
             () = msg![env; button addTarget:delegate
                                     action:selector
                           forControlEvents:UIControlEventTouchUpInside];
