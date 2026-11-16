@@ -566,6 +566,12 @@ struct AppPickerDelegateHostObject {
     icon_touch_down: id,
     /// Set when a touch that started on an icon stops being a tap.
     icon_touch_cancelled: bool,
+    /// How many times the user has tapped the status-bar clock. At 5, legacy
+    /// mode toggles.
+    time_tap_count: u8,
+    /// When true, the picker draws itself in the classic pre-touchHLE style:
+    /// chunky pixels, strong shadows, and the old springboard colours.
+    legacy_mode: bool,
     delete_cancel: bool,
     delete_confirm: bool,
     /// Set when the horizontal swipe recognizers fire (old-iOS page change).
@@ -980,6 +986,16 @@ const CLASSES: ClassExports = objc_classes! {
 - (())statusAccessoryTapped {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).status_accessory_tapped = true;
 }
+
+- (())timeTapped:(id)sender {
+    let host = env.objc.borrow_mut::<AppPickerDelegateHostObject>(this);
+    host.time_tap_count = host.time_tap_count.saturating_add(1);
+    if host.time_tap_count >= 5 {
+        host.time_tap_count = 0;
+        host.legacy_mode = !host.legacy_mode;
+    }
+}
+
 - (())accessPromptConfirm {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).access_prompt_confirm = true;
 }
@@ -1854,6 +1870,27 @@ fn app_picker_inner(
         }
 
         let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+        if host_obj.legacy_mode {
+            // Legacy mode: classic black status bar with retro green clock.
+            if let Some(bar) = status_bar {
+                let black: id = msg_class![env; UIColor blackColor];
+                () = msg![env; bar setBackgroundColor:black];
+            }
+            if let Some(label) = status_time_label {
+                let retro_green = ui_color(env, 0.0, 0.8, 0.0, 1.0);
+                () = msg![env; label setTextColor:retro_green];
+            }
+        } else if status_bar.is_some() {
+            // Modern style: clear status bar with white clock.
+            let clear: id = msg_class![env; UIColor clearColor];
+            if let Some(bar) = status_bar {
+                () = msg![env; bar setBackgroundColor:clear];
+            }
+            if let Some(label) = status_time_label {
+                let white: id = msg_class![env; UIColor whiteColor];
+                () = msg![env; label setTextColor:white];
+            }
+        }
         if std::mem::take(&mut host_obj.recent_app_tapped) {
             if let Some((path, _, _)) = recent_app.as_ref() {
                 echo!("Picked last launched app: {}", path.display());
@@ -3176,6 +3213,16 @@ fn make_status_bar(
         width: 0.0,
         height: 1.0,
     })];
+    // Transparent button over the clock: tap it 5 times to toggle legacy mode.
+    let time_button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+    () = msg![env; time_button setFrame:(rect(0.0, 0.0, width, height))];
+    let clear: id = msg_class![env; UIColor clearColor];
+    () = msg![env; time_button setBackgroundColor:clear];
+    let selector = env.objc.lookup_selector("timeTapped:").unwrap();
+    () = msg![env; time_button addTarget:delegate
+                                 action:selector
+                       forControlEvents:UIControlEventTouchUpInside];
+    () = msg![env; bar addSubview:time_button];
     () = msg![env; bar addSubview:time];
 
     // Battery: a white rounded shell with a black inside and a charge bar.
