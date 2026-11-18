@@ -142,6 +142,25 @@ impl GLESContext for LoggingGLESContext {
 }
 
 impl<'a> GLES for LoggingGLES<'a> {
+    // Tracing must preserve the backend's API and presentation paths.
+    fn is_es2(&self) -> bool {
+        self.inner.is_es2()
+    }
+    fn is_es3(&self) -> bool {
+        self.inner.is_es3()
+    }
+    fn is_translator(&self) -> bool {
+        self.inner.is_translator()
+    }
+    fn pvrtc_native(&self) -> bool {
+        self.inner.pvrtc_native()
+    }
+    fn supports_vao_oes(&self) -> bool {
+        self.inner.supports_vao_oes()
+    }
+    fn diagnostic_profile(&self) -> &'static str {
+        self.inner.diagnostic_profile()
+    }
     fn is_native_es1(&self) -> bool {
         self.inner.is_native_es1()
     }
