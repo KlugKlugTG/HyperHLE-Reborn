@@ -170,6 +170,10 @@ int test_AutoreleasePool(void);    // AutoReleasePoolTest.m
 int test_CGAffineTransform(void);  // CGAffineTransform.c
 int test_RespondsToSelector(void); // RespondsToSelector.m
 int test_Initialize(void);         // Initialize.m
+int test_dispatch_main_queue_async(void);     // DispatchMainQueue.m
+int test_dispatch_main_queue_serial(void);    // DispatchMainQueue.m
+int test_dispatch_main_queue_sync(void);      // DispatchMainQueue.m
+int test_dispatch_queue_thread_identity(void); // DispatchMainQueue.m
 
 #ifndef DEFINE_ME_WHEN_BUILDING_ON_MACOS
 int test_cpp_virtual_inheritance(void); // CppVirtualInheritance.cpp
@@ -6637,6 +6641,10 @@ struct {
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_withObject),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_removeObserver),
     FUNC_DEF(test_performSelectorOnMainThread_mainThreadDeferred),
+    FUNC_DEF(test_dispatch_main_queue_async),
+    FUNC_DEF(test_dispatch_main_queue_serial),
+    FUNC_DEF(test_dispatch_main_queue_sync),
+    FUNC_DEF(test_dispatch_queue_thread_identity),
     FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
     XFUNC_DEF(test_CFRunLoopTimerCreate_callout),

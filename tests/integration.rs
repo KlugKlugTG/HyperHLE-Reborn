@@ -315,6 +315,9 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         // itself (see ns_string::register_constant_strings), so no stub
         // exports it.
         "-Wl,-U,___CFConstantStringClassReference",
+        // The SDK predates Blocks. Like constant strings, their class
+        // descriptor is resolved by touchHLE's loader, not a guest library.
+        "-Wl,-U,__NSConcreteStackBlock",
     ];
 
     // Generate symbol stubs.

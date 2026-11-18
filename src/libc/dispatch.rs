@@ -5,11 +5,8 @@
  */
 //! Grand Central Dispatch (GCD) — `dispatch/dispatch.h`
 //!
-//! touchHLE is single-threaded from the guest's perspective, so most
-//! concurrency primitives can be dramatically simplified:
-//!   - `dispatch_once` just calls the block once and marks the token.
-//!   - `dispatch_async` / `dispatch_sync` call the block immediately.
-//!   - Queues are opaque handles — we don't actually schedule work.
+//! Main-queue submissions are scheduled on the main thread's run loop.
+//! Other queues and dispatch groups still have limited, inline execution.
 
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::{
@@ -20,8 +17,8 @@ use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::libc::semaphore::{host_create_semaphore, host_destroy_semaphore, sem_t};
 use crate::mem::{ConstVoidPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{id, msg, msg_class, objc_classes, Class, ClassExports};
-use crate::Environment;
-use std::collections::HashMap;
+use crate::{Environment, ThreadId};
+use std::collections::{HashMap, VecDeque};
 
 use super::dispatch_source::{
     self, dispatch_resume, dispatch_source_cancel, dispatch_source_create,
@@ -41,7 +38,6 @@ pub type dispatch_once_t = i32;
 /// Opaque queue handle — we use a small integer sentinel.
 #[allow(non_camel_case_types)]
 pub type dispatch_queue_t = MutVoidPtr;
-
 
 /// Opaque group handle.
 #[allow(non_camel_case_types)]
@@ -126,10 +122,15 @@ pub struct State {
     /// pointer bits. See
     /// <https://developer.apple.com/documentation/dispatch/1452828-dispatch_queue_set_specific>.
     queue_specifics: HashMap<(u32, u32), u32>,
-    /// Stack of queue handles currently executing a block, so that
+    /// Per-thread stacks of queue handles currently executing a callback, so
     /// `dispatch_get_specific` can resolve against the running queue. When
     /// the stack is empty, see [current_queue].
-    pub(super) current_queue_stack: Vec<u32>,
+    current_queue_stacks: HashMap<ThreadId, Vec<u32>>,
+    /// FIFO work awaiting execution on the main thread.
+    main_queue: VecDeque<MainQueueTask>,
+    /// Nested run loops must not execute another main-queue callback while
+    /// one is still running: the main queue is serial.
+    draining_main_queue: bool,
     /// Active dispatch sources keyed by their opaque guest handles.
     pub(super) sources: HashMap<u32, dispatch_source::DispatchSource>,
     /// Next aligned opaque source handle.
@@ -151,14 +152,16 @@ pub(super) fn get_state(env: &mut Environment) -> &mut State {
 /// `dispatch_get_current_queue() == &_dispatch_main_q`, so answering "main
 /// queue" there made it call GL on a thread with no EAGLContext.
 fn current_queue(env: &mut Environment) -> u32 {
+    let thread = env.current_thread;
     let fallback = if env.current_thread == 0 {
         MAIN_QUEUE_PTR
     } else {
         GLOBAL_QUEUE_PTR
     };
     get_state(env)
-        .current_queue_stack
-        .last()
+        .current_queue_stacks
+        .get(&thread)
+        .and_then(|stack| stack.last())
         .copied()
         .unwrap_or(fallback)
 }
@@ -256,7 +259,10 @@ fn dispatch_queue_create(
         },
         attr
     );
-    let label_cstr = env.mem.alloc_and_write_cstr(raw_label.as_bytes()).cast_const();
+    let label_cstr = env
+        .mem
+        .alloc_and_write_cstr(raw_label.as_bytes())
+        .cast_const();
     let st = get_state(env);
     st.next_queue_handle += 2; // keep odd
     let handle = st.next_queue_handle | 0x0100_0000;
@@ -335,21 +341,89 @@ fn dispatch_release(env: &mut Environment, obj: MutVoidPtr) {
 
 // MARK: - Dispatch async / sync
 
+enum MainQueueWork {
+    Block(dispatch_block_t),
+    Function(GuestFunction, MutVoidPtr),
+}
+
+struct MainQueueTask {
+    work: MainQueueWork,
+    /// Async blocks are copied and owned by the queue. Sync blocks remain
+    /// owned by their blocked caller, which is signalled after execution.
+    completion: Option<MutPtr<sem_t>>,
+}
+
+/// Apple documents main-queue tasks as serial work on the main thread,
+/// serviced by its run loop. Take a bounded batch so callbacks that submit
+/// more work cannot indefinitely starve the rest of that run loop.
+/// <https://developer.apple.com/library/archive/documentation/General/Conceptual/ConcurrencyProgrammingGuide/OperationQueues/OperationQueues.html>
+pub(crate) fn drain_main_queue(env: &mut Environment) {
+    assert_eq!(env.current_thread, 0);
+    let state = get_state(env);
+    if state.draining_main_queue || state.main_queue.is_empty() {
+        return;
+    }
+    state.draining_main_queue = true;
+    let count = state.main_queue.len();
+    for _ in 0..count {
+        let task = get_state(env).main_queue.pop_front().unwrap();
+        with_current_queue(env, Ptr::from_bits(MAIN_QUEUE_PTR), |env| match task.work {
+            MainQueueWork::Block(block) => {
+                call_void_block(env, block);
+                if task.completion.is_none() {
+                    crate::libc::blocks::_Block_release(env, block.cast_const());
+                }
+            }
+            MainQueueWork::Function(work, context) => {
+                let _: () = work.call_from_host(env, (context,));
+            }
+        });
+        if let Some(completion) = task.completion {
+            assert!(env.sem_increment(completion));
+        }
+    }
+    get_state(env).draining_main_queue = false;
+}
+
+fn dispatch_main_sync(env: &mut Environment, work: MainQueueWork) {
+    // Apple documents dispatch_sync to the main queue from the main thread
+    // as a deadlock. Report the misuse instead of executing it inline.
+    assert_ne!(
+        env.current_thread, 0,
+        "dispatch_sync to the main queue from the main thread would deadlock"
+    );
+    let completion = host_create_semaphore(env, 0);
+    get_state(env).main_queue.push_back(MainQueueTask {
+        work,
+        completion: Some(completion),
+    });
+    assert!(env.sem_decrement(completion, true));
+    host_destroy_semaphore(env, completion);
+}
+
 fn dispatch_async(env: &mut Environment, queue: dispatch_queue_t, block: dispatch_block_t) {
-    log_dbg!("dispatch_async: calling block immediately (single-threaded)");
-    if !block.is_null() {
-        get_state(env).current_queue_stack.push(queue.to_bits());
-        call_void_block(env, block);
-        get_state(env).current_queue_stack.pop();
+    if block.is_null() {
+        return;
+    }
+    if queue.to_bits() == MAIN_QUEUE_PTR {
+        let block = crate::libc::blocks::_Block_copy(env, block.cast_const()).cast_mut();
+        get_state(env).main_queue.push_back(MainQueueTask {
+            work: MainQueueWork::Block(block),
+            completion: None,
+        });
+    } else {
+        with_current_queue(env, queue, |env| call_void_block(env, block));
     }
 }
 
 fn dispatch_sync(env: &mut Environment, queue: dispatch_queue_t, block: dispatch_block_t) {
-    log_dbg!("dispatch_sync: calling block immediately");
-    if !block.is_null() {
-        get_state(env).current_queue_stack.push(queue.to_bits());
-        call_void_block(env, block);
-        get_state(env).current_queue_stack.pop();
+    if block.is_null() {
+        return;
+    }
+    if queue.to_bits() == MAIN_QUEUE_PTR {
+        dispatch_main_sync(env, MainQueueWork::Block(block));
+    } else {
+        with_current_queue(env, queue, |env| call_void_block(env, block));
     }
 }
 
@@ -359,10 +433,18 @@ fn dispatch_async_f(
     context: MutVoidPtr,
     work: GuestFunction,
 ) {
-    if work != GuestFunction::null_ptr() {
-        get_state(env).current_queue_stack.push(queue.to_bits());
-        let _: () = work.call_from_host(env, (context,));
-        get_state(env).current_queue_stack.pop();
+    if work == GuestFunction::null_ptr() {
+        return;
+    }
+    if queue.to_bits() == MAIN_QUEUE_PTR {
+        get_state(env).main_queue.push_back(MainQueueTask {
+            work: MainQueueWork::Function(work, context),
+            completion: None,
+        });
+    } else {
+        with_current_queue(env, queue, |env| {
+            let _: () = work.call_from_host(env, (context,));
+        });
     }
 }
 
@@ -372,10 +454,15 @@ fn dispatch_sync_f(
     context: MutVoidPtr,
     work: GuestFunction,
 ) {
-    if work != GuestFunction::null_ptr() {
-        get_state(env).current_queue_stack.push(queue.to_bits());
-        let _: () = work.call_from_host(env, (context,));
-        get_state(env).current_queue_stack.pop();
+    if work == GuestFunction::null_ptr() {
+        return;
+    }
+    if queue.to_bits() == MAIN_QUEUE_PTR {
+        dispatch_main_sync(env, MainQueueWork::Function(work, context));
+    } else {
+        with_current_queue(env, queue, |env| {
+            let _: () = work.call_from_host(env, (context,));
+        });
     }
 }
 
@@ -465,7 +552,9 @@ fn dispatch_after(
         .objc
         .lookup_selector("_touchHLE_dispatchAfterFireBlock:")
         .unwrap();
-    let cls: Class = env.objc.get_known_class("_touchHLE_DispatchAfter", &mut env.mem);
+    let cls: Class = env
+        .objc
+        .get_known_class("_touchHLE_DispatchAfter", &mut env.mem);
     let _: id = msg_class![env;
         NSTimer scheduledTimerWithTimeInterval:delay
                                        target:cls
@@ -496,7 +585,9 @@ fn dispatch_after_f(
         .objc
         .lookup_selector("_touchHLE_dispatchAfterFireFunc:")
         .unwrap();
-    let cls: Class = env.objc.get_known_class("_touchHLE_DispatchAfter", &mut env.mem);
+    let cls: Class = env
+        .objc
+        .get_known_class("_touchHLE_DispatchAfter", &mut env.mem);
     let _: id = msg_class![env;
         NSTimer scheduledTimerWithTimeInterval:delay
                                        target:cls
@@ -530,9 +621,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let bits: u32 = msg![env; num unsignedIntValue];
     let block: dispatch_block_t = Ptr::from_bits(bits);
     if !block.is_null() {
-        get_state(env).current_queue_stack.push(queue_bits);
-        call_void_block(env, block);
-        get_state(env).current_queue_stack.pop();
+        with_current_queue(env, Ptr::from_bits(queue_bits), |env| call_void_block(env, block));
         crate::libc::blocks::_Block_release(env, block.cast_void().cast_const());
     }
 }
@@ -558,9 +647,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     let context: MutVoidPtr = Ptr::from_bits(ctx_bits);
     let work = GuestFunction::from_addr_with_thumb_bit(work_bits);
     if work != GuestFunction::null_ptr() {
-        get_state(env).current_queue_stack.push(queue_bits);
-        let _: () = work.call_from_host(env, (context,));
-        get_state(env).current_queue_stack.pop();
+        with_current_queue(env, Ptr::from_bits(queue_bits), |env| {
+            let _: () = work.call_from_host(env, (context,));
+        });
     }
 }
 
@@ -610,9 +699,7 @@ fn dispatch_group_async(
     block: dispatch_block_t,
 ) {
     if !block.is_null() {
-        get_state(env).current_queue_stack.push(queue.to_bits());
-        call_void_block(env, block);
-        get_state(env).current_queue_stack.pop();
+        with_current_queue(env, queue, |env| call_void_block(env, block));
     }
 }
 
@@ -624,9 +711,9 @@ fn dispatch_group_async_f(
     work: GuestFunction,
 ) {
     if work != GuestFunction::null_ptr() {
-        get_state(env).current_queue_stack.push(queue.to_bits());
-        let _: () = work.call_from_host(env, (context,));
-        get_state(env).current_queue_stack.pop();
+        with_current_queue(env, queue, |env| {
+            let _: () = work.call_from_host(env, (context,));
+        });
     }
 }
 
@@ -644,9 +731,7 @@ fn dispatch_group_notify(
     block: dispatch_block_t,
 ) {
     if !block.is_null() {
-        get_state(env).current_queue_stack.push(queue.to_bits());
-        call_void_block(env, block);
-        get_state(env).current_queue_stack.pop();
+        with_current_queue(env, queue, |env| call_void_block(env, block));
     }
 }
 
@@ -658,9 +743,9 @@ fn dispatch_group_notify_f(
     work: GuestFunction,
 ) {
     if work != GuestFunction::null_ptr() {
-        get_state(env).current_queue_stack.push(queue.to_bits());
-        let _: () = work.call_from_host(env, (context,));
-        get_state(env).current_queue_stack.pop();
+        with_current_queue(env, queue, |env| {
+            let _: () = work.call_from_host(env, (context,));
+        });
     }
 }
 
@@ -708,12 +793,18 @@ fn dispatch_semaphore_wait(env: &mut Environment, sem: dispatch_semaphore_t, tim
         if crate::env_flag_cached!("TOUCHHLE_TRACE_DISPATCHSEM") {
             log!(
                 "DSEM t={} wait-enter sem={:#x} lr={:#x}",
-                env.current_thread, sem.to_bits(), env.cpu.regs()[14]
+                env.current_thread,
+                sem.to_bits(),
+                env.cpu.regs()[14]
             );
         }
         env.sem_decrement(backing, true);
         if crate::env_flag_cached!("TOUCHHLE_TRACE_DISPATCHSEM") {
-            log!("DSEM t={} wait-exit sem={:#x}", env.current_thread, sem.to_bits());
+            log!(
+                "DSEM t={} wait-exit sem={:#x}",
+                env.current_thread,
+                sem.to_bits()
+            );
         }
         0
     } else {
@@ -729,7 +820,10 @@ fn dispatch_semaphore_wait(env: &mut Environment, sem: dispatch_semaphore_t, tim
         if crate::env_flag_cached!("TOUCHHLE_TRACE_DISPATCHSEM") {
             log!(
                 "DSEM t={} timedwait-enter sem={:#x} timeout_ns={} lr={:#x}",
-                env.current_thread, sem.to_bits(), timeout, env.cpu.regs()[14]
+                env.current_thread,
+                sem.to_bits(),
+                timeout,
+                env.cpu.regs()[14]
             );
         }
         let timeout_ns = timeout.min(3_600_000_000_000); // cap at 1 hour
@@ -758,7 +852,9 @@ fn dispatch_semaphore_signal(env: &mut Environment, sem: dispatch_semaphore_t) -
     if crate::env_flag_cached!("TOUCHHLE_TRACE_DISPATCHSEM") {
         log!(
             "DSEM t={} signal sem={:#x} lr={:#x}",
-            env.current_thread, sem.to_bits(), env.cpu.regs()[14]
+            env.current_thread,
+            sem.to_bits(),
+            env.cpu.regs()[14]
         );
     }
     env.sem_increment(backing);
@@ -863,7 +959,7 @@ fn dispatch_queue_get_specific(
 /// `void *dispatch_get_specific(const void *key)`
 ///
 /// Returns the value associated with `key` on the queue currently executing
-/// the caller. We track the running queue via `current_queue_stack`
+/// the caller. We track the running queue via per-thread stacks
 /// (pushed/popped around `dispatch_sync`/`dispatch_async` block execution);
 /// when nothing is running we resolve against the main queue on the main
 /// thread (and the default global queue elsewhere, see [current_queue]),
@@ -914,9 +1010,28 @@ fn dispatch_debug(_env: &mut Environment, _object: MutVoidPtr, _message: ConstVo
 
 // MARK: - Helpers
 
+pub(super) fn with_current_queue(
+    env: &mut Environment,
+    queue: dispatch_queue_t,
+    callback: impl FnOnce(&mut Environment),
+) {
+    let thread = env.current_thread;
+    get_state(env)
+        .current_queue_stacks
+        .entry(thread)
+        .or_default()
+        .push(queue.to_bits());
+    callback(env);
+    let state = get_state(env);
+    let stack = state.current_queue_stacks.get_mut(&thread).unwrap();
+    assert_eq!(stack.pop(), Some(queue.to_bits()));
+    if stack.is_empty() {
+        state.current_queue_stacks.remove(&thread);
+    }
+}
+
 /// Invoke a GCD block (`void (^)(void)`).
-/// On ARM32 a block is a struct whose second word is the invoke function
-//pointer.
+/// On ARM32 the fourth word of a block is the invoke function pointer.
 /// Layout: [isa, flags, reserved, invoke, descriptor, captures...]
 pub(super) fn call_void_block(env: &mut Environment, block: dispatch_block_t) {
     let invoke_ptr = env.mem.read(block.cast::<u32>() + 3u32);
