@@ -248,12 +248,6 @@ fn CFDataFind(
     }
 }
 
-// Placeholder type ID ('CFDt'), like the other fake IDs in this codebase.
-// Remove this if `cf_type.rs` already exports CFDataGetTypeID.
-fn CFDataGetTypeID(_env: &mut Environment) -> u32 {
-    0x43464474
-}
-
 // MARK: - CFMutableData
 
 fn CFDataCreateMutable(
@@ -392,7 +386,6 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFDataRelease(_)),
     export_c_func!(CFDataIsEqual(_, _)),
     export_c_func!(CFDataFind(_, _, _, _)),
-    export_c_func!(CFDataGetTypeID()),
     // Mutable
     export_c_func!(CFDataCreateMutable(_, _)),
     export_c_func!(CFDataCreateMutableCopy(_, _, _)),
