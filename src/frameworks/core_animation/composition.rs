@@ -122,21 +122,6 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         }
     }
 
-    if env.options.print_fps
-        || cfg!(target_os = "ios")
-        || crate::gles::present::onscreen_fps_enabled()
-    {
-        env.framework_state
-            .core_animation
-            .composition
-            .fps_counter
-            .get_or_insert_with(FpsCounter::start)
-            .count_frame(
-                format_args!("Core Animation compositor"),
-                env.options.print_fps,
-            );
-    }
-
     let now = Instant::now();
     let interval = 1.0 / 60.0; // 60Hz
     let new_recomposite_next = if let Some(recomposite_next) = env
@@ -183,6 +168,21 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         .core_animation
         .composition
         .recomposite_next = new_recomposite_next;
+
+    if env.options.print_fps
+        || cfg!(target_os = "ios")
+        || crate::gles::present::onscreen_fps_enabled()
+    {
+        env.framework_state
+            .core_animation
+            .composition
+            .fps_counter
+            .get_or_insert_with(FpsCounter::start)
+            .count_frame(
+                format_args!("Core Animation compositor"),
+                env.options.print_fps,
+            );
+    }
 
     let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
     let window_layers: Vec<id> = windows
