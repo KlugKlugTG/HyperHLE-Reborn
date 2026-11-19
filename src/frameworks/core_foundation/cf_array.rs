@@ -35,27 +35,77 @@ pub const K_CF_NOT_FOUND: CFIndex = -1;
 // The kCFTypeArrayCallBacks constant has a non-null pointer but we
 // ignore the actual callbacks and use NSArray's retain/release instead.
 
-// MARK: - Helper functions for safe range validation
+// MARK: - Helper functions
 
+/// Whether `location..location+length` lies inside an array of `array_count`
+/// elements. Uses checked arithmetic because the values come from the guest.
 fn validate_range(array_count: CFIndex, location: CFIndex, length: CFIndex) -> bool {
     if location < 0 || length < 0 {
         return false;
     }
-    if location > array_count {
-        return false;
+    match location.checked_add(length) {
+        Some(end) => end <= array_count,
+        None => false,
     }
-    if location + length > array_count {
-        return false;
-    }
-    true
 }
 
-fn safe_index(idx: CFIndex) -> Result<NSUInteger, ()> {
-    if idx < 0 {
-        Err(())
-    } else {
-        idx.try_into().map_err(|_| ())
+/// Stable bottom-up merge sort of `items` using a guest `CFComparatorFunction`.
+/// Takes the left element on ties, so equal elements keep their order. Makes
+/// O(n log n) guest calls instead of the O(n²) of an insertion sort.
+fn sort_ids(
+    env: &mut Environment,
+    items: Vec<id>,
+    comparator: GuestFunction,
+    context: MutVoidPtr,
+) -> Vec<id> {
+    use crate::abi::CallFromHost;
+
+    let n = items.len();
+    let mut items = items;
+    let mut buf = items.clone();
+    let mut width = 1;
+    while width < n {
+        let mut i = 0;
+        while i < n {
+            let mid = (i + width).min(n);
+            let hi = (i + 2 * width).min(n);
+            let (mut l, mut r, mut k) = (i, mid, i);
+            while l < mid && r < hi {
+                let a = items[l];
+                let b = items[r];
+                let res: i32 = comparator.call_from_host(
+                    env,
+                    (
+                        a.cast::<std::ffi::c_void>().cast_const(),
+                        b.cast::<std::ffi::c_void>().cast_const(),
+                        context,
+                    ),
+                );
+                if res <= 0 {
+                    buf[k] = a;
+                    l += 1;
+                } else {
+                    buf[k] = b;
+                    r += 1;
+                }
+                k += 1;
+            }
+            while l < mid {
+                buf[k] = items[l];
+                l += 1;
+                k += 1;
+            }
+            while r < hi {
+                buf[k] = items[r];
+                r += 1;
+                k += 1;
+            }
+            i += 2 * width;
+        }
+        std::mem::swap(&mut items, &mut buf);
+        width *= 2;
     }
+    items
 }
 
 // MARK: - Retain / Release
@@ -88,6 +138,8 @@ pub fn CFArrayCreate(
     }
 
     let arr: id = msg_class![env; NSMutableArray new];
+    // NULL entries are skipped: NSArray cannot hold nil, so indices after a
+    // NULL in the input shift down by one.
     for i in 0..num_values.max(0) as u32 {
         let val: id = env.mem.read(values + i).cast().cast_mut();
         if !val.is_null() {
@@ -276,17 +328,17 @@ pub fn CFArrayGetLastIndexOfValue(
 
     let val: id = value.cast().cast_mut();
     let end = range_location + range_length;
-    let mut last = K_CF_NOT_FOUND;
 
-    for i in range_location..end {
+    // Scan backwards so we can stop at the first hit.
+    for i in (range_location..end).rev() {
         let item: id = msg![env; array objectAtIndex:(i as NSUInteger)];
         let eq: bool = msg![env; item isEqual:val];
         if eq {
-            last = i;
+            return i;
         }
     }
 
-    last
+    K_CF_NOT_FOUND
 }
 
 pub fn CFArrayGetCountOfValue(
@@ -412,13 +464,22 @@ pub fn CFArraySetValueAtIndex(
     }
 
     let count = CFArrayGetCount(env, array);
-    if idx < 0 || idx >= count {
+    // Real CF accepts idx == count and appends.
+    if idx < 0 || idx > count {
         return;
     }
 
     let idx_u: NSUInteger = idx.try_into().unwrap();
     let val: id = value.cast().cast_mut();
-    () = msg![env; array replaceObjectAtIndex:idx_u withObject:val];
+    if idx == count {
+        () = msg![env; array addObject:val];
+    } else {
+        // Hold the new value across the replace: if it is the element being
+        // replaced, the array may hold the only reference to it.
+        crate::objc::retain(env, val);
+        () = msg![env; array replaceObjectAtIndex:idx_u withObject:val];
+        crate::objc::release(env, val);
+    }
 }
 
 pub fn CFArrayRemoveValueAtIndex(env: &mut Environment, array: CFMutableArrayRef, idx: CFIndex) {
@@ -487,18 +548,32 @@ pub fn CFArrayReplaceValues(
         return;
     }
 
+    // Read and retain the new values *before* removing anything: they may be
+    // owned only by the range that is about to be removed (e.g. values copied
+    // out of this same array with CFArrayGetValues).
+    let mut new_vals: Vec<id> = Vec::new();
+    for i in 0..new_count.max(0) as u32 {
+        let val: id = env.mem.read(new_values + i).cast().cast_mut();
+        if !val.is_null() {
+            crate::objc::retain(env, val);
+            new_vals.push(val);
+        }
+    }
+
     // Remove old range (in reverse order to maintain indices).
     for i in (range_location..range_location + range_length).rev() {
         () = msg![env; array removeObjectAtIndex:(i as NSUInteger)];
     }
 
-    // Insert new values at range_location.
-    for i in 0..new_count.max(0) as u32 {
-        let val: id = env.mem.read(new_values + i).cast().cast_mut();
-        if !val.is_null() {
-            let idx = (range_location as u32 + i) as NSUInteger;
-            () = msg![env; array insertObject:val atIndex:idx];
-        }
+    // Insert new values at range_location. The index counts only the values
+    // actually inserted, so skipped NULLs cannot push it past the end.
+    for (k, &val) in new_vals.iter().enumerate() {
+        let idx = (range_location as u32 + k as u32) as NSUInteger;
+        () = msg![env; array insertObject:val atIndex:idx];
+    }
+
+    for val in new_vals {
+        crate::objc::release(env, val);
     }
 }
 
@@ -547,7 +622,6 @@ pub fn CFArraySortValues(
     comparator: GuestFunction, // CFComparatorFunction
     context: MutVoidPtr,
 ) {
-    use crate::abi::CallFromHost;
     if array.is_null() {
         return;
     }
@@ -561,48 +635,25 @@ pub fn CFArraySortValues(
         return; // Already sorted
     }
 
-    // Extract the range into a temporary vec and sort.
+    // Extract the range, retaining each element so it survives the write-back.
     let end = range_location + range_length;
-    let mut items: Vec<id> = (range_location..end)
-        .map(|i| {
-            let val: id = msg![env; array objectAtIndex:(i as NSUInteger)];
-            crate::objc::retain(env, val);
-            val
-        })
-        .collect();
-    // Simple insertion sort — avoids the borrow-checker complexity of in-place
-    // sort with a closure that borrows env.
-    let n = items.len();
-    for i in 1..n {
-        let mut j = i;
-        while j > 0 {
-            let a = items[j - 1];
-            let b = items[j];
-            let res: i32 = comparator.call_from_host(
-                env,
-                (
-                    a.cast::<std::ffi::c_void>().cast_const(),
-                    b.cast::<std::ffi::c_void>().cast_const(),
-                    context,
-                ),
-            );
-            if res > 0 {
-                items.swap(j - 1, j);
-                j -= 1;
-            } else {
-                break;
-            }
-        }
+    let mut items: Vec<id> = Vec::with_capacity(range_length as usize);
+    for i in range_location..end {
+        let val: id = msg![env; array objectAtIndex:(i as NSUInteger)];
+        crate::objc::retain(env, val);
+        items.push(val);
     }
 
+    let sorted = sort_ids(env, items, comparator, context);
+
     // Write sorted items back.
-    for (k, val) in items.iter().enumerate() {
+    for (k, &val) in sorted.iter().enumerate() {
         let idx = (range_location as usize + k) as NSUInteger;
-        () = msg![env; array replaceObjectAtIndex:idx withObject:(*val)];
+        () = msg![env; array replaceObjectAtIndex:idx withObject:val];
     }
 
     // Release retained items
-    for item in items {
+    for item in sorted {
         crate::objc::release(env, item);
     }
 }
@@ -642,7 +693,13 @@ pub fn CFArrayCreateDescription(env: &mut Environment, array: CFArrayRef) -> CFT
         return nil;
     }
 
-    msg![env; array description]
+    // `-description` returns an autoreleased string, but this is a Create
+    // function, so the caller expects to own the result.
+    let desc: id = msg![env; array description];
+    if desc.is_null() {
+        return nil;
+    }
+    CFRetain(env, desc)
 }
 
 // MARK: - Additional utility functions
