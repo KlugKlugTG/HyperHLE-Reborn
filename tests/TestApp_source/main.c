@@ -18,7 +18,16 @@ int TestApp_cli_tests_main(void);
 int TestApp_gui_tests_main(int argc, char **argv);
 
 int main(int argc, char **argv) {
-  if (argc == 2 && !strcmp(argv[1], "--cli-tests")) {
+  if (argc == 2 && !strcmp(argv[1], "--trap-probe")) {
+    printf("Entering intentional undefined-instruction probe.\n");
+    fflush(stdout);
+    __builtin_trap();
+  } else if (argc == 2 && !strcmp(argv[1], "--breakpoint-probe")) {
+    printf("Entering intentional breakpoint probe.\n");
+    fflush(stdout);
+    __asm__ volatile("bkpt #0");
+    return 0;
+  } else if (argc == 2 && !strcmp(argv[1], "--cli-tests")) {
     printf("Starting command-line automated tests (omit --cli-tests for UIKit "
            "test app).\n");
     return TestApp_cli_tests_main();

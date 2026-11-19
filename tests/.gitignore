@@ -9,3 +9,7 @@
 
 /AudioUnitThread.app/AudioUnitThread
 /AudioUnitThread.app/*.o
+
+/BundledDylib.app/BundledDylib
+/BundledDylib.app/Frameworks
+/BundledDylib.app/*.o

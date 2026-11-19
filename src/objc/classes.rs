@@ -104,9 +104,18 @@ struct class_t {
     superclass: Class,
     _cache: ConstVoidPtr,
     _vtable: ConstVoidPtr,
-    data: ConstPtr<class_rw_t>,
+    data_bits: u32,
 }
 unsafe impl SafeRead for class_t {}
+
+impl class_t {
+    /// The low two bits describe Swift ABI variants on 32-bit iOS.
+    /// Apple's class_data_bits_t::data() masks them with FAST_DATA_MASK.
+    /// https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-runtime-new.h
+    fn data(&self) -> ConstPtr<class_rw_t> {
+        Ptr::from_bits(self.data_bits & 0xffff_fffc)
+    }
+}
 
 /// The layout of the main class data in an app binary.
 ///
@@ -343,9 +352,8 @@ impl ClassHostObject {
     }
 
     fn from_bin(class: Class, is_metaclass: bool, mem: &Mem, objc: &mut ObjC) -> Self {
-        let class_t {
-            superclass, data, ..
-        } = mem.read(class.cast());
+        let class_struct: class_t = mem.read(class.cast());
+        let superclass = class_struct.superclass;
         let class_rw_t {
             instance_start,
             instance_size,
@@ -355,7 +363,7 @@ impl ClassHostObject {
             ivars,
             _base_properties,
             ..
-        } = mem.read(data);
+        } = mem.read(class_struct.data());
         // Apple's Objective-C 2.0 runtime stores `class_rw_t.name` as a
         // pointer to a NUL-terminated UTF-8 C string in `__objc_classname`
         // (see <objc/runtime.h> and `class_getName`). Some real-world
@@ -418,8 +426,8 @@ fn substitute_classes(
     class: Class,
     metaclass: Class,
 ) -> Option<(Box<FakeClass>, Box<FakeClass>)> {
-    let class_t { data, .. } = mem.read(class.cast());
-    let class_rw_t { name, .. } = mem.read(data);
+    let class_struct: class_t = mem.read(class.cast());
+    let class_rw_t { name, .. } = mem.read(class_struct.data());
     // If the class name bytes aren't valid UTF-8 the metadata is almost
     // certainly corrupt / still-encrypted (see comment in
     // `ClassHostObject::from_bin`). Don't try to fake-substitute such a
@@ -478,11 +486,11 @@ fn substitute_classes(
     }
 
     {
-        let class_t { data, .. } = mem.read(metaclass.cast());
+        let class_struct: class_t = mem.read(metaclass.cast());
         let class_rw_t {
             name: metaclass_name,
             ..
-        } = mem.read(data);
+        } = mem.read(class_struct.data());
         // Same defensive handling as the class-name read above. In Apple's
         // runtime, `class_getName(cls) == class_getName(object_getClass(cls))`,
         // but a corrupt binary can violate that invariant; an `assert!`
@@ -882,10 +890,9 @@ impl ObjC {
             );
         }
 
-        self.reconcile_bin_class_ivars(mem);
     }
 
-    fn reconcile_bin_class_ivars(&mut self, mem: &mut Mem) {
+    pub(crate) fn reconcile_bin_class_ivars(&mut self, mem: &mut Mem) {
         // Host classes are linked lazily. A class list can be empty, contain
         // only independent roots, or have every entry skipped above. In those
         // cases non-lazy symbol binding need not have loaded NSObject at all.
@@ -1526,27 +1533,37 @@ pub fn class_getSuperclass(env: &mut crate::Environment, cls: Class) -> Class {
     env.objc.get_superclass(cls)
 }
 
-pub fn class_getInstanceSize(env: &mut crate::Environment, cls: Class, name: SEL) -> ConstVoidPtr {
+/// The instance's ivar storage rounded to a guest pointer boundary.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-class.mm
+pub fn class_getInstanceSize(env: &mut crate::Environment, cls: Class) -> GuestUSize {
     if cls.is_null() {
-        return ConstVoidPtr::null();
+        return 0;
     }
+    let size = env.objc.class_instance_size(cls);
+    size.checked_add(3).expect("Class instance size overflows") & !3
+}
 
-    let mut curr = cls;
-    while !curr.is_null() {
-        if let Some(host_obj) = env.objc.get_host_object(curr) {
-            if let Some(class_obj) = host_obj.as_any().downcast_ref::<ClassHostObject>() {
-                if class_obj.methods.contains_key(&name) {
-                    return curr.cast_const().cast();
-                }
-            }
-        }
-        let next = env.objc.get_superclass(curr);
-        if next == curr {
-            break;
-        }
-        curr = next;
+/// Allocate zeroed instance storage without sending +alloc or -init.
+/// Apple's runtime reserves at least 16 bytes and runs C++ constructors.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-runtime-new.mm
+pub fn class_createInstance(
+    env: &mut crate::Environment,
+    cls: Class,
+    extra_bytes: GuestUSize,
+) -> id {
+    if cls == nil {
+        return nil;
     }
-    ConstVoidPtr::null()
+    let Some(size) = class_getInstanceSize(env, cls).checked_add(extra_bytes) else {
+        return nil;
+    };
+    let object = env.objc.alloc_object_sized(
+        cls,
+        size.max(16),
+        Box::new(super::TrivialHostObject),
+        &mut env.mem,
+    );
+    crate::frameworks::foundation::ns_object::invoke_cxx_constructors(env, object)
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -1676,24 +1693,6 @@ fn imp_to_guest_ptr(
             };
             env.objc.imp_tokens.insert(token.to_bits(), imp);
             token.cast_const()
-        }
-    }
-}
-
-fn imp_to_callable_guest_ptr(
-    env: &mut crate::Environment,
-    imp: IMP,
-    message_send_symbol: &str,
-) -> ConstVoidPtr {
-    match imp {
-        IMP::Guest(guest_function) => guest_function.to_ptr(),
-        IMP::Host(_) => {
-            let dyld = &mut env.dyld;
-            let mem = &mut env.mem;
-            let cpu = &mut env.cpu;
-            dyld.create_proc_address(mem, cpu, message_send_symbol)
-                .map(|guest_function| ConstVoidPtr::from_bits(guest_function.addr_with_thumb_bit()))
-                .unwrap_or_else(|_| ConstVoidPtr::null())
         }
     }
 }
@@ -2037,42 +2036,26 @@ pub fn class_isMetaClass(env: &mut crate::Environment, cls: Class) -> bool {
         return false;
     }
     let class_struct: class_t = env.mem.read(cls.cast());
-    if class_struct.data.is_null() {
+    if class_struct.data().is_null() {
         return false;
     }
     let rw_size = std::mem::size_of::<class_rw_t>() as GuestUSize;
     if env
         .mem
-        .get_bytes_fallible(class_struct.data.cast(), rw_size)
+        .get_bytes_fallible(class_struct.data().cast(), rw_size)
         .is_none()
     {
         return false;
     }
-    let rw: class_rw_t = env.mem.read(class_struct.data.cast());
+    let rw: class_rw_t = env.mem.read(class_struct.data());
     (rw._flags & 0x2) != 0
 }
 
-pub fn objc_getMetaClass(env: &mut crate::Environment, cls: Class, name: SEL) -> ConstVoidPtr {
-    if cls.is_null() {
-        return ConstVoidPtr::null();
-    }
-
-    let mut curr = cls;
-    while !curr.is_null() {
-        if let Some(host_obj) = env.objc.get_host_object(curr) {
-            if let Some(class_obj) = host_obj.as_any().downcast_ref::<ClassHostObject>() {
-                if class_obj.methods.contains_key(&name) {
-                    return curr.cast_const().cast();
-                }
-            }
-        }
-        let next = env.objc.get_superclass(curr);
-        if next == curr {
-            break;
-        }
-        curr = next;
-    }
-    ConstVoidPtr::null()
+/// Look up the metaclass by the class's name.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-runtime.mm
+pub fn objc_getMetaClass(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
+    let class = objc_getClass(env, name);
+    ObjC::read_isa(class, &env.mem)
 }
 
 /// `IMP class_replaceMethod(Class cls, SEL name, IMP imp, const char *types)`
@@ -2425,35 +2408,41 @@ pub fn class_getMethodImplementation(
     }
     // Unlike `method_getImplementation` (which takes an opaque `Method`),
     // this call resolves the selector through the inheritance chain.
+    // Apple's lookup uses LOOKUP_INITIALIZE, including when querying a
+    // metaclass. Initialization can replace the method before lookup.
+    // https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-class.mm
+    let class_to_initialize = env.objc.get_host_object(cls).and_then(|object| {
+        let class = object.as_any().downcast_ref::<ClassHostObject>()?;
+        if class.is_metaclass {
+            env.objc.get_class(&class.name, false, &env.mem)
+        } else {
+            Some(cls)
+        }
+    });
+    if let Some(class) = class_to_initialize {
+        super::messages::ensure_class_initialized(env, class);
+    }
     let defining = find_defining_class(env, cls, name);
     if defining.is_null() {
         return ConstVoidPtr::null();
     }
     match imp_at(env, defining, name) {
-        Some(imp) => imp_to_callable_guest_ptr(env, imp, "_objc_msgSend"),
+        Some(imp) => imp_to_guest_ptr(env, defining, name, imp),
         None => ConstVoidPtr::null(),
     }
 }
 
 /// `IMP class_getMethodImplementation_stret(Class cls, SEL name)` — same
-/// as above but for selectors whose return type uses `objc_msgSend_stret`
-/// (large struct returns). The IMP slot is the same in touchHLE.
+/// as above, using struct-return forwarding if the method is missing.
+/// For an implemented method, both variants return its actual IMP, whose
+/// calling convention already includes any hidden result pointer.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-class.mm
 pub fn class_getMethodImplementation_stret(
     env: &mut crate::Environment,
     cls: Class,
     name: crate::objc::SEL,
 ) -> ConstVoidPtr {
-    if cls.is_null() || name.is_null() {
-        return ConstVoidPtr::null();
-    }
-    let defining = find_defining_class(env, cls, name);
-    if defining.is_null() {
-        return ConstVoidPtr::null();
-    }
-    match imp_at(env, defining, name) {
-        Some(imp) => imp_to_callable_guest_ptr(env, imp, "_objc_msgSend_stret"),
-        None => ConstVoidPtr::null(),
-    }
+    class_getMethodImplementation(env, cls, name)
 }
 
 pub fn objc_retainAutorelease(env: &mut crate::Environment, obj: id) -> id {
@@ -3342,6 +3331,46 @@ mod class_registration_tests {
         let mut objc = ObjC::new();
         objc.register_host_selectors(&mut mem);
         (objc, mem)
+    }
+
+    // Swift legacy/stable classes carry flags in class_data_bits_t. The
+    // loader must still find their real name, instance size, and methods.
+    // https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-runtime-new.h
+    #[test]
+    fn binary_class_registration_reads_swift_tagged_metadata() {
+        for flags in [0, 1, 2] {
+            let (mut objc, mut mem) = runtime();
+            let name = mem.alloc_and_write_cstr(b"TaggedMetadataClass");
+            let selector_name = mem.alloc_and_write_cstr(b"fixtureMethod");
+            let types = mem.alloc_and_write_cstr(b"v8@0:4");
+            let method_list: crate::mem::MutPtr<u32> = mem.alloc(20).cast();
+            mem.write(method_list, 12);
+            mem.write(method_list + 1, 1);
+            mem.write(method_list + 2, selector_name.to_bits());
+            mem.write(method_list + 3, types.to_bits());
+            mem.write(method_list + 4, 0x2001);
+            let metadata: crate::mem::MutPtr<u32> = mem.calloc(40).cast();
+            mem.write(metadata + 1, 4);
+            mem.write(metadata + 2, 16);
+            mem.write(metadata + 4, name.to_bits());
+            mem.write(metadata + 5, method_list.to_bits());
+            let class: crate::mem::MutPtr<u32> = mem.calloc(20).cast();
+            mem.write(class + 4, metadata.to_bits() | flags);
+
+            let host = ClassHostObject::from_bin(class.cast(), false, &mem, &mut objc);
+
+            assert_eq!(host.name, "TaggedMetadataClass", "data flags {flags}");
+            assert_eq!(host.instance_start, 4);
+            assert_eq!(host.instance_size, 16);
+            let selector = objc.lookup_selector("fixtureMethod").unwrap();
+            assert_eq!(host.methods.len(), 1);
+            assert_eq!(host.guest_method_signatures[&selector], types.cast_const());
+            assert!(matches!(
+                host.methods[&selector],
+                IMP::Guest(function)
+                    if function.addr_with_thumb_bit() == 0x2001
+            ));
+        }
     }
 
     #[test]

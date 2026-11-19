@@ -386,24 +386,24 @@ fn generate_binary_load_order(graph: &[BinaryDependencyNode]) -> Result<Vec<usiz
     let node_to_index: HashMap<_, _> = graph
         .iter()
         .enumerate()
-        .map(|(idx, node)| (node.name.as_str(), idx))
+        .map(|(idx, node)| (canonicalize_dylib_path(&node.name), idx))
         .collect();
     let mut node_dependents = HashMap::new();
     let mut node_in_degrees: HashMap<_, _> = node_to_index.values().map(|&idx| (idx, 0)).collect();
 
     for node in graph {
         let &bin_index = node_to_index
-            .get(node.name.as_str())
+            .get(&canonicalize_dylib_path(&node.name))
             .ok_or_else(|| format!("Failed to find {:?} name mapping", &node.name))?;
 
-        // Bin names dont include prefix while dynamic lib paths do
-        for dependency in node
-            .dependencies
-            .iter()
-            .map(|path| path.strip_prefix("/usr/lib/").unwrap_or(path.as_str()))
-        {
+        for dependency in &node.dependencies {
+            let dependency = canonicalize_dylib_path(dependency);
             // Ignore dependencies that are not included in packaged dylibs
-            let Some(&dylib_index) = node_to_index.get(dependency) else {
+            let Some(&dylib_index) = node_to_index.get(&dependency).or_else(|| {
+                dependency
+                    .strip_prefix("/usr/lib/")
+                    .and_then(|name| node_to_index.get(name))
+            }) else {
                 continue;
             };
 
@@ -672,7 +672,7 @@ impl Environment {
         let executable_path = bundle.executable_path();
         let executable_name = executable_path.file_name().unwrap().to_string();
         let executable_bytes = fs
-            .read(executable_path)
+            .read(&executable_path)
             .map_err(|_| "Could not load executable: Could not read executable file".to_string())?;
 
         let window = if options.headless {
@@ -806,44 +806,96 @@ impl Environment {
             // start much more likely but not certain yet.)
             log!("Applying game-specific hack for Gravity Guy: zeroing memory on alloc instead of free.");
         }
-        let executable = mach_o::MachO::load_from_bytes(
+        let mut executable = mach_o::MachO::load_from_bytes(
             &executable_bytes,
             &mut mem,
             executable_name,
             /* slide: */ 0,
         )
         .map_err(|e| format!("Could not load executable: {e}"))?;
+        executable.loaded_path = executable_path.as_str().to_owned();
         drop(executable_bytes);
 
-        let dylibs = load_transitive_dependencies(&executable.dynamic_libraries, |dylib| {
+        use crate::dyld::dylib_paths::{expand_run_paths, resolve_install_name};
+        let main_run_paths = expand_run_paths(
+            &executable.run_paths,
+            &executable_path,
+            &executable_path,
+            &[],
+        );
+        let find_guest_file = |path: &fs::GuestPath| {
+            let path = fs.resolve_case_insensitive_path(path)?;
+            fs.is_file(&path).then_some(path)
+        };
+        let mut inherited_run_paths = HashMap::new();
+        let roots: Vec<String> = executable
+            .dynamic_libraries
+            .iter()
+            .map(|install_name| {
+                let path = resolve_install_name(
+                    install_name,
+                    &executable_path,
+                    &executable_path,
+                    &main_run_paths,
+                    find_guest_file,
+                );
+                inherited_run_paths
+                    .entry(canonicalize_dylib_path(&path))
+                    .or_insert_with(|| main_run_paths.clone());
+                path
+            })
+            .collect();
+        executable.dynamic_libraries = roots.clone();
+        let dylibs = load_transitive_dependencies(&roots, |dylib| {
             let dylib_path = fs::GuestPath::new(dylib);
             if fs.is_file(dylib_path) {
-                assert!(dylib_path.as_str().starts_with("/usr/lib/"));
                 let name = dylib_path.file_name().unwrap();
-                let dylib_slide = match name {
-                    "libstdc++.6.dylib" | "libstdc++.6.0.9.dylib" => 0x3748a000,
-                    "libc++.1.dylib" => 0x38000000,
-                    "libc++abi.dylib" => 0x38100000,
-                    "libiconv.2.dylib" => 0x32000000,
-                    "libgcc_s.1.dylib" => 0x30000000,
-                    "libz.1.dylib" | "libz.1.2.3.dylib" | "libz.dylib" | "libz.1.1.3.dylib" => 0,
-                    "libsqlite3.dylib" | "libsqlite3.0.dylib" => 0,
-                    _ => {
-                        log!(
-                            "Warning: unknown binary slide for {:?}; loading at slide 0. App may fail to bind some symbols.",
-                            name
-                        );
-                        0
+                let resource_slide = if dylib.starts_with("/usr/lib/") {
+                    match name {
+                        "libstdc++.6.dylib" | "libstdc++.6.0.9.dylib" => Some(0x3748a000),
+                        "libc++.1.dylib" => Some(0x38000000),
+                        "libc++abi.dylib" => Some(0x38100000),
+                        "libiconv.2.dylib" => Some(0x32000000),
+                        "libgcc_s.1.dylib" => Some(0x30000000),
+                        "libz.1.dylib" | "libz.1.2.3.dylib" | "libz.dylib" | "libz.1.1.3.dylib" => {
+                            Some(0)
+                        }
+                        "libsqlite3.dylib" | "libsqlite3.0.dylib" => Some(0),
+                        _ => None,
                     }
+                } else {
+                    None
                 };
-                let binary = mach_o::MachO::load_from_file(
-                    fs::GuestPath::new(dylib),
-                    &fs,
-                    &mut mem,
-                    dylib_slide,
-                )
+                let mut binary = match resource_slide {
+                    Some(slide) => mach_o::MachO::load_from_file(dylib_path, &fs, &mut mem, slide),
+                    None => {
+                        mach_o::MachO::load_from_file_automatically_slid(dylib_path, &fs, &mut mem)
+                    }
+                }
                 .map_err(|e| format!("Could not load bundled dylib: {e}"))?;
-                let dependencies = binary.dynamic_libraries.clone();
+                let inherited = inherited_run_paths
+                    .remove(&canonicalize_dylib_path(dylib))
+                    .unwrap_or_default();
+                let run_paths =
+                    expand_run_paths(&binary.run_paths, dylib_path, &executable_path, &inherited);
+                let dependencies: Vec<String> = binary
+                    .dynamic_libraries
+                    .iter()
+                    .map(|install_name| {
+                        let path = resolve_install_name(
+                            install_name,
+                            dylib_path,
+                            &executable_path,
+                            &run_paths,
+                            find_guest_file,
+                        );
+                        inherited_run_paths
+                            .entry(canonicalize_dylib_path(&path))
+                            .or_insert_with(|| run_paths.clone());
+                        path
+                    })
+                    .collect();
+                binary.dynamic_libraries = dependencies.clone();
                 Ok(Some((binary, dependencies)))
             } else {
                 let implemented_in_host = crate::dyld::DYLIB_LIST
@@ -1039,6 +1091,9 @@ impl Environment {
 
                         let exited_via_pthread = env.threads[0].return_value.is_some();
                         if exited_via_pthread {
+                            if !env.is_guest_termination_requested() {
+                                libc::pthread::key::cleanup_thread_tsd(env);
+                            }
                             env.exit_if_last_thread();
                         } else if entry_point_is_lc_main && !env.is_guest_termination_requested() {
                             // LC_MAIN enters main directly: dyld normally
@@ -1698,6 +1753,9 @@ impl Environment {
                         );
                         let return_value: mem::MutVoidPtr =
                             start_routine.call_from_host(env, (user_data,));
+                        if !env.is_guest_termination_requested() {
+                            libc::pthread::key::cleanup_thread_tsd(env);
+                        }
                         let curr_thread = &mut env.threads[env.current_thread];
                         curr_thread.return_value = Some(return_value);
                         env.exit_if_last_thread();
@@ -2165,6 +2223,8 @@ impl Environment {
                 };
                 self = env;
                 self.threads[self.current_thread].active = false;
+                let finished_thread = self.current_thread;
+                libc::pthread::key::release_thread_tsd(&mut self, finished_thread);
                 let stack = self.threads[self.current_thread].stack.take().unwrap();
                 let stack: mem::MutVoidPtr = mem::Ptr::from_bits(*stack.start());
                 log_dbg!("Freeing thread {} stack {:?}", self.current_thread, stack);
@@ -2950,8 +3010,8 @@ impl Environment {
     }
 
     #[cold]
-    /// Let the debugger handle a CPU error. Without one, use bounded
-    /// best-effort recovery for guest traps; unhandled cases panic.
+    /// Let the debugger handle a CPU error. GUI sessions can recover guest
+    /// traps without one; headless sessions panic after instruction emulation.
     fn debug_cpu_error(&mut self, error: cpu::CpuError) {
         let is_thumb = (self.cpu.cpsr() & cpu::Cpu::CPSR_THUMB) != 0;
         // The instruction length this code historically *assumed*: 2 bytes in
@@ -3058,6 +3118,7 @@ impl Environment {
                 // and advance PC like the desktop path effectively does.
                 if is_undefined_instruction
                     && cfg!(target_os = "android")
+                    && !self.options.headless
                     && (self.cpu.cpsr() & cpu::Cpu::CPSR_THUMB) != 0
                 {
                     match pc {
@@ -3153,6 +3214,9 @@ impl Environment {
                         if start & 1 != 0 {
                             continue;
                         }
+                        if self.options.headless && start != fault_pc {
+                            continue;
+                        }
 
                         let hw1: u16 = self.mem.read(mem::ConstPtr::<u16>::from_bits(start));
                         let hw2: u16 = self
@@ -3164,7 +3228,8 @@ impl Environment {
                         // after the constant-load clusters. Do not fake-return
                         // from the whole function; advance past the trapped
                         // 32-bit instruction and let scene setup continue.
-                        if std::env::var_os("TOUCHHLE_POTATO_ANDROID_THUMB2_COMPAT").is_some()
+                        if !self.options.headless
+                            && std::env::var_os("TOUCHHLE_POTATO_ANDROID_THUMB2_COMPAT").is_some()
                             && matches!(hw1 & 0xfe00, 0xec00 | 0xee00)
                         {
                             log_no_panic!(
@@ -3230,6 +3295,12 @@ impl Environment {
                             return;
                         }
                     }
+                }
+
+                // Actual instruction emulation is allowed above, but automated
+                // runs must surface traps instead of inventing a guest return.
+                if self.options.headless {
+                    panic!("Error during CPU execution: {error:?}");
                 }
 
                 // ---- Generic guest-trap recovery ----
@@ -3654,7 +3725,9 @@ impl Environment {
             // guest instruction stores through NULL, so report it and carry
             // on: the store already reached the null page, and later nil
             // writes are absorbed without probing again.
-            if matches!(error, cpu::CpuError::MemoryError) && crate::mem::null_write_probe_pending()
+            if !self.options.headless
+                && matches!(error, cpu::CpuError::MemoryError)
+                && crate::mem::null_write_probe_pending()
             {
                 crate::mem::null_write_probe_clear();
                 log_no_panic!(
@@ -4371,7 +4444,7 @@ impl Environment {
             .bins
             .iter()
             .map(|bin| BinaryDependencyNode {
-                name: bin.name.clone(),
+                name: bin.loaded_path.clone(),
                 dependencies: bin.dynamic_libraries.clone(),
             })
             .collect();
@@ -4886,6 +4959,19 @@ mod dylib_sorting_tests {
             result.is_err(),
             "Sort should detect self-dependency as a cycle and return an error"
         );
+    }
+
+    #[test]
+    fn bundled_initializers_use_resolved_image_paths() {
+        let first = "/Apps/Game.app/Frameworks/First.framework/Common";
+        let second = "/Apps/Game.app/Frameworks/Second.framework/Common";
+        let graph = create_dylib_graph(&[
+            ("/Apps/Game.app/main", &[first]),
+            (first, &[second]),
+            (second, &[]),
+        ]);
+        let sorted = generate_binary_load_order(&graph).unwrap();
+        assert_eq!(sorted, [2, 1, 0]);
     }
 
     #[test]

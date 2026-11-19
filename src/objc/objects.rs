@@ -161,7 +161,13 @@ impl super::ObjC {
         refcount: Option<NonZeroU32>,
     ) -> id {
         let guest_object = objc_object { isa };
-        let ptr: MutPtr<objc_object> = mem.alloc(instance_size).cast();
+        // Objective-C instance allocation uses calloc and returns nil on
+        // failure, before writing isa or registering a host-side object.
+        // https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-runtime-new.mm
+        let ptr: MutPtr<objc_object> = mem.calloc(instance_size).cast();
+        if ptr == nil {
+            return nil;
+        }
         mem.write(ptr, guest_object);
         self.objects.insert(
             ptr,
@@ -473,5 +479,30 @@ impl super::ObjC {
             std::mem::drop(entry.host_object);
             mem.free(object.cast());
         }
+    }
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    // A failed calloc must not turn NULL into a registered Objective-C object.
+    // https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-runtime-new.mm
+    #[test]
+    fn allocation_failure_returns_nil_without_registering_an_object() {
+        let mut objc = super::super::ObjC::new();
+        let mut mem = Mem::new();
+        let allocations_before = mem.live_allocations();
+        mem.set_memory_limit(Some(0));
+        let object = objc.alloc_object_sized(
+            Ptr::from_bits(0x2000),
+            16,
+            Box::new(TrivialHostObject),
+            &mut mem,
+        );
+
+        assert_eq!(object, nil);
+        assert!(!objc.objects.contains_key(&nil));
+        assert_eq!(mem.live_allocations(), allocations_before);
     }
 }

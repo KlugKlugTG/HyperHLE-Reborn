@@ -135,7 +135,7 @@ use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 /// marked as initialized *before* `+initialize` is dispatched, so that any
 /// messages sent to it from within `+initialize` itself do not cause infinite
 /// recursion.
-fn ensure_class_initialized(env: &mut Environment, class_to_init: Class) {
+pub(super) fn ensure_class_initialized(env: &mut Environment, class_to_init: Class) {
     if class_to_init == nil {
         return;
     }
@@ -2484,14 +2484,18 @@ pub(super) fn objc_msgSendSuper2(
 }
 
 #[allow(non_snake_case)]
+/// Struct-return super dispatch preserves the destination in r0 and
+/// replaces the objc_super argument in r1 with its receiver.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/Messengers.subproj/objc-msg-arm.s
 pub(super) fn objc_msgSendSuper2_stret(
     env: &mut Environment,
+    _stret: MutVoidPtr,
     super_ptr: ConstPtr<objc_super>,
     selector: SEL,
 ) {
     let objc_super { receiver, class } = env.mem.read(super_ptr);
-    // Rewrite first argument to match the normal ABI.
-    crate::abi::write_next_arg(&mut 0, env.cpu.regs_mut(), &mut env.mem, receiver);
+    // The hidden result pointer stays in r0.
+    crate::abi::write_next_arg(&mut 1, env.cpu.regs_mut(), &mut env.mem, receiver);
     objc_msgSend_inner(
         env,
         receiver,
@@ -2742,14 +2746,7 @@ where
     // Provide type info for dynamic type checking.
     env.objc.message_type_info = Some(<(R, P) as MsgSendSuperSignature>::WithoutSuper::type_info());
     if R::SIZE_IN_MEM.is_some() {
-        // Struct returns (stret) for super-calls aren't implemented yet.
-        // Log this clearly and fall through to the non-stret path so the
-        // host process keeps running and the caller will simply observe
-        // the default-constructed return value via to_regs/to_mem below.
-        log!(
-            "Warning: msg_send_super2: struct-return (stret) super-call is not implemented; falling back to non-stret dispatch. Result may be unreliable.",
-        );
-        (objc_msgSendSuper2 as fn(&mut Environment, ConstPtr<objc_super>, SEL))
+        (objc_msgSendSuper2_stret as fn(&mut Environment, MutVoidPtr, ConstPtr<objc_super>, SEL))
             .call_from_host(env, args)
     } else {
         (objc_msgSendSuper2 as fn(&mut Environment, ConstPtr<objc_super>, SEL))

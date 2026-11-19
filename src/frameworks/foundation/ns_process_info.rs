@@ -15,6 +15,11 @@
 //! On 32-bit iOS `NSInteger` is `int32_t` (4 bytes), so the struct is 12
 //! bytes total and is returned by value via the AAPCS struct-return ABI
 //! (i.e. via the stret variant of `objc_msgSend`).
+//!
+//! `+processInfo` caches the shared agent. NSProcessInfo also inherits ordinary
+//! NSObject allocation and initialization; its process and system queries do
+//! not require the receiver to be the shared instance.
+//! <https://github.com/theos/sdks/blob/master/iPhoneOS9.3.sdk/System/Library/Frameworks/Foundation.framework/Headers/NSProcessInfo.h>
 
 use super::NSTimeInterval;
 use crate::abi::{impl_GuestRet_for_large_struct, GuestArg};
@@ -81,17 +86,6 @@ struct ActivityInfo {
     reason: String,
 }
 
-fn assert_process_info_singleton(env: &mut Environment, this: id) {
-    assert_eq!(
-        this,
-        env.framework_state
-            .foundation
-            .ns_process_info
-            .process_info
-            .unwrap()
-    );
-}
-
 /// Fake OS version used when the app queries the host system version.
 ///
 /// touchHLE targets early iPhone OS apps; we report iOS 12.0.0 so that any
@@ -130,24 +124,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 // =========================================================================
 
 - (id)processName {
-    assert_process_info_singleton(env, this);
     let main_bundle: id = msg_class![env; NSBundle mainBundle];
     let name_key: id = ns_string::get_static_str(env, "CFBundleName");
     msg![env; main_bundle objectForInfoDictionaryKey:name_key]
 }
 
 - (())setProcessName:(id)_name {
-    assert_process_info_singleton(env, this);
     log!("TODO: [NSProcessInfo setProcessName:] — ignored");
 }
 
 - (i32)processIdentifier {
-    assert_process_info_singleton(env, this);
     1234
 }
 
 - (id)globallyUniqueString {
-    assert_process_info_singleton(env, this);
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let uptime_ns = env.guest_clock.now()
@@ -163,17 +153,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 // =========================================================================
 
 - (id)hostName {
-    assert_process_info_singleton(env, this);
     ns_string::get_static_str(env, "touchHLE-host.local")
 }
 
 - (id)arguments {
-    assert_process_info_singleton(env, this);
     msg_class![env; NSArray array]
 }
 
 - (id)environment {
-    assert_process_info_singleton(env, this);
     // Snapshot the emulated process environment, not the host's variables.
     let vars: Vec<(String, String)> = env
         .env_vars
@@ -203,17 +190,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 // =========================================================================
 
 - (u64)physicalMemory {
-    assert_process_info_singleton(env, this);
     physical_memory(env)
 }
 
 - (u32)processorCount {
-    assert_process_info_singleton(env, this);
     GUEST_PROCESSOR_COUNT as u32
 }
 
 - (u32)activeProcessorCount {
-    assert_process_info_singleton(env, this);
     GUEST_PROCESSOR_COUNT as u32
 }
 
@@ -222,7 +206,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 // =========================================================================
 
 - (NSTimeInterval)systemUptime {
-    assert_process_info_singleton(env, this);
     env.guest_clock.now().duration_since(env.startup_time).as_secs_f64()
 }
 
@@ -242,13 +225,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 // old stub did) caused the receiver to be mis-mapped to that destination
 // pointer, which produced the assertion failure observed in Bloons TD 5.
 - (NSOperatingSystemVersion)operatingSystemVersion {
-    assert_process_info_singleton(env, this);
     let (major, minor, patch) = os_version(env);
     NSOperatingSystemVersion { major, minor, patch }
 }
 
 - (id)operatingSystemVersionString {
-    assert_process_info_singleton(env, this);
     // Per Apple's documentation this returns a human-readable version string.
     // Apps (e.g. Puzzle Agent) use it together with operatingSystemName for
     // platform diagnostics.
@@ -270,7 +251,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 // three separate `u64` parameters with the wrong selector
 // (`...:minor:patch:`), so it was unreachable from real apps.
 - (bool)isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion)version {
-    assert_process_info_singleton(env, this);
     let (current_major, current_minor, current_patch) = os_version(env);
     let NSOperatingSystemVersion { major, minor, patch } = version;
     if major != current_major {
@@ -288,7 +268,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // NSProcessInfoThermalStateNominal = 0
 - (i64)thermalState {
-    assert_process_info_singleton(env, this);
     0
 }
 
@@ -297,7 +276,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 // =========================================================================
 
 - (bool)isLowPowerModeEnabled {
-    assert_process_info_singleton(env, this);
     false
 }
 
@@ -306,7 +284,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 // =========================================================================
 
 - (id)beginActivityWithOptions:(u64)options reason:(id)reason {
-    assert_process_info_singleton(env, this);
 
     // Per the NSProcessInfo documentation the return value is an opaque
     // activity token that must be passed back to -endActivity:. Returning
@@ -339,7 +316,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())endActivity:(id)activity {
-    assert_process_info_singleton(env, this);
     if activity == nil {
         // Passing nil is a caller bug; Apple's documentation does not
         // define the behaviour, so just ignore it.
@@ -369,7 +345,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())performActivityWithOptions:(u64)options
                           reason:(id)reason
                       usingBlock:(id)block {
-    assert_process_info_singleton(env, this);
     // Apple's contract: apply the activity for the duration of the block.
     // (The `wait` behaviour only matters across threads, which HLE does not
     // model — the block is always run synchronously here.)
@@ -383,32 +358,26 @@ pub const CLASSES: ClassExports = objc_classes! {
 // =========================================================================
 
 - (())disableSuddenTermination {
-    assert_process_info_singleton(env, this);
 }
 
 - (())enableSuddenTermination {
-    assert_process_info_singleton(env, this);
 }
 
 - (())disableAutomaticTermination:(id)_reason {
-    assert_process_info_singleton(env, this);
 }
 
 - (())enableAutomaticTermination:(id)_reason {
-    assert_process_info_singleton(env, this);
 }
 
 - (bool)automaticTerminationSupportEnabled {
-    assert_process_info_singleton(env, this);
     false
 }
 
 - (())setAutomaticTerminationSupportEnabled:(bool)_enabled {
-    assert_process_info_singleton(env, this);
 }
 
 - (id)operatingSystemName {
-    assert_process_info_singleton(env, this); // TODO
+     // TODO
     // This is the value documented by Foundation for the Darwin/Mach family.
     ns_string::get_static_str(env, "NSMACHOperatingSystem")
 }

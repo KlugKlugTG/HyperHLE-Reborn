@@ -452,8 +452,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::<UIViewHostObject>::default();
     let view = env.objc.alloc_object(this, host_object, &mut env.mem);
-    crate::frameworks::foundation::ns_object::invoke_cxx_constructors(env, view);
-    view
+    crate::frameworks::foundation::ns_object::invoke_cxx_constructors(env, view)
 }
 
 + (Class)layerClass {

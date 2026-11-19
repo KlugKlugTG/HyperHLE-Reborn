@@ -448,10 +448,62 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         &extra_compile_args,
         &["--game-center-authenticated"],
     )?;
+    // ARM UDF and BKPT deliberately stop execution. Headless compatibility
+    // recovery must never let these programs return success to the test runner.
+    for (argument, error) in [
+        ("--trap-probe", "UndefinedInstruction"),
+        ("--breakpoint-probe", "Breakpoint"),
+    ] {
+        let output =
+            Command::new(target_dir().join(format!("touchHLE{}", env::consts::EXE_SUFFIX)))
+                .arg(tests_dir.join("TestApp.app"))
+                .args(["--headless", "--args", argument])
+                .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{argument} was recovered: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("Error during CPU execution: {error}")),
+            "{argument} failed for an unrelated reason: {stderr}"
+        );
+    }
     run_test_app(
         &tests_dir,
         "AudioUnitThread",
         &extra_compile_args,
         &["--audio-unit-render-thread"],
-    )
+    )?;
+
+    let frameworks_dir = tests_dir.join("BundledDylib.app/Frameworks");
+    let library_path = frameworks_dir.join("BundledLibrary.framework/BundledLibrary");
+    std::fs::create_dir_all(library_path.parent().unwrap())?;
+    // -ObjC overrides the .mm extension and forces Objective-C, so replace it
+    // with -ObjC++ for the compiler-generated C++ lifecycle regression.
+    let mut library_compile_args: Vec<_> = extra_compile_args
+        .iter()
+        .copied()
+        .filter(|arg| *arg != "-ObjC")
+        .collect();
+    library_compile_args.extend([
+        "-dynamiclib",
+        "-ObjC++",
+        "-Wl,-install_name,@rpath/BundledLibrary.framework/BundledLibrary",
+    ]);
+    build_object(
+        &tests_dir,
+        &library_path,
+        [tests_dir.join("BundledLibrary_source/BundledLibrary.mm")].iter(),
+        &library_compile_args,
+    )?;
+    let framework_search_arg = format!("-F{}", frameworks_dir.display());
+    let mut bundled_compile_args = extra_compile_args.clone();
+    bundled_compile_args.extend([
+        framework_search_arg.as_str(),
+        "-framework",
+        "BundledLibrary",
+        "-Wl,-rpath,@executable_path/Frameworks",
+    ]);
+    run_test_app(&tests_dir, "BundledDylib", &bundled_compile_args, &[])
 }

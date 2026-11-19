@@ -6464,6 +6464,8 @@ int test_NSString_longLongValue(void);
 int test_munmap_partial_mapping(void);
 int test_NSUserDefaults_persistentDomain(void);
 int test_NSData_base64EncodedStringWithOptions(void);
+int test_pthread_static_tls(void);
+int test_pthread_dynamic_tls(void);
 // clang-format on
 
 int test_munmap_partial_mapping(void) {
@@ -6518,6 +6520,11 @@ int test_NSUserDefaults_persistentDomain(void) {
   return result;
 }
 
+int test_objc_struct_return_imp(void);
+int test_objc_struct_return_super(void);
+int test_NSProcessInfo_allocated_instance(void);
+int test_objc_struct_return_imp_initialization(void);
+
 // clang-format off
 // Tests marked XFUNC_DEF assert behaviour that PR #259 ("fix testapp
 // failures") added and that its revert (24a2107) removed again, because the
@@ -6533,6 +6540,10 @@ struct {
   const char *name;
   int known_fail;
 } test_func_array[] = {
+    FUNC_DEF(test_NSProcessInfo_allocated_instance),
+    FUNC_DEF(test_objc_struct_return_imp),
+    FUNC_DEF(test_objc_struct_return_imp_initialization),
+    FUNC_DEF(test_objc_struct_return_super),
 #ifndef DEFINE_ME_WHEN_BUILDING_ON_MACOS
     // below tests are failing on macOS,
     // so we skip them
@@ -6540,6 +6551,8 @@ struct {
     FUNC_DEF(test_synchronized),
     FUNC_DEF(test_read_directory_as_fd),
     FUNC_DEF(test_pthread_get_stacksize_np),
+    FUNC_DEF(test_pthread_static_tls),
+    FUNC_DEF(test_pthread_dynamic_tls),
     FUNC_DEF(test_cpp_virtual_inheritance),
 #endif
     FUNC_DEF(test_qsort),
