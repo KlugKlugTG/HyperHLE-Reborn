@@ -6,20 +6,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// adapted from `assert_cmd` crate
-fn target_dir() -> PathBuf {
-    env::current_exe()
-        .ok()
-        .map(|mut path| {
-            path.pop();
-            if path.ends_with("deps") {
-                path.pop();
-            }
-            path
-        })
-        .unwrap()
-}
-
 // https://stackoverflow.com/a/35907071/2241008
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
@@ -185,8 +171,7 @@ fn run_test_app(
         sources.iter().chain(cpp_objects.iter()),
         extra_compile_args,
     )?;
-    let binary_name = "touchHLE";
-    let binary_path = target_dir().join(format!("{}{}", binary_name, env::consts::EXE_SUFFIX));
+    let binary_path = env!("CARGO_BIN_EXE_touchHLE");
     let mut cmd = Command::new(binary_path);
     let output = cmd
         .arg(test_app_path)
@@ -322,8 +307,7 @@ fn test_app() -> Result<(), Box<dyn Error>> {
     let symbols_path = stubs_dir.join("SYMBOLS.txt");
     let dump_file_option = format!("--dump-file={}", symbols_path.to_str().unwrap());
     let dump_run_args = ["--dump=symbols", dump_file_option.as_str(), "--headless"];
-    let binary_name = "touchHLE";
-    let binary_path = target_dir().join(format!("{}{}", binary_name, env::consts::EXE_SUFFIX));
+    let binary_path = env!("CARGO_BIN_EXE_touchHLE");
     let mut cmd = Command::new(binary_path);
     let output = cmd
         .args(dump_run_args)
