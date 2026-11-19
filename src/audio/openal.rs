@@ -140,6 +140,9 @@ pub struct OpenALContext {
     // We don't need to guarantee the lifetime or thread-safety of the device -
     // OpenAL (should) do that for us.
     device: *mut ALCdevice,
+    /// Contexts made from a guest device borrow it; internally opened devices
+    /// must be closed after their context has been destroyed.
+    owns_device: bool,
 }
 
 impl OpenALContext {
@@ -168,7 +171,10 @@ impl OpenALContext {
             }
         }
         match unsafe { Self::new_with_device_and_attrlist(_manager, device, std::ptr::null()) } {
-            Ok(ctx) => Ok(ctx),
+            Ok(mut ctx) => {
+                ctx.owns_device = true;
+                Ok(ctx)
+            }
             Err(e) => {
                 log!(
                     "Could not create OpenAL context on selected device: {}; trying OpenAL Soft \"No Output\" backend.",
@@ -193,8 +199,17 @@ impl OpenALContext {
                     );
                 }
 
-                unsafe {
+                match unsafe {
                     Self::new_with_device_and_attrlist(_manager, null_device, std::ptr::null())
+                } {
+                    Ok(mut ctx) => {
+                        ctx.owns_device = true;
+                        Ok(ctx)
+                    }
+                    Err(error) => {
+                        unsafe { al_sys::alcCloseDevice(null_device) };
+                        Err(error)
+                    }
                 }
             }
         }
@@ -214,7 +229,11 @@ impl OpenALContext {
             device,
             context
         );
-        Ok(Self { context, device })
+        Ok(Self {
+            context,
+            device,
+            owns_device: false,
+        })
     }
 
     pub fn make_current<'al_ctx, 'manager: 'al_ctx>(
@@ -251,7 +270,17 @@ impl OpenALContext {
 
 impl Drop for OpenALContext {
     fn drop(&mut self) {
+        // Release a current context before destruction (OpenAL 1.1, 6.2.6).
+        if unsafe { al_sys::alcGetCurrentContext() } == self.context {
+            unsafe { al_sys::alcMakeContextCurrent(std::ptr::null_mut()) };
+        }
         unsafe { al_sys::alcDestroyContext(self.context) };
+        // alcDestroyContext leaves its device open. On Windows that also
+        // leaves WASAPI's message thread joinable at native process shutdown.
+        // https://www.openal.org/documentation/openal-1.1-specification.pdf
+        if self.owns_device {
+            unsafe { al_sys::alcCloseDevice(self.device) };
+        }
     }
 }
 
