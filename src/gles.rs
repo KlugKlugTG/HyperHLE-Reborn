@@ -142,7 +142,14 @@ impl GLESContext for LoggingGLESContext {
 }
 
 impl<'a> GLES for LoggingGLES<'a> {
-    // Tracing must preserve the backend's API and presentation paths.
+    fn is_native_es1(&self) -> bool {
+        self.inner.is_native_es1()
+    }
+    fn is_gles1_on_gl2(&self) -> bool {
+        self.inner.is_gles1_on_gl2()
+    }
+    // The logging wrapper must forward every capability query: profiles such
+    // as ES 2.0 are selected from these, not from the raw GL strings.
     fn is_es2(&self) -> bool {
         self.inner.is_es2()
     }
@@ -160,12 +167,6 @@ impl<'a> GLES for LoggingGLES<'a> {
     }
     fn diagnostic_profile(&self) -> &'static str {
         self.inner.diagnostic_profile()
-    }
-    fn is_native_es1(&self) -> bool {
-        self.inner.is_native_es1()
-    }
-    fn is_gles1_on_gl2(&self) -> bool {
-        self.inner.is_gles1_on_gl2()
     }
     fn discard_ext_supported(&self) -> bool {
         self.inner.discard_ext_supported()

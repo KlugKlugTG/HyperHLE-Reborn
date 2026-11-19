@@ -3233,6 +3233,51 @@ int test_strcspn() {
   return 0;
 }
 
+// UE3's texture LOD parser passes a numeric prefix followed by other settings.
+// https://github.com/CodeRedModding/UnrealEngine3/blob/main/Development/Src/IPhone/Inc/IPhone.h
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/wcstol.3.html
+int test_wide_numeric_prefixes() {
+  const wchar_t *lod = L"4096,LODBias=1,MinMagFilter=aniso";
+  wchar_t *end = NULL;
+  if (wcstoul(lod, &end, 10) != 4096 || end != lod + 4)
+    return -1;
+  const wchar_t *signed_value = L"  -12,Next=0";
+  if (wcstol(signed_value, &end, 10) != -12 || end != signed_value + 5)
+    return -2;
+  const wchar_t *hex = L"0x1000,Next=0";
+  if (wcstoul(hex, &end, 0) != 4096 || end != hex + 6)
+    return -3;
+  const wchar_t *octal = L"010,Next=0";
+  if (wcstoul(octal, &end, 0) != 8 || end != octal + 3)
+    return -4;
+  const wchar_t *none = L"  nope";
+  if (wcstoul(none, &end, 10) != 0 || end != none)
+    return -5;
+  if (wcstoul(L"-1,Next=0", NULL, 10) != ULONG_MAX)
+    return -6;
+  errno = 0;
+  const wchar_t *overflow = L"999999999999999999999999,Next=0";
+  if (wcstoul(overflow, &end, 10) != ULONG_MAX || errno != ERANGE ||
+      *end != L',')
+    return -7;
+  errno = 0;
+  if (wcstol(overflow, NULL, 10) != LONG_MAX || errno != ERANGE)
+    return -8;
+  errno = 0;
+  if (wcstol(L"-999999999999999999999999,x", NULL, 10) != LONG_MIN ||
+      errno != ERANGE)
+    return -9;
+  errno = 0;
+  if (wcstoul(lod, &end, 1) != 0 || errno != EINVAL || end != lod)
+    return -10;
+  const wchar_t *material = L"0.5,Specular=1";
+  if (wcstod(material, &end) != 0.5 || end != material + 3)
+    return -11;
+  if (wcstod(none, &end) != 0.0 || end != none)
+    return -12;
+  return 0;
+}
+
 int test_mbstowcs() {
   wchar_t wbuffer[64];
   char buffer[64];
@@ -6586,6 +6631,7 @@ struct {
     FUNC_DEF(test_CFStringFind),
     FUNC_DEF(test_strcspn),
     FUNC_DEF(test_mbstowcs),
+    FUNC_DEF(test_wide_numeric_prefixes),
     FUNC_DEF(test_CFMutableString),
     FUNC_DEF(test_fwrite),
     XFUNC_DEF(test_tmpfile),

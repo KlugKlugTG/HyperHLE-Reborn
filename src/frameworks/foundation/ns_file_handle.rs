@@ -17,7 +17,7 @@
 use super::ns_string;
 use super::NSUInteger;
 use crate::libc::posix_io;
-use crate::mem::{ConstPtr, ConstVoidPtr};
+use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr,
@@ -169,6 +169,22 @@ pub const CLASSES: ClassExports = objc_classes! {
             autorelease(env, new)
         },
     }
+}
+
+// iOS 7+ URL-based factory. Crashlytics uses it to open its log file;
+// without it the SDK gets a nil handle and keeps retrying.
++ (id)fileHandleForWritingToURL:(id)url error:(MutPtr<id>)error {
+    if !error.is_null() {
+        env.mem.write(error, nil);
+    }
+    if url == nil {
+        return nil;
+    }
+    let path: id = msg![env; url path];
+    if path == nil {
+        return nil;
+    }
+    msg![env; this fileHandleForWritingAtPath:path]
 }
 
 + (id)fileHandleForUpdatingAtPath:(id)path { // NSString*

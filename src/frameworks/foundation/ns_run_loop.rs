@@ -426,8 +426,11 @@ pub fn run_run_loop(
             let next_due = uikit::handle_events(env);
             limit_sleep_time(&mut sleep_until, next_due);
 
-            let force_video_composition = media_player::has_active_video(env);
-            let next_due = core_animation::recomposite_if_necessary(env, force_video_composition);
+            // Apply decoded movie frames before drawing the layer tree. An
+            // active video already disables the fullscreen EAGL fast path;
+            // it must still respect the compositor's 60 Hz deadline.
+            media_player::handle_players(env);
+            let next_due = core_animation::recomposite_if_necessary(env, false);
             limit_sleep_time(&mut sleep_until, next_due);
         }
 
@@ -479,10 +482,6 @@ pub fn run_run_loop(
         // single run loop, so we poll OpenAL source state once per tick
         // and dispatch finished completions here.
         tick_system_sound_completions(env);
-
-        if is_main_run_loop {
-            media_player::handle_players(env);
-        }
 
         // Unfortunately, touchHLE has to poll for certain things repeatedly;
         // it can't just wait until the next event appears.
