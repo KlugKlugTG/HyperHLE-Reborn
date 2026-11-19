@@ -52,7 +52,13 @@ const REALTIME_CLOCK: clock_id_t = 2; // alias for SYSTEM_CLOCK on Darwin
 /// Physical memory of the emulated device, in bytes. Mirrors what a real
 /// device reports through `NSProcessInfo.physicalMemory` and `hw.memsize`.
 pub fn physical_memory(env: &Environment) -> u64 {
-    env.window().device_family().physical_memory()
+    // Device information is available in headless sessions too. Environment
+    // initialization records the selected profile in the options.
+    env.options
+        .as_ref()
+        .device_family
+        .unwrap_or(crate::window::DeviceFamily::iPhone3GS)
+        .physical_memory()
 }
 
 const HOST_VM_INFO: host_flavor_t = 2;

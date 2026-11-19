@@ -18,8 +18,8 @@ use crate::frameworks::foundation::ns_thread::{self, detach_new_thread_inner};
 use crate::libc::semaphore::{host_create_semaphore, host_destroy_semaphore, sem_post, sem_wait};
 use crate::mem::MutVoidPtr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, msg_send, msg_send_no_type_checking, msg_send_super2, nil,
-    objc_classes, release, retain, Class, ClassExports, NSZonePtr, ObjC, TrivialHostObject, SEL,
+    autorelease, id, msg, msg_class, msg_send, msg_send_no_type_checking, nil, objc_classes,
+    release, retain, Class, ClassExports, NSZonePtr, ObjC, TrivialHostObject, SEL,
 };
 use crate::Environment;
 use std::sync::Mutex;
@@ -266,67 +266,55 @@ fn object_class_hierarchy(env: &Environment, object: id) -> Vec<Class> {
     hierarchy
 }
 
-pub(crate) fn invoke_cxx_constructors(env: &mut Environment, object: id) {
+pub(crate) fn invoke_cxx_constructors(env: &mut Environment, object: id) -> id {
+    if object == nil {
+        return nil;
+    }
     let Some(selector) = env.objc.lookup_selector(".cxx_construct") else {
-        return;
+        return object;
     };
     let hierarchy = object_class_hierarchy(env, object);
-    if !hierarchy
-        .iter()
-        .any(|&class| env.objc.class_has_uninherited_method(class, selector))
-    {
-        return;
-    }
     let return_value = env.cpu.regs()[0];
-    let super_info = env.mem.alloc(8).cast::<u32>();
     for (index, &class) in hierarchy.iter().enumerate() {
         if !env.objc.class_has_uninherited_method(class, selector) {
             continue;
         }
-        if index + 1 == hierarchy.len() {
-            let _: id = msg_send(env, (object, selector));
-        } else {
-            env.mem.write(super_info, object.to_bits());
-            env.mem
-                .write(super_info + 1, hierarchy[index + 1].to_bits());
-            let super_info_ptr: crate::mem::ConstPtr<crate::objc::objc_super> =
-                super_info.cast_const().cast();
-            let _: id = msg_send_super2(env, (super_info_ptr, selector));
+        // Runtime C++ construction calls each class's own IMP without
+        // sending a message or triggering +initialize.
+        // https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-class.mm
+        let method = crate::objc::class_getInstanceMethod(env, class, selector);
+        let implementation = crate::objc::method_getImplementation(env, method);
+        let constructor = GuestFunction::from_addr_with_thumb_bit(implementation.to_bits());
+        let result: id = constructor.call_from_host(env, (object, selector));
+        if result == nil {
+            invoke_cxx_destructors_for_classes(env, object, &hierarchy[..index]);
+            env.objc.dealloc_object(object, &mut env.mem);
+            env.cpu.regs_mut()[0] = return_value;
+            return nil;
         }
     }
-    env.mem.free(super_info.cast::<std::ffi::c_void>());
     env.cpu.regs_mut()[0] = return_value;
+    object
 }
 
-pub(crate) fn invoke_cxx_destructors(env: &mut Environment, object: id) {
+fn invoke_cxx_destructors_for_classes(env: &mut Environment, object: id, hierarchy: &[Class]) {
     let Some(selector) = env.objc.lookup_selector(".cxx_destruct") else {
         return;
     };
-    let hierarchy = object_class_hierarchy(env, object);
-    if !hierarchy
-        .iter()
-        .any(|&class| env.objc.class_has_uninherited_method(class, selector))
-    {
-        return;
-    }
-    let super_info = env.mem.alloc(8).cast::<u32>();
-    for index in (0..hierarchy.len()).rev() {
-        let class = hierarchy[index];
+    for &class in hierarchy.iter().rev() {
         if !env.objc.class_has_uninherited_method(class, selector) {
             continue;
         }
-        if index + 1 == hierarchy.len() {
-            let _: () = msg_send(env, (object, selector));
-        } else {
-            env.mem.write(super_info, object.to_bits());
-            env.mem
-                .write(super_info + 1, hierarchy[index + 1].to_bits());
-            let super_info_ptr: crate::mem::ConstPtr<crate::objc::objc_super> =
-                super_info.cast_const().cast();
-            let _: () = msg_send_super2(env, (super_info_ptr, selector));
-        }
+        let method = crate::objc::class_getInstanceMethod(env, class, selector);
+        let implementation = crate::objc::method_getImplementation(env, method);
+        let destructor = GuestFunction::from_addr_with_thumb_bit(implementation.to_bits());
+        let _: () = destructor.call_from_host(env, (object, selector));
     }
-    env.mem.free(super_info.cast::<std::ffi::c_void>());
+}
+
+pub(crate) fn invoke_cxx_destructors(env: &mut Environment, object: id) {
+    let hierarchy = object_class_hierarchy(env, object);
+    invoke_cxx_destructors_for_classes(env, object, &hierarchy);
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -341,8 +329,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)allocWithZone:(NSZonePtr)_zone {
     log_dbg!("[{:?} allocWithZone:]", this);
     let object = env.objc.alloc_object(this, Box::new(TrivialHostObject), &mut env.mem);
-    invoke_cxx_constructors(env, object);
-    object
+    invoke_cxx_constructors(env, object)
 }
 
 + (id)new {
@@ -406,9 +393,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 // first physics step. Resolving the selector here — exactly like
 // `-methodForSelector:` — keeps the two in agreement. In a class method
 // `this` is the class itself, which is what `class_getMethodImplementation`
-// expects. Host-implemented methods still come back as the `_objc_msgSend`
-// trampoline via `class_getMethodImplementation`, preserving the previous
-// behaviour for them.
+// expects. Host methods use a stable callable IMP stub, which also preserves
+// the method's struct-return convention and its identity after swizzling.
 + (u32)instanceMethodForSelector:(SEL)selector {
     crate::objc::class_getMethodImplementation(env, this, selector).to_bits()
 }

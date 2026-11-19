@@ -1551,6 +1551,7 @@ dependencies = [
  "corosensei",
  "digest",
  "encoding_rs",
+ "getrandom 0.2.17",
  "gl_generator",
  "hound",
  "lazy_static",

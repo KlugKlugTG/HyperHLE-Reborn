@@ -3219,13 +3219,15 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Copy, Default)]
     struct ProfileBackend {
         es2: bool,
         es3: bool,
         translator: bool,
         native_es1: bool,
         gles1_on_gl2: bool,
+        pvrtc: bool,
+        vao: bool,
     }
 
     impl GLES for ProfileBackend {
@@ -3248,11 +3250,18 @@ mod tests {
         fn is_gles1_on_gl2(&self) -> bool {
             self.gles1_on_gl2
         }
+
+        fn pvrtc_native(&self) -> bool {
+            self.pvrtc
+        }
+
+        fn supports_vao_oes(&self) -> bool {
+            self.vao
+        }
     }
 
-    #[test]
-    fn diagnostic_profile_identifies_guest_gles_version() {
-        let profiles = [
+    fn profile_backends() -> [(ProfileBackend, &'static str); 6] {
+        [
             (
                 ProfileBackend {
                     es2: true,
@@ -3291,10 +3300,53 @@ mod tests {
                 "OpenGL ES 1.1 emulated on desktop OpenGL 2.1",
             ),
             (ProfileBackend::default(), "unknown GLES profile"),
-        ];
+        ]
+    }
 
-        for (backend, expected) in profiles {
+    #[test]
+    fn diagnostic_profile_identifies_guest_gles_version() {
+        for (backend, expected) in profile_backends() {
             assert_eq!(backend.diagnostic_profile(), expected);
+        }
+    }
+
+    // ES 2/3 contexts need the shader presenter; ES 1 translation has its
+    // own path. Tracing must preserve that choice and the guest API version.
+    // https://developer.apple.com/library/archive/documentation/3DDrawing/Conceptual/OpenGLES_ProgrammingGuide/OpenGLESontheiPhone/OpenGLESontheiPhone.html
+    #[test]
+    fn logging_wrapper_preserves_rendering_profile() {
+        for (backend, profile) in profile_backends() {
+            for verbose in [false, true] {
+                let wrapped = crate::gles::LoggingGLES {
+                    inner: Box::new(backend),
+                    verbose,
+                };
+                assert_eq!(
+                    wrapped.is_es2() && !wrapped.is_translator(),
+                    backend.is_es2() && !backend.is_translator(),
+                    "tracing changed the presenter for {profile}"
+                );
+                assert_eq!(wrapped.is_es3(), backend.is_es3());
+                assert_eq!(wrapped.diagnostic_profile(), profile);
+            }
+        }
+    }
+
+    #[test]
+    fn logging_wrapper_preserves_texture_and_vertex_array_support() {
+        for pvrtc in [false, true] {
+            for vao in [false, true] {
+                let wrapped = crate::gles::LoggingGLES {
+                    inner: Box::new(ProfileBackend {
+                        pvrtc,
+                        vao,
+                        ..Default::default()
+                    }),
+                    verbose: false,
+                };
+                assert_eq!(wrapped.pvrtc_native(), pvrtc);
+                assert_eq!(wrapped.supports_vao_oes(), vao);
+            }
         }
     }
 

@@ -170,6 +170,10 @@ int test_AutoreleasePool(void);    // AutoReleasePoolTest.m
 int test_CGAffineTransform(void);  // CGAffineTransform.c
 int test_RespondsToSelector(void); // RespondsToSelector.m
 int test_Initialize(void);         // Initialize.m
+int test_dispatch_main_queue_async(void);     // DispatchMainQueue.m
+int test_dispatch_main_queue_serial(void);    // DispatchMainQueue.m
+int test_dispatch_main_queue_sync(void);      // DispatchMainQueue.m
+int test_dispatch_queue_thread_identity(void); // DispatchMainQueue.m
 
 #ifndef DEFINE_ME_WHEN_BUILDING_ON_MACOS
 int test_cpp_virtual_inheritance(void); // CppVirtualInheritance.cpp
@@ -6505,6 +6509,8 @@ int test_NSString_longLongValue(void);
 int test_munmap_partial_mapping(void);
 int test_NSUserDefaults_persistentDomain(void);
 int test_NSData_base64EncodedStringWithOptions(void);
+int test_pthread_static_tls(void);
+int test_pthread_dynamic_tls(void);
 // clang-format on
 
 int test_munmap_partial_mapping(void) {
@@ -6559,6 +6565,11 @@ int test_NSUserDefaults_persistentDomain(void) {
   return result;
 }
 
+int test_objc_struct_return_imp(void);
+int test_objc_struct_return_super(void);
+int test_NSProcessInfo_allocated_instance(void);
+int test_objc_struct_return_imp_initialization(void);
+
 // clang-format off
 // Tests marked XFUNC_DEF assert behaviour that PR #259 ("fix testapp
 // failures") added and that its revert (24a2107) removed again, because the
@@ -6574,6 +6585,10 @@ struct {
   const char *name;
   int known_fail;
 } test_func_array[] = {
+    FUNC_DEF(test_NSProcessInfo_allocated_instance),
+    FUNC_DEF(test_objc_struct_return_imp),
+    FUNC_DEF(test_objc_struct_return_imp_initialization),
+    FUNC_DEF(test_objc_struct_return_super),
 #ifndef DEFINE_ME_WHEN_BUILDING_ON_MACOS
     // below tests are failing on macOS,
     // so we skip them
@@ -6581,6 +6596,8 @@ struct {
     FUNC_DEF(test_synchronized),
     FUNC_DEF(test_read_directory_as_fd),
     FUNC_DEF(test_pthread_get_stacksize_np),
+    FUNC_DEF(test_pthread_static_tls),
+    FUNC_DEF(test_pthread_dynamic_tls),
     FUNC_DEF(test_cpp_virtual_inheritance),
 #endif
     FUNC_DEF(test_qsort),
@@ -6683,6 +6700,10 @@ struct {
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_withObject),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_removeObserver),
     FUNC_DEF(test_performSelectorOnMainThread_mainThreadDeferred),
+    FUNC_DEF(test_dispatch_main_queue_async),
+    FUNC_DEF(test_dispatch_main_queue_serial),
+    FUNC_DEF(test_dispatch_main_queue_sync),
+    FUNC_DEF(test_dispatch_queue_thread_identity),
     FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
     XFUNC_DEF(test_CFRunLoopTimerCreate_callout),

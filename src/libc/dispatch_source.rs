@@ -14,7 +14,7 @@ use crate::Environment;
 
 use super::dispatch::{
     call_void_block, dispatch_after_delay_secs, dispatch_block_t, dispatch_queue_t,
-    dispatch_source_t, get_state, State, DISPATCH_TIME_FOREVER, MAIN_QUEUE_PTR,
+    dispatch_source_t, get_state, with_current_queue, State, DISPATCH_TIME_FOREVER, MAIN_QUEUE_PTR,
 };
 
 const SOURCE_TYPE_READ: u32 = 0x4453_0001;
@@ -217,16 +217,14 @@ fn invoke_source_handler(
     queue: dispatch_queue_t,
     context: MutVoidPtr,
 ) {
-    get_state(env).current_queue_stack.push(queue.to_bits());
-    match handler {
+    with_current_queue(env, queue, |env| match handler {
         SourceHandler::Block(block) => call_void_block(env, block),
         SourceHandler::Function(function) => {
             if function != GuestFunction::null_ptr() {
                 let _: () = function.call_from_host(env, (context,));
             }
         }
-    }
-    get_state(env).current_queue_stack.pop();
+    });
 }
 
 fn dispatch_source_fire_event(env: &mut Environment, source: u32) {

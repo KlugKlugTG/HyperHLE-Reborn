@@ -162,6 +162,12 @@ impl<'a> GLES for LoggingGLES<'a> {
     fn pvrtc_native(&self) -> bool {
         self.inner.pvrtc_native()
     }
+    fn supports_vao_oes(&self) -> bool {
+        self.inner.supports_vao_oes()
+    }
+    fn diagnostic_profile(&self) -> &'static str {
+        self.inner.diagnostic_profile()
+    }
     fn discard_ext_supported(&self) -> bool {
         self.inner.discard_ext_supported()
     }

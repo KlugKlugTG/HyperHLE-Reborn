@@ -105,7 +105,46 @@ fn get_etext(env: &mut Environment) -> u32 {
     text_section.next_section_addr()
 }
 
+/// Returns the named section's contents at its loaded address. Apple's
+/// implementation leaves `size` untouched when the section is absent.
+/// https://github.com/apple-oss-distributions/cctools/blob/cctools-973.0.1/libmacho/getsecbyname.c
+fn getsectiondata(
+    env: &mut Environment,
+    header: ConstVoidPtr,
+    segment_name: ConstPtr<u8>,
+    section_name: ConstPtr<u8>,
+    size: MutPtr<u32>,
+) -> MutPtr<u8> {
+    let segment_name = env.mem.cstr_at(segment_name);
+    let section_name = env.mem.cstr_at(section_name);
+    let segment_name = &segment_name[..segment_name.len().min(16)];
+    let section_name = &section_name[..section_name.len().min(16)];
+    let Some(section) = env
+        .bins
+        .iter()
+        .find(|image| image.text_base == header.to_bits())
+        .and_then(|image| {
+            image.sections.iter().find(|section| {
+                section.segment_name.as_bytes() == segment_name
+                    && section.name.as_bytes() == section_name
+            })
+        })
+    else {
+        return Ptr::null();
+    };
+    let address = section.addr;
+    let section_size = section.size;
+    env.mem.write(size, section_size);
+    Ptr::from_bits(address)
+}
+
 // --- dyld API functions ---
+
+/// The main executable's Mach-O header, also exposed by crt_externs.h.
+/// https://github.com/apple-oss-distributions/Libc/blob/Libc-997.90.3/sys/crt_externs.c
+fn _NSGetMachExecuteHeader(env: &mut Environment) -> ConstVoidPtr {
+    Ptr::from_bits(_dyld_get_image_header(env, 0))
+}
 
 /// `uint32_t _dyld_image_count(void)` — returns the number of images
 /// (Mach-O binaries) currently loaded in the process address space.
@@ -142,7 +181,7 @@ fn _dyld_get_image_name(env: &mut Environment, image_index: u32) -> ConstPtr<u8>
         );
         return Ptr::null();
     }
-    let name = env.bins[idx].name.clone();
+    let name = env.bins[idx].loaded_path.clone();
     let len = name.len() as u32 + 1;
     let ptr: MutPtr<u8> = env.mem.alloc(len).cast();
     let dst = env.mem.bytes_at_mut(ptr, len);
@@ -152,18 +191,14 @@ fn _dyld_get_image_name(env: &mut Environment, image_index: u32) -> ConstPtr<u8>
 }
 
 /// `intptr_t _dyld_get_image_vmaddr_slide(uint32_t image_index)`
-/// Returns the virtual memory address slide for the image. Since touchHLE
-/// loads binaries at their preferred addresses (slide=0 for the main app),
-/// we return 0. Dylibs might have a slide but in practice iOS games don't
-/// query this for anything critical.
+/// Returns the offset added to this image's preferred virtual addresses.
+/// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dyld.3.html
 fn _dyld_get_image_vmaddr_slide(env: &mut Environment, image_index: u32) -> u32 {
     let idx = image_index as usize;
     if idx >= env.bins.len() {
         return 0;
     }
-    // For the main binary (index 0) the slide is always 0 in touchHLE.
-    // For dylibs we don't track the slide separately, return 0.
-    0
+    env.bins[idx].slide
 }
 
 /// `void _dyld_register_func_for_add_image(void (*func)(const struct mach_header *mh, intptr_t vmaddr_slide))`
@@ -179,10 +214,8 @@ fn _dyld_get_image_vmaddr_slide(env: &mut Environment, image_index: u32) -> u32 
 /// touchHLE finishes loading every binary and dylib before guest code
 /// starts executing, and we do not support dynamic image load / unload
 /// at runtime, so the documented contract collapses to: "invoke the
-/// callback exactly once for every already-loaded image". We honour
-/// that here. Each call passes the image's mach_header pointer and a
-/// `vmaddr_slide` of 0 (touchHLE loads binaries at their preferred
-/// addresses).
+/// callback exactly once for every already-loaded image". Each callback
+/// receives the loaded mach_header pointer and that image's actual slide.
 fn _dyld_register_func_for_add_image(env: &mut Environment, func: GuestFunction) {
     if func.to_ptr().is_null() {
         log!("Warning: _dyld_register_func_for_add_image(NULL) — ignored");
@@ -195,12 +228,9 @@ fn _dyld_register_func_for_add_image(env: &mut Environment, func: GuestFunction)
     );
     // Snapshot the per-image data first because the callback runs guest
     // code and `env.bins` may be borrowed during the call.
-    let images: Vec<u32> = env.bins.iter().map(|b| b.text_base).collect();
-    for mh in images {
-        // vmaddr_slide = 0 for the main binary, and we don't track per-dylib
-        // slides separately. This matches what `_dyld_get_image_vmaddr_slide`
-        // already returns and keeps the two APIs consistent.
-        let _: () = func.call_from_host(env, (mh, 0u32));
+    let images: Vec<(u32, u32)> = env.bins.iter().map(|b| (b.text_base, b.slide)).collect();
+    for (mh, slide) in images {
+        let _: () = func.call_from_host(env, (mh, slide));
     }
 }
 
@@ -852,7 +882,9 @@ fn NXGetAllArchInfos(env: &mut Environment) -> ConstPtr<NXArchInfoGuest> {
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(get_end()),
     export_c_func!(get_etext()),
+    export_c_func!(getsectiondata(_, _, _, _)),
     export_c_func!(host_info(_, _, _, _)),
+    export_c_func!(_NSGetMachExecuteHeader()),
     export_c_func!(_dyld_image_count()),
     export_c_func!(_dyld_get_image_header(_)),
     export_c_func!(_dyld_get_image_name(_)),

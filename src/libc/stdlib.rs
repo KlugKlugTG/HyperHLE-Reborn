@@ -497,6 +497,16 @@ fn arc4random(env: &mut Environment) -> u32 {
     env.libc_state.stdlib.arc4random
 }
 
+/// Fill all requested bytes from the host's cryptographic random source.
+/// https://github.com/apple-oss-distributions/Libc/blob/main/gen/FreeBSD/arc4random.c
+fn arc4random_buf(env: &mut Environment, buffer: MutVoidPtr, size: GuestUSize) {
+    if size == 0 {
+        return;
+    }
+    getrandom::getrandom(env.mem.bytes_at_mut(buffer.cast(), size))
+        .expect("Could not obtain cryptographic random bytes");
+}
+
 /// `arc4random_uniform(upper_bound)` — returns a uniformly distributed
 /// random number less than `upper_bound`.
 ///
@@ -2002,6 +2012,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(srandom(_)),
     export_c_func!(random()),
     export_c_func!(arc4random()),
+    export_c_func!(arc4random_buf(_, _)),
     export_c_func!(arc4random_uniform(_)),
     export_c_func!(arc4random_stir()),
     export_c_func!(arc4random_addrandom()),

@@ -22,9 +22,9 @@ use crate::abi::GuestFunction;
 use crate::fs::{Fs, GuestPath};
 use crate::mem::{GuestUSize, Mem, Ptr};
 use mach_object::{
-    cpu_subtype_t, vm_prot_t, Bind, BindSymbolType, DyLib, LoadCommand, MachCommand, OFile, Rebase,
-    Symbol, SymbolIter, ThreadState, N_ARM_THUMB_DEF, S_LAZY_SYMBOL_POINTERS,
-    S_MOD_INIT_FUNC_POINTERS, S_NON_LAZY_SYMBOL_POINTERS, S_SYMBOL_STUBS,
+    cpu_subtype_t, vm_prot_t, Bind, BindSymbolType, DyLib, ExportKind, ExportTrie, LoadCommand,
+    MachCommand, OFile, Rebase, Symbol, SymbolIter, ThreadState, N_ARM_THUMB_DEF,
+    S_LAZY_SYMBOL_POINTERS, S_MOD_INIT_FUNC_POINTERS, S_NON_LAZY_SYMBOL_POINTERS, S_SYMBOL_STUBS,
 };
 use std::collections::HashMap;
 use std::io::{Cursor, Seek, SeekFrom};
@@ -38,8 +38,14 @@ const VM_PROT_EXECUTE: vm_prot_t = 4;
 pub struct MachO {
     /// Name (for debugging purposes and sorting)
     pub name: String,
+    /// Guest filesystem path used to load the image.
+    pub loaded_path: String,
     /// Paths of dynamic libraries referenced by the binary.
     pub dynamic_libraries: Vec<String>,
+    /// LC_RPATH entries, in the order recorded by the linker.
+    pub run_paths: Vec<String>,
+    /// Offset added to the image's preferred virtual addresses.
+    pub slide: u32,
     /// Metadata related to sections.
     pub sections: Vec<Section>,
     /// All defined symbols in the binary, including local symbols. Use
@@ -74,6 +80,8 @@ pub struct MachO {
 pub struct Section {
     /// Section name.
     pub name: String,
+    /// Segment containing the section; section names can repeat by segment.
+    pub segment_name: String,
     /// Section address in memory.
     pub addr: u32,
     /// Section size in bytes.
@@ -293,6 +301,53 @@ fn record_defined_symbol(
     }
 }
 
+// Modern stripped dylibs keep their public symbols in the export trie,
+// which is authoritative even when the nlist table marks them private.
+// Regular and thread-local addresses are relative to the Mach-O header;
+// absolute exports retain their recorded address.
+// https://github.com/apple-oss-distributions/dyld/blob/dyld-360.22/src/ImageLoaderMachOCompressed.cpp
+fn record_export_trie(
+    bytes: &[u8],
+    offset: u32,
+    size: u32,
+    image_base: u32,
+    defined_symbols: &mut HashMap<String, u32>,
+    external_symbols: &mut HashMap<String, u32>,
+) -> Result<(), &'static str> {
+    if size == 0 {
+        return Ok(());
+    }
+    let start = offset as usize;
+    let end = start
+        .checked_add(size as usize)
+        .ok_or("Mach-O export trie range overflows")?;
+    let payload = bytes
+        .get(start..end)
+        .ok_or("Mach-O export trie extends past end of file")?;
+    let trie = ExportTrie::parse(payload).map_err(|_| "Malformed Mach-O export trie")?;
+    for symbol in trie.symbols() {
+        // Reexported definitions are supplied by the dependency's image.
+        let Some(address) = symbol.address() else {
+            continue;
+        };
+        let address = u32::try_from(address).map_err(|_| "Export address exceeds 32 bits")?;
+        let address = match symbol.kind {
+            ExportKind::Absolute => address,
+            _ => image_base
+                .checked_add(address)
+                .ok_or("Export address overflows")?,
+        };
+        record_defined_symbol(
+            defined_symbols,
+            external_symbols,
+            &symbol.name,
+            address,
+            true,
+        );
+    }
+    Ok(())
+}
+
 /// Only the virtual tail (vmsize - filesize) is zero-filled. Missing bytes
 /// inside the declared file range are corruption, not BSS.
 fn validate_segment_file_range(
@@ -353,6 +408,15 @@ impl MachO {
         into_mem: &mut Mem,
         name: String,
         slide_to_address: u32,
+    ) -> Result<MachO, &'static str> {
+        Self::load_with_placement(bytes, into_mem, name, Some(slide_to_address))
+    }
+
+    fn load_with_placement(
+        bytes: &[u8],
+        into_mem: &mut Mem,
+        name: String,
+        requested_slide: Option<u32>,
     ) -> Result<MachO, &'static str> {
         log_dbg!("Reading {:?}", name);
 
@@ -434,7 +498,7 @@ impl MachO {
                     }
                 }
                 return if let Some(subslice) = best_subslice {
-                    MachO::load_from_bytes(subslice, into_mem, name, slide_to_address)
+                    MachO::load_with_placement(subslice, into_mem, name, requested_slide)
                 } else if had_invalid_slice {
                     Err("FAT binary has no usable ARM slice: slices are truncated, malformed or unsupported (check the IPA)")
                 } else {
@@ -477,6 +541,11 @@ impl MachO {
         // __LINKEDIT, is known to fit the selected thin image.
         validate_segment_ranges(&commands, bytes.len())?;
 
+        let slide = match requested_slide {
+            Some(slide) => slide,
+            None => Self::available_image_slide(&commands, into_mem)?,
+        };
+
         let split_segs = (header.flags & mach_object::MH_SPLIT_SEGS) != 0;
 
         // Info used while parsing file
@@ -490,14 +559,13 @@ impl MachO {
 
         // Info used for the result
         let mut dynamic_libraries = Vec::new();
+        let mut run_paths = Vec::new();
         let mut exported_symbols = HashMap::new();
         let mut external_symbols = HashMap::new();
         let mut indirect_undef_symbols: Vec<Option<String>> = Vec::new();
         let mut external_relocations: Vec<(u32, String)> = Vec::new();
         let mut entry_point_pc: Option<u32> = None;
         let mut entry_point_is_lc_main = false;
-
-        let slide = slide_to_address;
 
         for MachCommand(command, _size) in commands {
             match command {
@@ -667,6 +735,8 @@ impl MachO {
                     nindirectsyms,
                     extreloff,
                     nextrel,
+                    locreloff,
+                    nlocrel,
                     ..
                 } => {
                     let indirectsyms = {
@@ -715,6 +785,70 @@ impl MachO {
                                 None
                             }
                         })
+                    }
+
+                    // Classic dyld images record internal pointers in the
+                    // local relocation table instead of LC_DYLD_INFO.
+                    // The relocation offset is relative to the first segment
+                    // (first writable segment for split-segment images).
+                    // https://github.com/apple-oss-distributions/dyld/blob/dyld-360.22/src/ImageLoaderMachOClassic.cpp
+                    if nlocrel != 0 {
+                        let start = locreloff as usize;
+                        let end = start
+                            .checked_add(nlocrel as usize * 8)
+                            .ok_or("Local relocation table range overflows")?;
+                        let local_relocations = bytes
+                            .get(start..end)
+                            .ok_or("Local relocation table extends past end of file")?;
+                        let relocation_base = if split_segs {
+                            first_read_write_segment_base
+                        } else {
+                            first_segment_base
+                        }
+                        .ok_or("Local relocations have no segment base")?;
+                        for entry in local_relocations.chunks_exact(8) {
+                            let relocation = Reloc::parse(is_bigend, entry.try_into().unwrap());
+                            let offset = match relocation {
+                                Reloc::Local { section_idx: 0, .. } => continue,
+                                Reloc::Local {
+                                    addr,
+                                    is_pc_relative: false,
+                                    size: 4,
+                                    type_: 0,
+                                    ..
+                                } => addr,
+                                Reloc::Scattered {
+                                    offset,
+                                    is_pc_relative: false,
+                                    size: 4,
+                                    type_: 0,
+                                    ..
+                                } => offset,
+                                // Prebound lazy pointers are reset using their
+                                // recorded value rather than the existing word.
+                                Reloc::Scattered {
+                                    offset,
+                                    value,
+                                    is_pc_relative: false,
+                                    size: 4,
+                                    type_: 4,
+                                } => {
+                                    let address = relocation_base
+                                        .checked_add(offset)
+                                        .ok_or("Local relocation address overflows")?;
+                                    into_mem
+                                        .write(Ptr::from_bits(address), value.wrapping_add(slide));
+                                    continue;
+                                }
+                                _ => return Err("Unsupported classic local relocation"),
+                            };
+                            let address = relocation_base
+                                .checked_add(offset)
+                                .ok_or("Local relocation address overflows")?;
+                            let pointer = Ptr::from_bits(address);
+                            let original: u32 = into_mem.read(pointer);
+                            into_mem.write(pointer, original.wrapping_add(slide));
+                        }
                     }
 
                     let extrels = {
@@ -775,7 +909,6 @@ impl MachO {
                             is_64bit,
                             &mut cursor,
                         );
-                        assert_eq!(slide, 0); // TODO
                         match sym {
                             Some(Symbol::Undefined { name: Some(n), .. }) => {
                                 external_relocations.push((addr, String::from(n)));
@@ -795,7 +928,8 @@ impl MachO {
                                 } else {
                                     entry
                                 };
-                                into_mem.write(addr, entry.wrapping_add(addend));
+                                into_mem
+                                    .write(addr, entry.wrapping_add(slide).wrapping_add(addend));
                             }
                             Some(Symbol::Prebound { name: Some(n), .. }) => {
                                 let ptr_ptr = Ptr::<u32, true>::from_bits(addr);
@@ -819,9 +953,14 @@ impl MachO {
                         );
                     }
                 }
-                LoadCommand::LoadDyLib(DyLib { name, .. }) => {
+                LoadCommand::LoadDyLib(DyLib { name, .. })
+                | LoadCommand::LoadWeakDyLib(DyLib { name, .. })
+                | LoadCommand::ReexportDyLib(DyLib { name, .. })
+                | LoadCommand::LoadUpwardDylib(DyLib { name, .. })
+                | LoadCommand::LazyLoadDylib(DyLib { name, .. }) => {
                     dynamic_libraries.push(String::from(&*name));
                 }
+                LoadCommand::Rpath(path) => run_paths.push(path),
                 // Old-style entry point PC command
                 LoadCommand::UnixThread { state, .. } => {
                     let ThreadState::Arm {
@@ -870,13 +1009,16 @@ impl MachO {
                     entry_point_pc = Some(text_segment_base.unwrap() + entryoff);
                     entry_point_is_lc_main = true;
                 }
-                // Used in iOS 3.1+ apps. Also contains info about
-                // weak and lazy binds, but we already handle those.
+                // Compressed dyld fixups used in iOS 3.1+ apps.
                 LoadCommand::DyldInfo {
                     rebase_off,
                     rebase_size,
                     bind_off,
                     bind_size,
+                    lazy_bind_off,
+                    lazy_bind_size,
+                    export_off,
+                    export_size,
                     ..
                 } => {
                     fn checked_dyld_info_slice<'a>(
@@ -1002,6 +1144,37 @@ impl MachO {
                             }
                         }
                     }
+                    record_lazy_bindings(
+                        checked_dyld_info_slice(
+                            bytes,
+                            lazy_bind_off as u64,
+                            lazy_bind_size as u64,
+                            "lazy bind",
+                            &name,
+                        ),
+                        &segment_offsets,
+                        slide,
+                        into_mem,
+                        &mut external_relocations,
+                    )?;
+                    record_export_trie(
+                        bytes,
+                        export_off,
+                        export_size,
+                        text_segment_base.ok_or("Export trie has no Mach-O header")?,
+                        &mut exported_symbols,
+                        &mut external_symbols,
+                    )?;
+                }
+                LoadCommand::DyldExportsTrie(data) => {
+                    record_export_trie(
+                        bytes,
+                        data.off,
+                        data.size,
+                        text_segment_base.ok_or("Export trie has no Mach-O header")?,
+                        &mut exported_symbols,
+                        &mut external_symbols,
+                    )?;
                 }
                 _ => (),
             }
@@ -1076,6 +1249,7 @@ impl MachO {
 
                 Section {
                     name,
+                    segment_name: section.segname.clone(),
                     addr,
                     size,
                     type_,
@@ -1085,8 +1259,11 @@ impl MachO {
             .collect();
 
         Ok(MachO {
+            loaded_path: name.clone(),
             name,
             dynamic_libraries,
+            run_paths,
+            slide,
             sections,
             exported_symbols,
             external_symbols,
@@ -1108,19 +1285,194 @@ impl MachO {
         slide_to_address: u32,
     ) -> Result<MachO, &'static str> {
         let name = path.as_ref().file_name().unwrap().to_string();
-        Self::load_from_bytes(
+        let mut image = Self::load_from_bytes(
             &fs.read(path.as_ref())
                 .map_err(|_| "Could not read executable file")?,
             into_mem,
             name,
             slide_to_address,
-        )
+        )?;
+        image.loaded_path = path.as_ref().as_str().to_owned();
+        Ok(image)
+    }
+
+    pub(crate) fn load_from_file_automatically_slid(
+        path: &GuestPath,
+        fs: &Fs,
+        into_mem: &mut Mem,
+    ) -> Result<MachO, &'static str> {
+        let mut image = Self::load_with_placement(
+            &fs.read(path)
+                .map_err(|_| "Could not read executable file")?,
+            into_mem,
+            path.file_name().unwrap().to_owned(),
+            None,
+        )?;
+        image.loaded_path = path.as_str().to_owned();
+        Ok(image)
+    }
+
+    // dyld relocates images whose preferred segment ranges are occupied.
+    // Keep the image's relative layout and use page-aligned free space.
+    // https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dyld.3.html
+    fn available_image_slide(commands: &[MachCommand], mem: &Mem) -> Result<u32, &'static str> {
+        let mut first = u32::MAX;
+        let mut last = 0;
+        for MachCommand(command, _) in commands {
+            if let LoadCommand::Segment {
+                segname,
+                vmaddr,
+                vmsize,
+                ..
+            } = command
+            {
+                if matches!(&**segname, "__PAGEZERO" | "__LINKEDIT") || *vmsize == 0 {
+                    continue;
+                }
+                let base = u32::try_from(*vmaddr).map_err(|_| "Image address exceeds 32 bits")?;
+                let size = u32::try_from(*vmsize).map_err(|_| "Image size exceeds 32 bits")?;
+                let end = base
+                    .checked_add(size)
+                    .ok_or("Image address range overflows")?;
+                first = first.min(base);
+                last = last.max(end);
+            }
+        }
+        let size = last
+            .checked_sub(first)
+            .filter(|size| *size != 0)
+            .ok_or("Image has no loadable segments")?;
+        if first != 0 && mem.is_range_free(first, size) {
+            return Ok(0);
+        }
+        let mut base = first
+            .max(0x1000_0000)
+            .checked_add(0xffff)
+            .map(|value| value & !0xffff)
+            .ok_or("Image address range overflows")?;
+        while base.checked_add(size).is_some_and(|end| end < 0xf000_0000) {
+            if mem.is_range_free(base, size) {
+                return Ok(base - first);
+            }
+            base = base
+                .checked_add(0x1_0000)
+                .ok_or("Image address range overflows")?;
+        }
+        Err("No free address range for bundled image")
     }
 
     /// Get a section by its name (`&str`) or type ([SectionType]).
     pub fn get_section<P: SectionPredicate>(&self, by: P) -> Option<&Section> {
         self.sections.iter().find(|section| by.test(section))
     }
+}
+
+/// Bind compressed lazy pointers at load time, including pointers whose
+/// indirect-symbol entries are LOCAL/ABS. DONE ends one record, not the table.
+/// The initial pointer targets a stub helper; it is not a relocation addend.
+/// https://github.com/apple-oss-distributions/dyld/blob/dyld-360.22/src/ImageLoaderMachOCompressed.cpp
+fn record_lazy_bindings(
+    payload: &[u8],
+    segment_offsets: &[u32],
+    slide: u32,
+    mem: &mut Mem,
+    relocations: &mut Vec<(u32, String)>,
+) -> Result<(), &'static str> {
+    let mut bytes = payload.iter();
+    let mut name = None;
+    let mut segment_index = 0usize;
+    let mut offset = 0u32;
+    let mut addend = 0i64;
+    let mut symbol_type = 1;
+    while let Some(&byte) = bytes.next() {
+        let immediate = byte & 0x0f;
+        match byte & 0xf0 {
+            0x00 => {}        // BIND_OPCODE_DONE
+            0x10 | 0x30 => {} // Library ordinal; existing linking uses flat lookup.
+            0x20 => {
+                read_unsigned_leb128(&mut bytes)?;
+            }
+            0x40 => {
+                let mut symbol = Vec::new();
+                loop {
+                    match bytes.next().ok_or("Truncated lazy binding symbol")? {
+                        0 => break,
+                        byte => symbol.push(*byte),
+                    }
+                }
+                name = Some(String::from_utf8(symbol).map_err(|_| "Invalid lazy binding symbol")?);
+            }
+            0x50 => symbol_type = immediate,
+            0x60 => addend = read_signed_leb128(&mut bytes)?,
+            0x70 => {
+                segment_index = immediate as usize;
+                offset = read_unsigned_leb128(&mut bytes)?
+                    .try_into()
+                    .map_err(|_| "Lazy binding offset exceeds ARM32")?;
+            }
+            0x80 => {
+                let delta: u32 = read_unsigned_leb128(&mut bytes)?
+                    .try_into()
+                    .map_err(|_| "Lazy binding offset exceeds ARM32")?;
+                offset = offset
+                    .checked_add(delta)
+                    .ok_or("Lazy binding offset overflow")?;
+            }
+            0x90 => {
+                if symbol_type != 1 {
+                    return Err("Unsupported lazy binding type");
+                }
+                let name = name.as_ref().ok_or("Lazy binding has no symbol name")?;
+                let addr = segment_offsets
+                    .get(segment_index)
+                    .ok_or("Lazy binding has an invalid segment index")?
+                    .checked_add(offset)
+                    .and_then(|addr| addr.checked_add(slide))
+                    .ok_or("Lazy binding address overflow")?;
+                // do_non_lazy_linking applies the stored addend to the symbol.
+                mem.write(Ptr::<u32, true>::from_bits(addr), addend as u32);
+                relocations.push((addr, name.clone()));
+                offset = offset
+                    .checked_add(4)
+                    .ok_or("Lazy binding offset overflow")?;
+            }
+            _ => return Err("Invalid lazy binding opcode"),
+        }
+    }
+    Ok(())
+}
+
+fn read_unsigned_leb128<'a>(bytes: &mut impl Iterator<Item = &'a u8>) -> Result<u64, &'static str> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *bytes.next().ok_or("Truncated lazy binding operand")?;
+        if shift == 63 && byte > 1 {
+            return Err("Lazy binding operand overflow");
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err("Lazy binding operand overflow")
+}
+
+fn read_signed_leb128<'a>(bytes: &mut impl Iterator<Item = &'a u8>) -> Result<i64, &'static str> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *bytes.next().ok_or("Truncated lazy binding addend")?;
+        if shift == 63 && byte != 0 && byte != 0x7f {
+            return Err("Lazy binding addend overflow");
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            if byte & 0x40 != 0 && shift < 57 {
+                value |= u64::MAX << (shift + 7);
+            }
+            return Ok(value as i64);
+        }
+    }
+    Err("Lazy binding addend overflow")
 }
 
 #[cfg(test)]
@@ -1158,6 +1510,147 @@ mod segment_validation_tests {
         }
         assert_eq!(bytes.len(), 84);
         bytes
+    }
+
+    #[test]
+    fn bundled_images_relocate_without_overlapping_each_other() {
+        let bytes = thin(9, 0, 84);
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(0x1000);
+        let first = MachO::load_with_placement(&bytes, &mut mem, "first".into(), None).unwrap();
+        let second = MachO::load_with_placement(&bytes, &mut mem, "second".into(), None).unwrap();
+
+        assert_ne!(first.slide, 0);
+        assert_ne!(second.slide, 0);
+        assert!(first.last_segment_end <= second.text_base);
+        assert_eq!(first.slide & 0x3fff, 0);
+        assert_eq!(second.slide & 0x3fff, 0);
+        assert_eq!(
+            mem.read::<u32, false>(Ptr::from_bits(first.text_base)),
+            0xfeedface
+        );
+        assert_eq!(
+            mem.read::<u32, false>(Ptr::from_bits(second.text_base)),
+            0xfeedface
+        );
+    }
+
+    #[test]
+    fn loader_retains_run_path_order_and_weak_dependencies() {
+        let mut bytes = thin(9, 0x9000, 84);
+        let mut commands = Vec::new();
+        for (command, prefix_words, name) in [
+            (0x8000001cu32, vec![12u32], "@executable_path/Frameworks"),
+            (0x8000001c, vec![12u32], "/usr/lib"),
+            (0x80000018, vec![24u32, 0, 0, 0], "@rpath/Support.dylib"),
+        ] {
+            let size = (8 + prefix_words.len() * 4 + name.len() + 1 + 3) & !3;
+            commands.extend_from_slice(&command.to_le_bytes());
+            commands.extend_from_slice(&(size as u32).to_le_bytes());
+            for word in prefix_words {
+                commands.extend_from_slice(&word.to_le_bytes());
+            }
+            commands.extend_from_slice(name.as_bytes());
+            commands.push(0);
+            while commands.len() % 4 != 0 {
+                commands.push(0);
+            }
+        }
+        bytes[16..20].copy_from_slice(&4u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&(56u32 + commands.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&commands);
+        let file_size = bytes.len() as u32;
+        bytes[64..68].copy_from_slice(&file_size.to_le_bytes());
+        let mut mem = Mem::new();
+        let image = MachO::load_from_bytes(&bytes, &mut mem, "rpaths".into(), 0).unwrap();
+
+        assert_eq!(image.run_paths, ["@executable_path/Frameworks", "/usr/lib"]);
+        assert_eq!(image.dynamic_libraries, ["@rpath/Support.dylib"]);
+    }
+
+    #[test]
+    fn stripped_export_trie_keeps_thumb_addresses_and_absolute_symbols() {
+        for (flags, expected) in [(0, 0x29045), (2, 0x45)] {
+            let mut bytes = thin(9, 0x9000, 84);
+            let edge = b"_trieOnly\0";
+            let mut trie = vec![0, 1];
+            trie.extend_from_slice(edge);
+            trie.push((2 + edge.len() + 1) as u8);
+            trie.extend_from_slice(&[2, flags, 0x45, 0]);
+            let export_offset = bytes.len() as u32 + 48;
+            for word in [
+                0x80000022,
+                48,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                export_offset,
+                trie.len() as u32,
+            ] {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            bytes.extend_from_slice(&trie);
+            bytes[16..20].copy_from_slice(&2u32.to_le_bytes());
+            bytes[20..24].copy_from_slice(&104u32.to_le_bytes());
+            let size = bytes.len() as u32;
+            bytes[64..68].copy_from_slice(&size.to_le_bytes());
+            let mut mem = Mem::new();
+            let image =
+                MachO::load_from_bytes(&bytes, &mut mem, "stripped".into(), 0x20000).unwrap();
+
+            assert_eq!(image.external_symbols["_trieOnly"], expected);
+            assert_eq!(image.exported_symbols["_trieOnly"], expected);
+        }
+    }
+
+    #[test]
+    fn compressed_lazy_bindings_continue_after_done_and_replace_stub_helpers() {
+        let mut bytes = thin(9, 0x9000, 84);
+        let mut binds = vec![0x70, 0x80, 0x02, 0x11, 0x40];
+        binds.extend_from_slice(b"_first\0");
+        binds.extend_from_slice(&[0x51, 0x90, 0x00, 0x70, 0x84, 0x02, 0x11, 0x40]);
+        binds.extend_from_slice(b"_second\0");
+        binds.extend_from_slice(&[0x60, 0x7c, 0x90, 0x00]); // Signed addend -4.
+        for word in [
+            0x80000022,
+            48,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            132,
+            binds.len() as u32,
+            0,
+            0,
+        ] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.extend_from_slice(&binds);
+        bytes.resize(0x108, 0);
+        bytes[0x100..0x104].copy_from_slice(&0x9200u32.to_le_bytes());
+        bytes[0x104..0x108].copy_from_slice(&0x9210u32.to_le_bytes());
+        bytes[16..20].copy_from_slice(&2u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&104u32.to_le_bytes());
+        bytes[64..68].copy_from_slice(&0x108u32.to_le_bytes());
+        let mut mem = Mem::new();
+        let image = MachO::load_from_bytes(&bytes, &mut mem, "lazy-binds".into(), 0x20000).unwrap();
+
+        assert_eq!(
+            image.external_relocations,
+            [(0x29100, "_first".into()), (0x29104, "_second".into())]
+        );
+        assert_eq!(mem.read::<u32, false>(Ptr::from_bits(0x29100)), 0);
+        assert_eq!(
+            mem.read::<u32, false>(Ptr::from_bits(0x29104)),
+            u32::MAX - 3
+        );
     }
 
     #[test]

@@ -19,7 +19,9 @@ use crate::frameworks::core_foundation::cf_run_loop::{
     kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoopRef,
 };
 use crate::frameworks::{core_animation, media_player, uikit};
-use crate::objc::{id, msg, nil, objc_classes, release, retain, Class, ClassExports, HostObject, SEL};
+use crate::objc::{
+    id, msg, nil, objc_classes, release, retain, Class, ClassExports, HostObject, SEL,
+};
 use crate::Environment;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -419,6 +421,8 @@ pub fn run_run_loop(
 
         // We want to process those only on the main run loop
         if is_main_run_loop {
+            crate::libc::dispatch::drain_main_queue(env);
+
             let next_due = uikit::handle_events(env);
             limit_sleep_time(&mut sleep_until, next_due);
 
@@ -528,7 +532,9 @@ pub fn run_run_loop(
             // and not worthy to convert back and forth)
             // The host clock could be set before the Unix epoch (or skew
             // backwards); never panic on that, just treat it as "not yet".
-            let now_secs = env.guest_clock.system_time()
+            let now_secs = env
+                .guest_clock
+                .system_time()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs_f64();

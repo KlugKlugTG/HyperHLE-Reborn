@@ -20,6 +20,7 @@
 //! See [crate::mach_o] for resources.
 
 mod dylib_list;
+pub(crate) mod dylib_paths;
 mod swift_runtime;
 
 use crate::abi::{CallFromGuest, GuestFunction};
@@ -574,9 +575,9 @@ impl Dyld {
         self.return_to_host_routine =
             Some(write_return_to_host_routine(mem, Self::SVC_RETURN_TO_HOST));
         self.thread_exit_routine = Some(write_return_to_host_routine(mem, Self::SVC_THREAD_EXIT));
-        // Currently assuming only the app binary contains Objective-C things.
-
-        objc.register_bin_selectors(&bins[0], mem);
+        for bin in bins {
+            objc.register_bin_selectors(bin, mem);
+        }
         objc.register_host_selectors(mem);
         for bin in bins {
             self.setup_lazy_linking(bin, mem);
@@ -585,10 +586,16 @@ impl Dyld {
             self.do_non_lazy_linking(bin, bins, mem, objc);
         }
 
-        objc.register_bin_classes(bundle, &bins[0], mem);
-        objc.register_bin_categories(&bins[0], mem);
-
-        ns_string::register_constant_strings(&bins[0], mem, objc);
+        for bin in bins {
+            objc.register_bin_classes(bundle, bin, mem);
+        }
+        // A superclass may belong to another image. Reconcile only once all
+        // images' class objects have been registered.
+        objc.reconcile_bin_class_ivars(mem);
+        for bin in bins {
+            objc.register_bin_categories(bin, mem);
+            ns_string::register_constant_strings(bin, mem, objc);
+        }
 
         // The `std::__throw_*` helpers in the bundled libstdc++ dylib are
         // `noreturn` — they construct and throw a C++ exception. touchHLE
@@ -869,6 +876,17 @@ impl Dyld {
         let mut skipped_stubs: Vec<u32> = Vec::new();
         let mut skipped_stub_count = 0usize;
         for i in 0..stub_count {
+            // LOCAL/ABS entries describe already-bound pointers, rather than
+            // undefined symbols. Preserve their original call sequence.
+            // https://github.com/apple-oss-distributions/dyld/blob/dyld-360.22/src/ImageLoaderMachOClassic.cpp
+            if indirect_info
+                .indirect_undef_symbols
+                .get(i as usize)
+                .and_then(Option::as_ref)
+                .is_none()
+            {
+                continue;
+            }
             let ptr: MutPtr<u32> = Ptr::from_bits(stubs.addr + i * entry_size);
 
             // Check that the stub matches the expected pattern.
@@ -975,14 +993,23 @@ impl Dyld {
             if let Some(addr) = guest_cxxabi_export {
                 register_cxxabi_typeinfo_vtable(name, addr, &mut self.cxxabi_typeinfo_vtable_kinds);
             }
-            let target: ConstVoidPtr = if let Some(name) = name.strip_prefix("_OBJC_CLASS_$_") {
-                objc.link_class(name, /* is_metaclass: */ false, mem)
-                    .cast()
-                    .cast_const()
-            } else if let Some(name) = name.strip_prefix("_OBJC_METACLASS_$_") {
-                objc.link_class(name, /* is_metaclass: */ true, mem)
-                    .cast()
-                    .cast_const()
+            let guest_external = bins
+                .iter()
+                .find_map(|other_bin| other_bin.external_symbols.get(name))
+                .copied();
+            let target: ConstVoidPtr = if let Some(class_name) = name.strip_prefix("_OBJC_CLASS_$_")
+            {
+                guest_external.map(Ptr::from_bits).unwrap_or_else(|| {
+                    objc.link_class(class_name, /* is_metaclass: */ false, mem)
+                        .cast()
+                        .cast_const()
+                })
+            } else if let Some(class_name) = name.strip_prefix("_OBJC_METACLASS_$_") {
+                guest_external.map(Ptr::from_bits).unwrap_or_else(|| {
+                    objc.link_class(class_name, /* is_metaclass: */ true, mem)
+                        .cast()
+                        .cast_const()
+                })
             } else if name == "___CFConstantStringClassReference" {
                 // See ns_string::register_constant_strings
                 nil.cast().cast_const()
@@ -1245,6 +1272,8 @@ impl Dyld {
                 p.cast().cast_const()
             } else if let Some(stub) = self.cxxabi_intercept(mem, name) {
                 Ptr::<std::ffi::c_void, false>::from_bits(stub.to_ptr().to_bits())
+            } else if let Some(external_addr) = guest_external {
+                Ptr::from_bits(external_addr)
             } else if let Some(link) = self.swift_intercept(mem, name) {
                 match link {
                     swift_runtime::SwiftLink::Function(f) => {
@@ -1252,13 +1281,6 @@ impl Dyld {
                     }
                     swift_runtime::SwiftLink::Data(slot) => slot,
                 }
-            } else if let Some(&external_addr) = bins
-                .iter()
-                .flat_map(|other_bin| other_bin.external_symbols.get(name))
-                .next()
-            {
-                // Often used for C++ RTTI
-                Ptr::from_bits(external_addr)
             } else if let Some((symbol, _)) =
                 search_host_dylibs(|dylib| dylib.function_exports, name)
             {
@@ -2473,9 +2495,12 @@ mod cxxabi_runtime_detection_tests {
 
 #[cfg(test)]
 mod lazy_link_recovery_tests {
-    use super::{fallback_for_unmapped_lazy_link, lazy_stub_section_offset, local_code_symbol};
+    use super::{
+        fallback_for_unmapped_lazy_link, lazy_stub_section_offset, local_code_symbol, Dyld,
+    };
     use crate::cpu::Cpu;
-    use crate::mach_o::{MachO, Section, SectionType};
+    use crate::mach_o::{DyldIndirectSymbolInfo, MachO, Section, SectionType};
+    use crate::mem::{Mem, MutPtr};
     use std::collections::HashMap;
 
     #[test]
@@ -2512,9 +2537,13 @@ mod lazy_link_recovery_tests {
 
         MachO {
             name: "test".to_owned(),
+            loaded_path: "/test".to_owned(),
             dynamic_libraries: Vec::new(),
+            run_paths: Vec::new(),
+            slide: 0,
             sections: vec![Section {
                 name: section_name.to_owned(),
+                segment_name: "__TEXT".to_owned(),
                 addr: 0x1000,
                 size: 0x100,
                 type_: SectionType::Normal,
@@ -2542,5 +2571,44 @@ mod lazy_link_recovery_tests {
         let external_code = mock_binary(symbol, 0x1011, "__text", true);
         assert_eq!(local_code_symbol(&external_code, symbol), None);
         assert_eq!(local_code_symbol(&private_code, "__other"), None);
+    }
+
+    // A local/absolute entry has no symbol to bind. Rewriting its PIC stub
+    // into an SVC loses the existing target and corrupts the return value.
+    // https://github.com/apple-oss-distributions/dyld/blob/dyld-360.22/src/ImageLoaderMachOClassic.cpp
+    #[test]
+    fn lazy_linking_preserves_already_bound_pic_stubs() {
+        let mut mem = Mem::new();
+        let stubs: MutPtr<u32> = mem.alloc(32).cast();
+        let mut original = Dyld::PIC_SYMBOL_STUB_INSTRUCTIONS.to_vec();
+        original.push(0x2000);
+        for stub_index in 0..2 {
+            for (index, &instruction) in original.iter().enumerate() {
+                mem.write(stubs + stub_index * 4 + index as u32, instruction);
+            }
+        }
+        let mut bin = mock_binary("_unused", 0x1011, "__text", false);
+        bin.sections = vec![Section {
+            name: "__picsymbolstub4".to_owned(),
+            segment_name: "__TEXT".to_owned(),
+            addr: stubs.to_bits(),
+            size: 32,
+            type_: SectionType::SymbolStubs,
+            dyld_indirect_symbol_info: Some(DyldIndirectSymbolInfo {
+                entry_size: 16,
+                indirect_undef_symbols: vec![None, Some("_objc_retain".to_owned())],
+            }),
+        }];
+
+        Dyld::new().setup_lazy_linking(&bin, &mut mem);
+        for (index, &instruction) in original.iter().enumerate() {
+            assert_eq!(mem.read(stubs + index as u32), instruction);
+        }
+        assert_eq!(
+            mem.read(stubs + 4),
+            super::encode_a32_svc(Dyld::SVC_LAZY_LINK)
+        );
+        assert_eq!(mem.read(stubs + 5), super::encode_a32_ret());
+        assert_eq!(mem.read(stubs + 7), original[3]);
     }
 }
