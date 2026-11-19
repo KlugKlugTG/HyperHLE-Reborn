@@ -76,6 +76,72 @@ pub fn pvrtc_payload_size(
         .map(|bits| bits / 8)
 }
 
+/// Vertex array state overwritten by an internal ES2 draw. Each attribute
+/// captures its own buffer binding when VertexAttribPointer is called.
+/// <https://registry.khronos.org/OpenGL-Refpages/es2.0/xhtml/glVertexAttribPointer.xml>
+#[derive(Debug, PartialEq)]
+pub(crate) struct VertexAttribState {
+    index: u32,
+    enabled: i32,
+    buffer: i32,
+    size: i32,
+    stride: i32,
+    type_: i32,
+    normalized: i32,
+    pointer: *mut std::ffi::c_void,
+}
+
+impl VertexAttribState {
+    pub(crate) unsafe fn capture(gles: &mut dyn GLES, index: u32) -> Self {
+        use super::gles2_raw as gl;
+        let mut state = Self {
+            index,
+            enabled: 0,
+            buffer: 0,
+            size: 0,
+            stride: 0,
+            type_: 0,
+            normalized: 0,
+            pointer: std::ptr::null_mut(),
+        };
+        gles.GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_ENABLED, &mut state.enabled);
+        gles.GetVertexAttribiv(
+            index,
+            gl::VERTEX_ATTRIB_ARRAY_BUFFER_BINDING,
+            &mut state.buffer,
+        );
+        gles.GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_SIZE, &mut state.size);
+        gles.GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_STRIDE, &mut state.stride);
+        gles.GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_TYPE, &mut state.type_);
+        gles.GetVertexAttribiv(
+            index,
+            gl::VERTEX_ATTRIB_ARRAY_NORMALIZED,
+            &mut state.normalized,
+        );
+        gles.GetVertexAttribPointerv(index, gl::VERTEX_ATTRIB_ARRAY_POINTER, &mut state.pointer);
+        state
+    }
+
+    /// The caller restores the global ARRAY_BUFFER binding after all attributes.
+    pub(crate) unsafe fn restore(&self, gles: &mut dyn GLES) {
+        use super::gles2_raw as gl;
+        gles.BindBuffer(gl::ARRAY_BUFFER, self.buffer as _);
+        gles.VertexAttribPointer(
+            self.index,
+            self.size,
+            self.type_ as _,
+            self.normalized as _,
+            self.stride,
+            self.pointer.cast_const(),
+        );
+        if self.enabled != 0 {
+            gles.EnableVertexAttribArray(self.index);
+        } else {
+            gles.DisableVertexAttribArray(self.index);
+        }
+    }
+}
+
 /// Convert a fixed-point scalar to a floating-point scalar.
 ///
 /// Beware: Rust's type checker won't complain if you mix up [GLfixed] with
@@ -324,13 +390,8 @@ pub fn try_decode_pvrtc(
 
     let upload_format = gles11::RGBA;
 
-    let pixels = crate::image::decode_pvrtc_with_alpha(
-        pvrtc_data,
-        is_2bit,
-        width_u,
-        height_u,
-        is_opaque,
-    );
+    let pixels =
+        crate::image::decode_pvrtc_with_alpha(pvrtc_data, is_2bit, width_u, height_u, is_opaque);
     unsafe {
         gles.TexImage2D(
             target,
@@ -596,6 +657,116 @@ impl PalettedTextureFormat {
                 palette_entry_type: gles11::UNSIGNED_SHORT_5_5_5_1,
             }),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod vertex_attrib_state_tests {
+    use super::VertexAttribState;
+    use crate::gles::gles11_raw::types::*;
+    use crate::gles::gles2_raw as gl;
+    use crate::gles::GLES;
+
+    // Models GL's per-attribute buffer capture, rather than treating the
+    // global ARRAY_BUFFER binding as the source for every attribute.
+    struct ArrayDriver {
+        buffer: GLuint,
+        arrays: [VertexAttribState; 2],
+    }
+
+    impl GLES for ArrayDriver {
+        unsafe fn GetVertexAttribiv(&mut self, index: GLuint, pname: GLenum, value: *mut GLint) {
+            let a = &self.arrays[index as usize];
+            *value = match pname {
+                gl::VERTEX_ATTRIB_ARRAY_ENABLED => a.enabled,
+                gl::VERTEX_ATTRIB_ARRAY_BUFFER_BINDING => a.buffer,
+                gl::VERTEX_ATTRIB_ARRAY_SIZE => a.size,
+                gl::VERTEX_ATTRIB_ARRAY_STRIDE => a.stride,
+                gl::VERTEX_ATTRIB_ARRAY_TYPE => a.type_,
+                gl::VERTEX_ATTRIB_ARRAY_NORMALIZED => a.normalized,
+                _ => panic!("unexpected attribute query"),
+            };
+        }
+        unsafe fn GetVertexAttribPointerv(
+            &mut self,
+            index: GLuint,
+            pname: GLenum,
+            pointer: *mut *mut GLvoid,
+        ) {
+            assert_eq!(pname, gl::VERTEX_ATTRIB_ARRAY_POINTER);
+            *pointer = self.arrays[index as usize].pointer;
+        }
+        unsafe fn BindBuffer(&mut self, target: GLenum, buffer: GLuint) {
+            assert_eq!(target, gl::ARRAY_BUFFER);
+            self.buffer = buffer;
+        }
+        unsafe fn VertexAttribPointer(
+            &mut self,
+            index: GLuint,
+            size: GLint,
+            type_: GLenum,
+            normalized: GLboolean,
+            stride: GLsizei,
+            pointer: *const GLvoid,
+        ) {
+            let a = &mut self.arrays[index as usize];
+            a.buffer = self.buffer as GLint;
+            a.size = size;
+            a.type_ = type_ as GLint;
+            a.normalized = normalized as GLint;
+            a.stride = stride;
+            a.pointer = pointer.cast_mut();
+        }
+        unsafe fn EnableVertexAttribArray(&mut self, index: GLuint) {
+            self.arrays[index as usize].enabled = 1;
+        }
+        unsafe fn DisableVertexAttribArray(&mut self, index: GLuint) {
+            self.arrays[index as usize].enabled = 0;
+        }
+    }
+
+    #[test]
+    fn internal_quad_preserves_cached_mesh_and_uv_arrays() {
+        let mut driver = ArrayDriver {
+            buffer: 99,
+            arrays: [
+                VertexAttribState {
+                    index: 0,
+                    enabled: 1,
+                    buffer: 7,
+                    size: 3,
+                    stride: 32,
+                    type_: gl::FLOAT as _,
+                    normalized: 0,
+                    pointer: 12usize as _,
+                },
+                VertexAttribState {
+                    index: 1,
+                    enabled: 0,
+                    buffer: 0,
+                    size: 2,
+                    stride: 8,
+                    type_: gl::UNSIGNED_SHORT as _,
+                    normalized: 1,
+                    pointer: 0x1234usize as _,
+                },
+            ],
+        };
+        unsafe {
+            let saved = [0, 1].map(|index| VertexAttribState::capture(&mut driver, index));
+            driver.BindBuffer(gl::ARRAY_BUFFER, 55);
+            for index in [0, 1] {
+                driver.EnableVertexAttribArray(index);
+                driver.VertexAttribPointer(index, 2, gl::FLOAT, gl::FALSE, 16, std::ptr::null());
+            }
+            assert_ne!(driver.arrays, saved);
+            for array in &saved {
+                array.restore(&mut driver);
+            }
+            driver.BindBuffer(gl::ARRAY_BUFFER, 99);
+            assert_eq!(driver.arrays, saved);
+            assert_eq!(driver.buffer, 99);
         }
     }
 }

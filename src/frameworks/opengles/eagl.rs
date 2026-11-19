@@ -2053,15 +2053,10 @@ unsafe fn present_renderbuffer_es2(
         return;
     };
 
-    // The presenter only changes the two attributes it owns. Querying all 16
-    // slots on every frame is unnecessary driver traffic.
-    let attribute_slots = [program.a_pos as GLuint, program.a_uv as GLuint];
-    let mut attrib_was_enabled = [0u8; 2];
-    for (slot, &attribute) in attrib_was_enabled.iter_mut().zip(attribute_slots.iter()) {
-        let mut v: GLint = 0;
-        gles.GetVertexAttribiv(attribute, gles2::VERTEX_ATTRIB_ARRAY_ENABLED, &mut v);
-        *slot = v as u8;
-    }
+    // Engines cache attribute pointers between draws. Restoring only the
+    // enabled flags leaves their UV/position arrays pointing at our quad VBO.
+    let attrib_states = [program.a_pos as GLuint, program.a_uv as GLuint]
+        .map(|index| crate::gles::util::VertexAttribState::capture(gles, index));
 
     gles.UseProgram(program.program);
     gles.Uniform1i(program.u_tex, 0);
@@ -2135,13 +2130,8 @@ unsafe fn present_renderbuffer_es2(
         let _ = pressed;
     }
 
-    // Restore vertex attribute enabled state so the app's next draw works.
-    for (&attribute, &was) in attribute_slots.iter().zip(attrib_was_enabled.iter()) {
-        if was != 0 {
-            gles.EnableVertexAttribArray(attribute);
-        } else {
-            gles.DisableVertexAttribArray(attribute);
-        }
+    for state in &attrib_states {
+        state.restore(gles);
     }
 
     // Restore state we touched
