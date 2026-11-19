@@ -65,6 +65,7 @@ pub struct CFSocketContext {
 }
 unsafe impl SafeRead for CFSocketContext {}
 
+#[derive(Default)]
 struct CFSocketHostObject {
     native_handle: CFSocketNativeHandle,
     valid: bool,
