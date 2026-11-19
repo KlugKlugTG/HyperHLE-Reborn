@@ -148,6 +148,20 @@ impl<'a> GLES for LoggingGLES<'a> {
     fn is_gles1_on_gl2(&self) -> bool {
         self.inner.is_gles1_on_gl2()
     }
+    // The logging wrapper must forward every capability query: profiles such
+    // as ES 2.0 are selected from these, not from the raw GL strings.
+    fn is_es2(&self) -> bool {
+        self.inner.is_es2()
+    }
+    fn is_es3(&self) -> bool {
+        self.inner.is_es3()
+    }
+    fn is_translator(&self) -> bool {
+        self.inner.is_translator()
+    }
+    fn pvrtc_native(&self) -> bool {
+        self.inner.pvrtc_native()
+    }
     fn discard_ext_supported(&self) -> bool {
         self.inner.discard_ext_supported()
     }
