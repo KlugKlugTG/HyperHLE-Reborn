@@ -487,64 +487,132 @@ fn wcstombs(
     i
 }
 
-/// wcstol — wide string to long.
+/// Parse the integer prefix, leaving endptr at the first unconsumed wchar.
+/// UE3 passes values such as L"4096,LODBias=1" here when reading texture LODs.
+/// <https://github.com/apple-oss-distributions/Libc/blob/main/locale/FreeBSD/wcstoul.c>
+/// <https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/wcstol.3.html>
+fn wide_integer(
+    env: &mut Environment,
+    s: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    base: i32,
+    signed: bool,
+) -> u32 {
+    use super::errno::{set_errno, EINVAL, ERANGE};
+    if base != 0 && !(2..=36).contains(&base) {
+        if !endptr.is_null() {
+            env.mem.write(endptr, s.cast_mut());
+        }
+        set_errno(env, EINVAL);
+        return 0;
+    }
+    let mut i: GuestUSize = 0;
+    while matches!(env.mem.read(s + i), 9..=13 | 32) {
+        i += 1;
+    }
+    let negative = env.mem.read(s + i) == b'-' as wchar_t;
+    if negative || env.mem.read(s + i) == b'+' as wchar_t {
+        i += 1;
+    }
+    let mut base = base as u32;
+    if (base == 0 || base == 16)
+        && env.mem.read(s + i) == b'0' as wchar_t
+        && matches!(env.mem.read(s + i + 1), 120 | 88)
+    {
+        base = 16;
+        i += 2;
+    }
+    if base == 0 {
+        base = if env.mem.read(s + i) == b'0' as wchar_t {
+            8
+        } else {
+            10
+        };
+    }
+    let limit = if signed {
+        i32::MAX as u32 + u32::from(negative)
+    } else {
+        u32::MAX
+    };
+    let first_digit = i;
+    let mut value = 0u32;
+    let mut overflow = false;
+    loop {
+        let c = env.mem.read(s + i);
+        let digit = match c {
+            48..=57 => (c - 48) as u32,
+            65..=90 => (c - 65 + 10) as u32,
+            97..=122 => (c - 97 + 10) as u32,
+            _ => break,
+        };
+        if digit >= base {
+            break;
+        }
+        if value > limit / base || (value == limit / base && digit > limit % base) {
+            overflow = true;
+        } else if !overflow {
+            value = value * base + digit;
+        }
+        i += 1;
+    }
+    if !endptr.is_null() {
+        let consumed = if i == first_digit { 0 } else { i };
+        env.mem.write(endptr, (s + consumed).cast_mut());
+    }
+    if overflow {
+        set_errno(env, ERANGE);
+        if signed && negative {
+            limit.wrapping_neg()
+        } else {
+            limit
+        }
+    } else if i == first_digit {
+        set_errno(env, EINVAL);
+        0
+    } else if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    }
+}
+
+/// wcstol — wide string to signed 32-bit long (the guest's ABI).
 fn wcstol(
     env: &mut Environment,
     s: ConstPtr<wchar_t>,
     endptr: MutPtr<MutPtr<wchar_t>>,
     base: i32,
 ) -> i32 {
-    // Convert to a narrow string then parse.
-    let mut buf = String::new();
-    let mut i: GuestUSize = 0;
-    loop {
-        let wc = env.mem.read(s + i);
-        if wc == 0 || wc > 0x7F {
-            break;
-        }
-        buf.push(wc as u8 as char);
-        i += 1;
-    }
-    let buf = buf.trim();
-    let result = if base == 0 || base == 10 {
-        buf.parse::<i32>().unwrap_or(0)
-    } else if base == 16 {
-        i32::from_str_radix(buf.trim_start_matches("0x"), 16).unwrap_or(0)
-    } else {
-        i32::from_str_radix(buf, base as u32).unwrap_or(0)
-    };
-    if !endptr.is_null() {
-        env.mem.write(endptr, (s + i).cast_mut());
-    }
-    result
+    wide_integer(env, s, endptr, base, true) as i32
 }
 
-/// wcstoul — wide string to unsigned long.
+/// wcstoul — wide string to unsigned 32-bit long.
 fn wcstoul(
     env: &mut Environment,
     s: ConstPtr<wchar_t>,
     endptr: MutPtr<MutPtr<wchar_t>>,
     base: i32,
 ) -> u32 {
-    wcstol(env, s, endptr, base) as u32
+    wide_integer(env, s, endptr, base, false)
 }
 
-/// wcstod — wide string to double.
+/// wcstod — use the same numeric-prefix scanner as narrow strtod.
 fn wcstod(env: &mut Environment, s: ConstPtr<wchar_t>, endptr: MutPtr<MutPtr<wchar_t>>) -> f64 {
-    let mut buf = String::new();
-    let mut i: GuestUSize = 0;
-    loop {
-        let wc = env.mem.read(s + i);
-        if wc == 0 || wc > 0x7F {
-            break;
-        }
-        buf.push(wc as u8 as char);
-        i += 1;
-    }
+    let (result, consumed) = super::stdlib::atof_inner_generic(
+        env,
+        |env, s, index| {
+            let c: wchar_t = env.mem.read(s + index);
+            Ok(u8::try_from(c).ok().filter(u8::is_ascii).unwrap_or(0))
+        },
+        |_, _, _| (),
+        s.cast_mut(),
+        0,
+    )
+    .unwrap_or((0.0, 0));
     if !endptr.is_null() {
-        env.mem.write(endptr, (s + i).cast_mut());
+        env.mem.write(endptr, (s + consumed).cast_mut());
     }
-    buf.trim().parse::<f64>().unwrap_or(0.0)
+    result
 }
 
 /// wcstof — wide string to float.
