@@ -27,7 +27,7 @@
 
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
-use crate::libc::errno::{set_errno, EINVAL};
+use crate::libc::errno::{set_errno, EINTR, EINVAL};
 use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::Environment;
 use std::collections::HashMap;
@@ -476,12 +476,20 @@ fn sigaltstack(env: &mut Environment, _ss: ConstVoidPtr, _old_ss: MutVoidPtr) ->
     0
 }
 
+// `int pause(void)` — suspend until a signal arrives. There is no signal
+// delivery thread, so report EINTR immediately rather than hanging the guest.
+fn pause(env: &mut Environment) -> i32 {
+    set_errno(env, EINTR);
+    -1
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(sigaction(_, _, _)),
     export_c_func!(signal(_, _)),
     export_c_func!(raise(_)),
     export_c_func!(sigprocmask(_, _, _)), // Строго 3 аргумента (how, set, old_set)
     export_c_func!(sigaltstack(_, _)),    // Строго 2 аргумента (ss, old_ss)
+    export_c_func!(pause()),
 ];
 
 /// Name of `signum` for logging, matching `_sys_siglist` below.

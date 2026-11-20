@@ -187,6 +187,25 @@ fn fopen(env: &mut Environment, filename: ConstPtr<u8>, mode: ConstPtr<u8>) -> M
     }
 }
 
+/// `FILE *fdopen(int fd, const char *mode)` — wrap an already-open
+/// descriptor. The mode string is advisory here; the descriptor's flags were
+/// fixed at open() time.
+fn fdopen(env: &mut Environment, fd: posix_io::FileDescriptor, _mode: ConstPtr<u8>) -> MutPtr<FILE> {
+    if fd < 0 {
+        set_errno(env, EBADF);
+        return Ptr::null();
+    }
+    let res = env.mem.alloc_and_write(FILE { fd });
+    State::get_mut(env).file_streams.insert(
+        res,
+        FILEHostObject {
+            pushbacks: Vec::new(),
+            error: false,
+        },
+    );
+    res
+}
+
 fn freopen(
     env: &mut Environment,
     filename: ConstPtr<u8>,
@@ -1073,6 +1092,7 @@ pub const CONSTANTS: ConstantExports = &[
 pub const FUNCTIONS: FunctionExports = &[
     // Standard C functions
     export_c_func!(fopen(_, _)),
+    export_c_func!(fdopen(_, _)),
     export_c_func!(freopen(_, _, _)),
     export_c_func!(fread(_, _, _, _)),
     export_c_func!(fgetc(_)),

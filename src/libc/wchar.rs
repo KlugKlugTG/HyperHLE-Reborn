@@ -6,7 +6,7 @@
 //! `wchar.h`
 
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::mem::{ConstPtr, GuestUSize, MutPtr};
+use crate::mem::{ConstPtr, GuestUSize, MutPtr, MutVoidPtr};
 use crate::Environment;
 
 use super::generic_char::GenericChar;
@@ -596,6 +596,52 @@ fn wcstoul(
     wide_integer(env, s, endptr, base, false)
 }
 
+/// wcstoll — wide string to signed 64-bit integer.
+fn wcstoll(
+    env: &mut Environment,
+    s: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    base: i32,
+) -> i64 {
+    let mut buf = String::new();
+    let mut i: GuestUSize = 0;
+    loop {
+        let wc = env.mem.read(s + i);
+        if wc == 0 || wc > 0x7F {
+            break;
+        }
+        buf.push(wc as u8 as char);
+        i += 1;
+    }
+    let buf = buf.trim();
+    let result = if base == 0 || base == 10 {
+        buf.parse::<i64>().unwrap_or(0)
+    } else if base == 16 {
+        i64::from_str_radix(buf.trim_start_matches("0x"), 16).unwrap_or(0)
+    } else {
+        i64::from_str_radix(buf, base as u32).unwrap_or(0)
+    };
+    if !endptr.is_null() {
+        env.mem.write(endptr, (s + i).cast_mut());
+    }
+    result
+}
+
+/// wcstoull — wide string to unsigned 64-bit integer.
+fn wcstoull(
+    env: &mut Environment,
+    s: ConstPtr<wchar_t>,
+    endptr: MutPtr<MutPtr<wchar_t>>,
+    base: i32,
+) -> u64 {
+    wcstoll(env, s, endptr, base) as u64
+}
+
+/// wcstold — wide string to long double (represented as f64).
+fn wcstold(env: &mut Environment, s: ConstPtr<wchar_t>, endptr: MutPtr<MutPtr<wchar_t>>) -> f64 {
+    wcstod(env, s, endptr)
+}
+
 /// wcstod — use the same numeric-prefix scanner as narrow strtod.
 fn wcstod(env: &mut Environment, s: ConstPtr<wchar_t>, endptr: MutPtr<MutPtr<wchar_t>>) -> f64 {
     let (result, consumed) = super::stdlib::atof_inner_generic(
@@ -618,6 +664,184 @@ fn wcstod(env: &mut Environment, s: ConstPtr<wchar_t>, endptr: MutPtr<MutPtr<wch
 /// wcstof — wide string to float.
 fn wcstof(env: &mut Environment, s: ConstPtr<wchar_t>, endptr: MutPtr<MutPtr<wchar_t>>) -> f32 {
     wcstod(env, s, endptr) as f32
+}
+
+// MARK: - xlocale.h wide-character variants
+// touchHLE has a single C/ASCII locale, so the locale argument is ignored.
+
+fn wcrtomb_l(
+    env: &mut Environment,
+    s: MutPtr<u8>,
+    wc: wchar_t,
+    _ps: MutVoidPtr,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    if s.is_null() {
+        return 1;
+    }
+    if !(0..=0x7F).contains(&wc) {
+        return GuestUSize::MAX; // (size_t)-1
+    }
+    env.mem.write(s, wc as u8);
+    1
+}
+
+fn mbrtowc_l(
+    env: &mut Environment,
+    pwc: MutPtr<wchar_t>,
+    s: ConstPtr<u8>,
+    n: GuestUSize,
+    _ps: MutVoidPtr,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    if s.is_null() {
+        if !pwc.is_null() {
+            env.mem.write(pwc, 0);
+        }
+        return 0;
+    }
+    if n == 0 {
+        return GuestUSize::MAX - 1; // (size_t)-2
+    }
+    let c = env.mem.read(s);
+    if c == 0 {
+        if !pwc.is_null() {
+            env.mem.write(pwc, 0);
+        }
+        return 0;
+    }
+    if c > 0x7F {
+        return GuestUSize::MAX;
+    }
+    if !pwc.is_null() {
+        env.mem.write(pwc, c as wchar_t);
+    }
+    1
+}
+
+fn mbrlen_l(
+    env: &mut Environment,
+    s: ConstPtr<u8>,
+    n: GuestUSize,
+    ps: MutVoidPtr,
+    loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    mbrtowc_l(env, MutPtr::null(), s, n, ps, loc)
+}
+
+fn btowc_l(env: &mut Environment, c: i32, _loc: crate::libc::clocale::locale_t) -> wint_t {
+    btowc(env, c)
+}
+
+fn wctob_l(env: &mut Environment, c: wint_t, _loc: crate::libc::clocale::locale_t) -> i32 {
+    wctob(env, c)
+}
+
+fn mbsnrtowcs_l(
+    env: &mut Environment,
+    dest: MutPtr<wchar_t>,
+    src: MutPtr<ConstPtr<u8>>,
+    nms: GuestUSize,
+    len: GuestUSize,
+    _ps: MutVoidPtr,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    if src.is_null() || env.mem.read(src).is_null() {
+        return 0;
+    }
+    let mut input = env.mem.read(src);
+    let mut written = 0;
+    while written < len && (written as GuestUSize) < nms {
+        let c = env.mem.read(input);
+        input += 1;
+        if c == 0 {
+            env.mem.write(src, ConstPtr::null());
+            return written;
+        }
+        if dest.is_null() {
+            written += 1;
+            continue;
+        }
+        env.mem.write(dest + written, c as wchar_t);
+        written += 1;
+    }
+    env.mem.write(src, input);
+    written
+}
+
+fn wcsnrtombs_l(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    src: MutPtr<ConstPtr<wchar_t>>,
+    nwc: GuestUSize,
+    len: GuestUSize,
+    _ps: MutVoidPtr,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    if src.is_null() || env.mem.read(src).is_null() {
+        return 0;
+    }
+    let mut input = env.mem.read(src);
+    let mut written = 0;
+    while written < len && (written as GuestUSize) < nwc {
+        let c = env.mem.read(input);
+        input += 1;
+        if c == 0 {
+            if !dest.is_null() {
+                env.mem.write(dest + written, 0);
+            }
+            env.mem.write(src, ConstPtr::null());
+            return written;
+        }
+        if !(0..=0x7F).contains(&c) {
+            return GuestUSize::MAX;
+        }
+        if dest.is_null() {
+            written += 1;
+            continue;
+        }
+        env.mem.write(dest + written, c as u8);
+        written += 1;
+    }
+    env.mem.write(src, input);
+    written
+}
+
+fn wcscoll_l(
+    env: &mut Environment,
+    a: ConstPtr<wchar_t>,
+    b: ConstPtr<wchar_t>,
+    _loc: crate::libc::clocale::locale_t,
+) -> i32 {
+    let mut i: GuestUSize = 0;
+    loop {
+        let ca = env.mem.read(a + i);
+        let cb = env.mem.read(b + i);
+        if ca != cb || ca == 0 {
+            return ca - cb;
+        }
+        i += 1;
+    }
+}
+
+fn wcsxfrm_l(
+    env: &mut Environment,
+    dest: MutPtr<wchar_t>,
+    src: ConstPtr<wchar_t>,
+    n: GuestUSize,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    let mut i: GuestUSize = 0;
+    loop {
+        let c = env.mem.read(src + i);
+        if !dest.is_null() && i + 1 < n {
+            env.mem.write(dest + i, c);
+        }
+        if c == 0 {
+            return i;
+        }
+        i += 1;
+    }
 }
 
 /// iswspace — test if wide char is whitespace.
@@ -816,6 +1040,18 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(wcstombs(_, _, _)),
     export_c_func!(wcstol(_, _, _)),
     export_c_func!(wcstoul(_, _, _)),
+    export_c_func!(wcstoll(_, _, _)),
+    export_c_func!(wcstoull(_, _, _)),
+    export_c_func!(wcstold(_, _)),
+    export_c_func!(wcrtomb_l(_, _, _, _)),
+    export_c_func!(mbrtowc_l(_, _, _, _, _)),
+    export_c_func!(mbrlen_l(_, _, _, _)),
+    export_c_func!(btowc_l(_, _)),
+    export_c_func!(wctob_l(_, _)),
+    export_c_func!(mbsnrtowcs_l(_, _, _, _, _, _)),
+    export_c_func!(wcsnrtombs_l(_, _, _, _, _, _)),
+    export_c_func!(wcscoll_l(_, _, _)),
+    export_c_func!(wcsxfrm_l(_, _, _, _)),
     export_c_func!(wcstod(_, _)),
     export_c_func!(wcstof(_, _)),
     // Classification

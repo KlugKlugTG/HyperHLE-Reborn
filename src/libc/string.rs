@@ -674,6 +674,56 @@ fn strcasestr(env: &mut Environment, haystack: MutPtr<u8>, needle: ConstPtr<u8>)
     Ptr::null()
 }
 
+// POSIX/Darwin path helper. Returns a pointer inside `path`; no allocation.
+fn basename(env: &mut Environment, path: MutPtr<u8>) -> MutPtr<u8> {
+    if path.is_null() {
+        return path;
+    }
+    let bytes = env.mem.cstr_at(path);
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1] == b'/' {
+        end -= 1;
+    }
+    if end == 0 {
+        return path + bytes.len() as GuestUSize;
+    }
+    let start = bytes[..end]
+        .iter()
+        .rposition(|&b| b == b'/')
+        .map_or(0, |i| i + 1);
+    path + start as GuestUSize
+}
+
+fn strcoll_l(
+    env: &mut Environment,
+    a: ConstPtr<u8>,
+    b: ConstPtr<u8>,
+    _loc: crate::libc::clocale::locale_t,
+) -> i32 {
+    let a = env.mem.cstr_at(a);
+    let b = env.mem.cstr_at(b);
+    a.cmp(b) as i32
+}
+
+fn strxfrm_l(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    src: ConstPtr<u8>,
+    n: GuestUSize,
+    _loc: crate::libc::clocale::locale_t,
+) -> GuestUSize {
+    let bytes = env.mem.cstr_at(src);
+    let len = bytes.len() as GuestUSize;
+    if !dest.is_null() && n > 0 {
+        let copy = (len as usize).min(n as usize - 1);
+        for (i, &byte) in bytes[..copy].iter().enumerate() {
+            env.mem.write(dest + i as GuestUSize, byte);
+        }
+        env.mem.write(dest + copy as GuestUSize, 0);
+    }
+    len
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(strtok(_, _)),
     export_c_func!(bzero(_, _)),
@@ -727,6 +777,9 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(explicit_bzero(_, _)),
     // strerror is exported from libc::errno; not duplicated here.
     export_c_func!(strerror_r(_, _, _)),
+    export_c_func!(strcoll_l(_, _, _)),
+    export_c_func!(strxfrm_l(_, _, _, _)),
+    export_c_func!(basename(_)),
     export_c_func!(bcopy(_, _, _)),
     export_c_func!(strnlen(_, _)),
     export_c_func!(strcasestr(_, _)),

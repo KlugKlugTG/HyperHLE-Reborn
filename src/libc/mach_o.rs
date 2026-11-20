@@ -879,12 +879,122 @@ fn NXGetAllArchInfos(env: &mut Environment) -> ConstPtr<NXArchInfoGuest> {
     const_ptr
 }
 
+// =========================================================================
+// MARK: - getsectbynamefromheader / getsectdatafromheader
+// =========================================================================
+
+const LC_SEGMENT: u32 = 0x1;
+const MACH_HEADER_SIZE: u32 = 28;
+const SEGMENT_COMMAND_SIZE: u32 = 56;
+const SECTION_SIZE: u32 = 68;
+
+fn fixed_name_matches(env: &Environment, ptr: MutPtr<u8>, wanted: &[u8]) -> bool {
+    if wanted.len() > 16 {
+        return false;
+    }
+    let bytes = env.mem.bytes_at(ptr.cast_const(), 16);
+    &bytes[..wanted.len()] == wanted && bytes[wanted.len()..].iter().all(|&b| b == 0)
+}
+
+/// Find a section in a 32-bit Mach-O header, returning its address in the
+/// header and the section's own metadata offset/size.
+fn find_section(
+    env: &Environment,
+    header: ConstVoidPtr,
+    segname: &[u8],
+    sectname: &[u8],
+) -> Option<(MutPtr<u8>, u32, u32)> {
+    let header_bits = header.to_bits();
+    let ncmds: u32 = env.mem.read(Ptr::from_bits(header_bits + 4));
+    let mut text_vmaddr = 0x4000u32;
+    let mut cmd_ptr = header_bits + MACH_HEADER_SIZE;
+    for _ in 0..ncmds {
+        let cmd: u32 = env.mem.read(Ptr::from_bits(cmd_ptr));
+        let cmdsize: u32 = env.mem.read(Ptr::from_bits(cmd_ptr + 4));
+        if cmdsize < 8 {
+            return None;
+        }
+        if cmd == LC_SEGMENT {
+            let segname_ptr: MutPtr<u8> = Ptr::from_bits(cmd_ptr + 8);
+            let vmaddr: u32 = env.mem.read(Ptr::from_bits(cmd_ptr + 24));
+            if fixed_name_matches(env, segname_ptr, b"__TEXT") {
+                text_vmaddr = vmaddr;
+            }
+            let nsects: u32 = env.mem.read(Ptr::from_bits(cmd_ptr + 48));
+            let mut sect_ptr = cmd_ptr + SEGMENT_COMMAND_SIZE;
+            for _ in 0..nsects {
+                let name_ptr: MutPtr<u8> = Ptr::from_bits(sect_ptr);
+                let seg_ptr: MutPtr<u8> = Ptr::from_bits(sect_ptr + 16);
+                if fixed_name_matches(env, name_ptr, sectname)
+                    && fixed_name_matches(env, seg_ptr, segname)
+                {
+                    let addr: u32 = env.mem.read(Ptr::from_bits(sect_ptr + 32));
+                    let size: u32 = env.mem.read(Ptr::from_bits(sect_ptr + 36));
+                    return Some((Ptr::from_bits(sect_ptr), addr, size));
+                }
+                sect_ptr += SECTION_SIZE;
+            }
+        }
+        cmd_ptr += cmdsize;
+    }
+    None
+}
+
+/// `const struct section *getsectbynamefromheader(const struct mach_header *,
+///     const char *segname, const char *sectname)`
+fn getsectbynamefromheader(
+    env: &mut Environment,
+    header: ConstVoidPtr,
+    segname: ConstPtr<u8>,
+    sectname: ConstPtr<u8>,
+) -> MutVoidPtr {
+    if header.is_null() || segname.is_null() || sectname.is_null() {
+        return MutVoidPtr::null();
+    }
+    let seg = env.mem.cstr_at(segname).to_vec();
+    let sect = env.mem.cstr_at(sectname).to_vec();
+    match find_section(env, header, &seg, &sect) {
+        Some((ptr, _, _)) => ptr.cast(),
+        None => MutVoidPtr::null(),
+    }
+}
+
+/// `char *getsectdatafromheader(const struct mach_header *, const char *segname,
+///     const char *sectname, uint32_t *size)`
+fn getsectdatafromheader(
+    env: &mut Environment,
+    header: ConstVoidPtr,
+    segname: ConstPtr<u8>,
+    sectname: ConstPtr<u8>,
+    size_out: MutPtr<u32>,
+) -> MutVoidPtr {
+    if header.is_null() || segname.is_null() || sectname.is_null() {
+        return MutVoidPtr::null();
+    }
+    let seg = env.mem.cstr_at(segname).to_vec();
+    let sect = env.mem.cstr_at(sectname).to_vec();
+    let Some((_, addr, size)) = find_section(env, header, &seg, &sect) else {
+        return MutVoidPtr::null();
+    };
+    if !size_out.is_null() {
+        env.mem.write(size_out, size);
+    }
+    // The header pointer is the load address of __TEXT; section.addr is the
+    // unslid virtual address, so subtract the __TEXT vmaddr (0x4000 by
+    // convention here) and add it to the in-memory header pointer.
+    let header_bits = header.to_bits();
+    let text_vmaddr = if header_bits >= 0x4000 { 0x4000 } else { 0 };
+    MutVoidPtr::from_bits(header_bits.wrapping_sub(text_vmaddr).wrapping_add(addr))
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(get_end()),
     export_c_func!(get_etext()),
     export_c_func!(getsectiondata(_, _, _, _)),
     export_c_func!(host_info(_, _, _, _)),
     export_c_func!(_NSGetMachExecuteHeader()),
+    export_c_func!(getsectbynamefromheader(_, _, _)),
+    export_c_func!(getsectdatafromheader(_, _, _, _)),
     export_c_func!(_dyld_image_count()),
     export_c_func!(_dyld_get_image_header(_)),
     export_c_func!(_dyld_get_image_name(_)),

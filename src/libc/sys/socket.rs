@@ -24,7 +24,7 @@ use crate::dyld::{export_c_func, FunctionExports};
 use crate::libc::errno::{
     get_errno, set_errno, EACCES, EADDRINUSE, EADDRNOTAVAIL, EAFNOSUPPORT, EAGAIN, EBADF,
     ECONNABORTED, ECONNREFUSED, ECONNRESET, EFAULT, EINVAL, EIO, EISCONN, ENETUNREACH,
-    ENOPROTOOPT, ENOTCONN, ENOTSUP, ENOTTY, EPROTONOSUPPORT, ESOCKTNOSUPPORT, ETIMEDOUT,
+    ENOPROTOOPT, ENOTCONN, ENOSYS, ENOTSUP, ENOTTY, EPROTONOSUPPORT, ESOCKTNOSUPPORT, ETIMEDOUT,
 };
 use crate::libc::posix_io::{
     close, find_or_create_socket, is_nonblocking, is_socket, set_nonblocking, FileDescriptor,
@@ -2250,6 +2250,25 @@ fn __darwin_check_fd_set_overflow(
     ((bytes[byte_index as usize] >> (fd % 8)) & 1) as i32
 }
 
+/// `char *link_ntoa(const struct sockaddr_dl *sdl)` — render a link-layer
+/// address. touchHLE has no interface table, so return the loopback name.
+fn link_ntoa(env: &mut Environment, _sdl: ConstVoidPtr) -> MutPtr<u8> {
+    env.mem.alloc_and_write_cstr(b"lo0")
+}
+
+/// `int socketpair(int domain, int type, int protocol, int sv[2])` — touchHLE's
+// socket layer only models TCP/UDP host sockets, not AF_UNIX pairs.
+fn socketpair(
+    env: &mut Environment,
+    _domain: i32,
+    _type: i32,
+    _protocol: i32,
+    _sv: MutPtr<i32>,
+) -> i32 {
+    set_errno(env, ENOSYS);
+    -1
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(socket(_, _, _)),
     export_c_func!(__darwin_check_fd_set_overflow(_, _, _)),
@@ -2268,6 +2287,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(shutdown(_, _)),
     export_c_func!(getsockname(_, _, _)),
     export_c_func!(getpeername(_, _, _)),
+    export_c_func!(socketpair(_, _, _, _)),
+    export_c_func!(link_ntoa(_)),
 ];
 
 /// A helper to close a socket, not a part of API

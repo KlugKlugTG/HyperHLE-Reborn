@@ -219,6 +219,22 @@ pub const CONSTANTS: ConstantExports = &[(
     HostConstant::Custom(get_default_rune_locale),
 )];
 
+// `xlocale.h` variants used by libc++. touchHLE only supports the C locale,
+// so the `locale_t` argument is ignored.
+fn __maskrune_l(env: &mut Environment, rune: i32, mask: u32, _loc: MutVoidPtr) -> i32 {
+    __maskrune(env, rune, mask)
+}
+fn ___mb_cur_max_l(_env: &mut Environment, _loc: MutVoidPtr) -> i32 {
+    // The guest locale is ASCII/C, so one byte per character.
+    1
+}
+fn ___toupper_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    __toupper(env, c)
+}
+fn ___tolower_l(env: &mut Environment, c: i32, _loc: MutVoidPtr) -> i32 {
+    __tolower(env, c)
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(isalnum(_)),
     export_c_func!(isalpha(_)),
@@ -236,6 +252,10 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(toupper(_)),
     export_c_func!(__tolower(_)),
     export_c_func!(__toupper(_)),
+    export_c_func!(__maskrune_l(_, _, _)),
+    export_c_func!(___mb_cur_max_l(_)),
+    export_c_func!(___toupper_l(_, _)),
+    export_c_func!(___tolower_l(_, _)),
     export_c_func!(__maskrune(_, _)),
 ];
 

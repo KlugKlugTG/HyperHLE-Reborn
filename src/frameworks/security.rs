@@ -13,7 +13,7 @@ use crate::frameworks::core_foundation::cf_data::CFDataRef;
 use crate::frameworks::core_foundation::cf_dictionary::CFDictionaryRef;
 use crate::frameworks::core_foundation::cf_string::CFStringRef;
 use crate::frameworks::core_foundation::CFTypeRef;
-use crate::mem::{ConstVoidPtr, MutPtr, MutVoidPtr};
+use crate::mem::{ConstVoidPtr, GuestUSize, MutPtr, MutVoidPtr};
 use crate::objc::nil;
 use crate::Environment;
 
@@ -1009,7 +1009,154 @@ pub const CONSTANTS: ConstantExports = &[
 // MARK: - FUNCTIONS
 // =========================================================================
 
+// =========================================================================
+// MARK: - SecureTransport (SSL)
+// =========================================================================
+//
+// XCom and other games import the SecureTransport C API directly. touchHLE
+// has no TLS implementation, so these entry points provide a valid opaque
+// context and fail connections fast instead of leaving callers stuck in a
+// handshake that can never complete.
+
+type SSLContextRef = MutVoidPtr;
+const ERR_SSL_CLOSED_ABORT: OSStatus = -9806;
+
+fn SSLCreateContext(
+    env: &mut Environment,
+    _alloc: CFTypeRef,
+    _protocol_side: i32,
+    _connection_type: i32,
+) -> SSLContextRef {
+    env.mem.alloc(4).cast()
+}
+
+fn SSLSetIOFuncs(
+    _env: &mut Environment,
+    _ctx: SSLContextRef,
+    _read: MutVoidPtr,
+    _write: MutVoidPtr,
+) -> OSStatus {
+    0
+}
+fn SSLSetConnection(_env: &mut Environment, _ctx: SSLContextRef, _conn: MutVoidPtr) -> OSStatus {
+    0
+}
+fn SSLSetPeerDomainName(
+    _env: &mut Environment,
+    _ctx: SSLContextRef,
+    _name: ConstVoidPtr,
+    _len: GuestUSize,
+) -> OSStatus {
+    0
+}
+fn SSLSetSessionOption(
+    _env: &mut Environment,
+    _ctx: SSLContextRef,
+    _option: i32,
+    _value: bool,
+) -> OSStatus {
+    0
+}
+fn SSLSetProtocolVersionMin(_env: &mut Environment, _ctx: SSLContextRef, _v: i32) -> OSStatus {
+    0
+}
+fn SSLSetProtocolVersionMax(_env: &mut Environment, _ctx: SSLContextRef, _v: i32) -> OSStatus {
+    0
+}
+fn SSLHandshake(_env: &mut Environment, _ctx: SSLContextRef) -> OSStatus {
+    ERR_SSL_CLOSED_ABORT
+}
+fn SSLRead(
+    env: &mut Environment,
+    _ctx: SSLContextRef,
+    _buf: MutVoidPtr,
+    _len: GuestUSize,
+    processed: MutPtr<GuestUSize>,
+) -> OSStatus {
+    if !processed.is_null() {
+        env.mem.write(processed, 0);
+    }
+    ERR_SSL_CLOSED_ABORT
+}
+fn SSLWrite(
+    env: &mut Environment,
+    _ctx: SSLContextRef,
+    _buf: ConstVoidPtr,
+    _len: GuestUSize,
+    processed: MutPtr<GuestUSize>,
+) -> OSStatus {
+    if !processed.is_null() {
+        env.mem.write(processed, 0);
+    }
+    ERR_SSL_CLOSED_ABORT
+}
+fn SSLGetBufferedReadSize(
+    env: &mut Environment,
+    _ctx: SSLContextRef,
+    size: MutPtr<GuestUSize>,
+) -> OSStatus {
+    if !size.is_null() {
+        env.mem.write(size, 0);
+    }
+    0
+}
+fn SSLGetSessionState(env: &mut Environment, _ctx: SSLContextRef, state: MutPtr<i32>) -> OSStatus {
+    if !state.is_null() {
+        env.mem.write(state, 0);
+    }
+    0
+}
+fn SSLGetNegotiatedCipher(
+    env: &mut Environment,
+    _ctx: SSLContextRef,
+    cipher: MutPtr<u32>,
+) -> OSStatus {
+    if !cipher.is_null() {
+        env.mem.write(cipher, 0);
+    }
+    0
+}
+fn SSLGetNegotiatedProtocolVersion(
+    env: &mut Environment,
+    _ctx: SSLContextRef,
+    version: MutPtr<i32>,
+) -> OSStatus {
+    if !version.is_null() {
+        env.mem.write(version, 0);
+    }
+    0
+}
+fn SSLCopyPeerTrust(
+    env: &mut Environment,
+    _ctx: SSLContextRef,
+    trust: MutPtr<CFTypeRef>,
+) -> OSStatus {
+    if !trust.is_null() {
+        env.mem.write(trust, nil);
+    }
+    ERR_SEC_PARAM
+}
+fn SSLClose(_env: &mut Environment, _ctx: SSLContextRef) -> OSStatus {
+    0
+}
+
 pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(SSLCreateContext(_, _, _)),
+    export_c_func!(SSLSetIOFuncs(_, _, _)),
+    export_c_func!(SSLSetConnection(_, _)),
+    export_c_func!(SSLSetPeerDomainName(_, _, _)),
+    export_c_func!(SSLSetSessionOption(_, _, _)),
+    export_c_func!(SSLSetProtocolVersionMin(_, _)),
+    export_c_func!(SSLSetProtocolVersionMax(_, _)),
+    export_c_func!(SSLHandshake(_)),
+    export_c_func!(SSLRead(_, _, _, _)),
+    export_c_func!(SSLWrite(_, _, _, _)),
+    export_c_func!(SSLGetBufferedReadSize(_, _)),
+    export_c_func!(SSLGetSessionState(_, _)),
+    export_c_func!(SSLGetNegotiatedCipher(_, _)),
+    export_c_func!(SSLGetNegotiatedProtocolVersion(_, _)),
+    export_c_func!(SSLCopyPeerTrust(_, _)),
+    export_c_func!(SSLClose(_)),
     // SecItem
     export_c_func!(SecItemCopyMatching(_, _)),
     export_c_func!(SecItemAdd(_, _)),

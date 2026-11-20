@@ -2194,6 +2194,26 @@ fn sscanf(env: &mut Environment, src: ConstPtr<u8>, format: ConstPtr<u8>, args: 
     sscanf_common(env, src, format, args.start())
 }
 
+fn asprintf_l(
+    env: &mut Environment,
+    ret: MutPtr<MutPtr<u8>>,
+    _loc: MutVoidPtr,
+    format: ConstPtr<u8>,
+    args: DotDotDot,
+) -> i32 {
+    asprintf(env, ret, format, args)
+}
+
+fn sscanf_l(
+    env: &mut Environment,
+    src: ConstPtr<u8>,
+    _loc: MutVoidPtr,
+    format: ConstPtr<u8>,
+    args: DotDotDot,
+) -> i32 {
+    sscanf(env, src, format, args)
+}
+
 fn swscanf(
     env: &mut Environment,
     ws: ConstPtr<wchar_t>,
@@ -2432,6 +2452,8 @@ fn NSLogv(env: &mut Environment, format: id, arg: VaList) -> i32 {
 
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(sscanf(_, _, _)),
+    export_c_func!(sscanf_l(_, _, _, _)),
+    export_c_func!(asprintf_l(_, _, _, _)),
     export_c_func!(swscanf(_, _, _)),
     export_c_func!(vsscanf(_, _, _)),
     export_c_func!(fscanf(_, _, _)),

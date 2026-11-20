@@ -156,6 +156,29 @@ fn nl_langinfo_l(env: &mut Environment, item: i32, _locale: locale_t) -> ConstPt
     nl_langinfo(env, item)
 }
 
+// MARK: - Message catalogs
+// There is no catalog database, so catopen hands out a sentinel and catgets
+// always returns the caller's fallback string (the documented default when a
+// message is missing).
+
+fn catopen(_env: &mut Environment, _name: ConstPtr<u8>, _oflag: i32) -> MutVoidPtr {
+    MutVoidPtr::from_bits(1)
+}
+
+fn catgets(
+    _env: &mut Environment,
+    _catalog: MutVoidPtr,
+    _set_id: i32,
+    _msg_id: i32,
+    default: ConstPtr<u8>,
+) -> ConstPtr<u8> {
+    default
+}
+
+fn catclose(_env: &mut Environment, _catalog: MutVoidPtr) -> i32 {
+    0
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(setlocale(_, _)),
     export_c_func!(newlocale(_, _, _)),
@@ -166,4 +189,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(localeconv_l(_)),
     export_c_func!(nl_langinfo(_)),
     export_c_func!(nl_langinfo_l(_, _)),
+    export_c_func!(catopen(_, _)),
+    export_c_func!(catgets(_, _, _, _)),
+    export_c_func!(catclose(_)),
 ];

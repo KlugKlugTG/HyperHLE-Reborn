@@ -13,7 +13,7 @@ use crate::libc::errno::{
     EPERM,
 };
 use crate::libc::posix_io::{FileDescriptor, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
-use crate::mem::{ConstPtr, GuestISize, GuestUSize, MutPtr, PAGE_SIZE};
+use crate::mem::{ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, MutPtr, PAGE_SIZE};
 use crate::Environment;
 use std::time::Duration;
 
@@ -509,6 +509,40 @@ fn sysconf(_env: &mut Environment, name: SysConfName) -> i32 {
     }
 }
 
+/// `int execl(const char *path, const char *arg, ...)`
+///
+/// touchHLE cannot start a new process, so report ENOSYS. The variadic
+/// arguments are deliberately not inspected.
+fn execl(
+    env: &mut Environment,
+    path: ConstPtr<u8>,
+    _arg0: ConstPtr<u8>,
+    _args: DotDotDot,
+) -> i32 {
+    log!(
+        "Warning: execl({:?}) unsupported; returning -1/ENOSYS",
+        env.mem.cstr_at_utf8(path).unwrap_or_default()
+    );
+    set_errno(env, ENOSYS);
+    -1
+}
+
+/// `int kill(pid_t pid, int sig)` — there is only one guest process, so
+/// signal delivery is a successful no-op.
+fn kill(_env: &mut Environment, _pid: i32, _sig: i32) -> i32 {
+    0
+}
+
+/// `int utimes(const char *path, const struct timeval times[2])` — the guest
+/// filesystem is virtual and timestamps are not persisted.
+fn utimes(env: &mut Environment, path: ConstPtr<u8>, _times: ConstVoidPtr) -> i32 {
+    if path.is_null() {
+        set_errno(env, EFAULT);
+        return -1;
+    }
+    0
+}
+
 fn pipe(env: &mut Environment, fds: MutPtr<FileDescriptor>) -> i32 {
     if fds.is_null() {
         set_errno(env, EFAULT);
@@ -667,6 +701,9 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(getdtablesize()),
     export_c_func!(sysconf(_)),
     export_c_func!(pipe(_)),
+    export_c_func!(execl(_, _, _)),
+    export_c_func!(kill(_, _)),
+    export_c_func!(utimes(_, _)),
     export_c_func!(fork()),
     export_c_func!(sbrk(_)),
     export_c_func!(chmod(_, _)),

@@ -603,6 +603,30 @@ fn CGContextMoveToPoint(env: &mut Environment, context: CGContextRef, x: CGFloat
 fn CGContextAddLineToPoint(env: &mut Environment, context: CGContextRef, x: CGFloat, y: CGFloat) {
     append_path_element(env, context, super::cg_path::PathElement::LineTo(CGPoint { x, y }));
 }
+/// `void CGContextStrokeLineSegments(CGContextRef c, const CGPoint points[],
+///     size_t count)` — each consecutive pair of points is an independent
+/// segment. Build them as one path and stroke once.
+fn CGContextStrokeLineSegments(
+    env: &mut Environment,
+    context: CGContextRef,
+    points: ConstPtr<CGPoint>,
+    count: usize,
+) {
+    if context.is_null() || points.is_null() || count < 2 {
+        return;
+    }
+    CGContextBeginPath(env, context);
+    let mut i = 0usize;
+    while i + 1 < count {
+        let a = env.mem.read(points + i as u32);
+        let b = env.mem.read(points + (i + 1) as u32);
+        CGContextMoveToPoint(env, context, a.x, a.y);
+        CGContextAddLineToPoint(env, context, b.x, b.y);
+        i += 2;
+    }
+    CGContextStrokePath(env, context);
+}
+
 fn CGContextAddLines(env: &mut Environment, context: CGContextRef, points: ConstPtr<CGPoint>, count: usize) {
     for i in 0..count as u32 {
         let p = env.mem.read(points + i);
@@ -1543,6 +1567,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextAddArcToPoint(_, _, _, _, _, _)),
     export_c_func!(CGContextAddLineToPoint(_, _, _)),
     export_c_func!(CGContextAddLines(_, _, _)),
+    export_c_func!(CGContextStrokeLineSegments(_, _, _)),
     export_c_func!(CGContextMoveToPoint(_, _, _)),
     export_c_func!(CGContextAddCurveToPoint(_, _, _, _, _, _, _)),
     export_c_func!(CGContextAddQuadCurveToPoint(_, _, _, _, _)),

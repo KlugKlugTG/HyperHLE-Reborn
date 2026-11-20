@@ -397,6 +397,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_copyStruct(_, _, _, _, _)),
     export_c_func!(objc_sync_enter(_)),
     export_c_func!(objc_sync_exit(_)),
+    export_c_func!(objc_enumerationMutation(_)),
     export_c_func!(sel_registerName(_)),
     export_c_func!(sel_getUid(_)),
     export_c_func!(sel_getName(_)),

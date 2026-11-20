@@ -51,6 +51,30 @@ const MOBILE_USER: PasswdStrings = PasswdStrings {
     shell: "/bin/sh",
 };
 
+/// `struct passwd *getpwuid(uid_t uid)`
+///
+/// Non-reentrant form used by older libc++/Foundation code. The returned
+/// structure and its strings are valid for the rest of the process lifetime.
+fn getpwuid(env: &mut Environment, uid: uid_t) -> MutPtr<passwd_t> {
+    if uid != 501 {
+        return Ptr::null();
+    }
+    let strings = &MOBILE_USER;
+    let alloc = |env: &mut Environment, text: &str| env.mem.alloc_and_write_cstr(text.as_bytes());
+    let out = passwd_t {
+        pw_name: alloc(env, strings.name),
+        pw_passwd: alloc(env, strings.passwd),
+        pw_uid: uid,
+        pw_gid: 501,
+        pw_gecos: alloc(env, strings.gecos),
+        pw_dir: alloc(env, strings.dir),
+        pw_shell: alloc(env, strings.shell),
+    };
+    let ptr: MutPtr<passwd_t> = env.mem.alloc(PASSWD_STRUCT_SIZE).cast();
+    env.mem.write(ptr, out);
+    ptr
+}
+
 /// `int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
 ///    struct passwd **result);`
 ///
@@ -158,4 +182,7 @@ unsafe impl SafeRead for passwd_t {}
 // Static assertion that the struct matches the 32-bit ABI layout.
 const _: () = assert!(std::mem::size_of::<passwd_t>() == PASSWD_STRUCT_SIZE as usize);
 
-pub const FUNCTIONS: FunctionExports = &[export_c_func!(getpwuid_r(_, _, _, _, _))];
+pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(getpwuid(_)),
+    export_c_func!(getpwuid_r(_, _, _, _, _)),
+];
