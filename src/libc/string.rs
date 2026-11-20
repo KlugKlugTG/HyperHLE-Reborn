@@ -712,7 +712,7 @@ fn strxfrm_l(
     n: GuestUSize,
     _loc: crate::libc::clocale::locale_t,
 ) -> GuestUSize {
-    let bytes = env.mem.cstr_at(src);
+    let bytes = env.mem.cstr_at(src).to_vec();
     let len = bytes.len() as GuestUSize;
     if !dest.is_null() && n > 0 {
         let copy = (len as usize).min(n as usize - 1);

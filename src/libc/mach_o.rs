@@ -896,6 +896,11 @@ fn fixed_name_matches(env: &Environment, ptr: MutPtr<u8>, wanted: &[u8]) -> bool
     &bytes[..wanted.len()] == wanted && bytes[wanted.len()..].iter().all(|&b| b == 0)
 }
 
+fn read_u32(env: &Environment, addr: u32) -> u32 {
+    let ptr: ConstPtr<u32> = Ptr::from_bits(addr);
+    env.mem.read(ptr)
+}
+
 /// Find a section in a 32-bit Mach-O header, returning its address in the
 /// header and the section's own metadata offset/size.
 fn find_section(
@@ -905,22 +910,22 @@ fn find_section(
     sectname: &[u8],
 ) -> Option<(MutPtr<u8>, u32, u32)> {
     let header_bits = header.to_bits();
-    let ncmds: u32 = env.mem.read(Ptr::from_bits(header_bits + 4));
+    let ncmds: u32 = read_u32(env, header_bits + 4);
     let mut text_vmaddr = 0x4000u32;
     let mut cmd_ptr = header_bits + MACH_HEADER_SIZE;
     for _ in 0..ncmds {
-        let cmd: u32 = env.mem.read(Ptr::from_bits(cmd_ptr));
-        let cmdsize: u32 = env.mem.read(Ptr::from_bits(cmd_ptr + 4));
+        let cmd: u32 = read_u32(env, cmd_ptr);
+        let cmdsize: u32 = read_u32(env, cmd_ptr + 4);
         if cmdsize < 8 {
             return None;
         }
         if cmd == LC_SEGMENT {
             let segname_ptr: MutPtr<u8> = Ptr::from_bits(cmd_ptr + 8);
-            let vmaddr: u32 = env.mem.read(Ptr::from_bits(cmd_ptr + 24));
+            let vmaddr: u32 = read_u32(env, cmd_ptr + 24);
             if fixed_name_matches(env, segname_ptr, b"__TEXT") {
                 text_vmaddr = vmaddr;
             }
-            let nsects: u32 = env.mem.read(Ptr::from_bits(cmd_ptr + 48));
+            let nsects: u32 = read_u32(env, cmd_ptr + 48);
             let mut sect_ptr = cmd_ptr + SEGMENT_COMMAND_SIZE;
             for _ in 0..nsects {
                 let name_ptr: MutPtr<u8> = Ptr::from_bits(sect_ptr);
@@ -928,9 +933,10 @@ fn find_section(
                 if fixed_name_matches(env, name_ptr, sectname)
                     && fixed_name_matches(env, seg_ptr, segname)
                 {
-                    let addr: u32 = env.mem.read(Ptr::from_bits(sect_ptr + 32));
-                    let size: u32 = env.mem.read(Ptr::from_bits(sect_ptr + 36));
-                    return Some((Ptr::from_bits(sect_ptr), addr, size));
+                    let addr: u32 = read_u32(env, sect_ptr + 32);
+                    let size: u32 = read_u32(env, sect_ptr + 36);
+                    let section: MutPtr<u8> = Ptr::from_bits(sect_ptr);
+                    return Some((section, addr, size));
                 }
                 sect_ptr += SECTION_SIZE;
             }
