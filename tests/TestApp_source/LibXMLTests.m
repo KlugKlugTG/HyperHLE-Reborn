@@ -4,6 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+#include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -46,7 +47,6 @@ extern xmlNode *xmlDocGetRootElement(xmlDoc *);
 extern void xmlFreeDoc(xmlDoc *);
 extern xmlXPathContext *xmlXPathNewContext(xmlDoc *);
 extern void xmlXPathFreeContext(xmlXPathContext *);
-extern int xmlXPathSetContextNode(xmlNode *, xmlXPathContext *);
 extern xmlXPathObject *xmlXPathEvalExpression(const unsigned char *,
                                               xmlXPathContext *);
 extern void xmlXPathFreeObject(xmlXPathObject *);
@@ -63,6 +63,11 @@ extern void xmlFree(void *);
   } while (0)
 
 int test_libxml_xpath_public_structs(void) {
+  // The bundled iOS libxml2 predates this API. Resolve HyperHLE's export at
+  // runtime so the old guest link library cannot hide the symbol from ld.
+  int (*setContextNode)(xmlNode *, xmlXPathContext *) =
+      dlsym(RTLD_DEFAULT, "xmlXPathSetContextNode");
+  XML_CHECK(setContextNode);
   const char *source =
       "<worlds><world><level url='Hello Rolando'/><level url='Second'/></world>"
       "<world><level url='Third'/></world></worlds>";
@@ -98,7 +103,7 @@ int test_libxml_xpath_public_structs(void) {
     xmlFree(name);
     xmlXPathFreeObject(result);
 
-    XML_CHECK(xmlXPathSetContextNode(otherWorld, context) == 0);
+    XML_CHECK(setContextNode(otherWorld, context) == 0);
     XML_CHECK(context->node == otherWorld);
     result = xmlXPathEvalExpression((const unsigned char *)"level", context);
     XML_CHECK(result && result->nodesetval->nodeNr == 1);
