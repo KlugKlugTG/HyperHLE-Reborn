@@ -158,7 +158,7 @@ fn h2attr(id: u32) -> *mut xml::xmlAttr {
     mirror_host_ptr(id).unwrap_or_else(|| ptr_for(id)) as *mut xml::xmlAttr
 }
 fn h2ns(id: u32) -> *mut xml::xmlNs {
-    ptr_for(id) as *mut xml::xmlNs
+    mirror_host_ptr(id).unwrap_or_else(|| ptr_for(id)) as *mut xml::xmlNs
 }
 fn h2parser_ctxt(id: u32) -> *mut xml::xmlParserCtxt {
     ptr_for(id) as *mut xml::xmlParserCtxt
@@ -336,8 +336,10 @@ fn mirror_one(env: &mut Environment, host: *mut c_void, parent_guest: u32, doc_k
     // layout past `ns`, so reading those offsets as pointers would dereference
     // garbage. An attribute's value is its children (a text node), which we
     // mirror below, and attributes have no properties.
-    const XML_ATTRIBUTE_NODE: c_int = 2;
-    if hn.type_ != XML_ATTRIBUTE_NODE && !hn.content.is_null() {
+    // Documents and DTD/declaration nodes also have a different tail after
+    // the common prefix. In particular, doc->intSubset is not text content.
+    let has_node_tail = matches!(hn.type_, 1 | 3 | 4 | 5 | 7 | 8 | 11 | 19 | 20);
+    if has_node_tail && !hn.content.is_null() {
         let bytes = unsafe { xml::read_xml_str(hn.content as *const xml::xmlChar) };
         let content_g = write_to_guest(env, &bytes);
         track_alloc(doc_key, content_g);
@@ -346,7 +348,7 @@ fn mirror_one(env: &mut Environment, host: *mut c_void, parent_guest: u32, doc_k
     let (first_child, last_child) = mirror_siblings(env, hn.children as *mut c_void, g, doc_key);
     wq(env, g, G_CHILDREN, first_child);
     wq(env, g, G_LAST, last_child);
-    if hn.type_ != XML_ATTRIBUTE_NODE {
+    if has_node_tail {
         let (first_prop, _) = mirror_siblings(env, hn.properties as *mut c_void, g, doc_key);
         wq(env, g, G_PROPERTIES, first_prop);
     }
@@ -1601,9 +1603,55 @@ fn release_xpath_mirror(env: &mut Environment, g: u32) -> *mut c_void {
             .unwrap_or_default()
     });
     for allocation in allocations {
+        // Namespace nodes are owned by the result, unlike ordinary nodes
+        // owned by the document. Remove their pointer aliases here too.
+        with_state(|s| {
+            if let Some(host) = s.mirror_guest_to_host.remove(&allocation) {
+                s.mirror_host_to_guest.remove(&host);
+            }
+        });
         env.mem.free(MutPtr::<u8>::from_bits(allocation).cast());
     }
     host
+}
+
+fn mirror_xpath_namespace(
+    env: &mut Environment,
+    result: *mut c_void,
+    namespace: *mut xml::xmlNs,
+) -> u32 {
+    // XPath's namespace axis returns xmlNs, not xmlNode. Its 32-bit public
+    // layout is next/type/href/prefix/_private/context (six words).
+    let g = alloc_xpath_buffer(env, result, 24);
+    with_state(|s| {
+        s.mirror_host_to_guest.insert(namespace as usize, g);
+        s.mirror_guest_to_host.insert(g, namespace as usize);
+    });
+    wq(env, g, 4, 18); // XML_NAMESPACE_DECL
+    unsafe {
+        for (offset, string) in [
+            (8, xml::hxml_ns_href(namespace)),
+            (12, xml::hxml_ns_prefix(namespace)),
+        ] {
+            if !string.is_null() {
+                let bytes = xml::read_xml_str(string);
+                let buffer = alloc_xpath_buffer(env, result, bytes.len() as u32 + 1);
+                env.mem
+                    .bytes_at_mut(MutPtr::from_bits(buffer), bytes.len() as u32)
+                    .copy_from_slice(&bytes);
+                wq(env, g, offset, buffer);
+            }
+        }
+        // libxml2 uses next to point at the namespace's owning element in
+        // namespace-axis results, rather than at another namespace.
+        let owner = xml::hxml_ns_next(namespace).cast::<xml::xmlNode>();
+        if !owner.is_null() {
+            let doc = xml::hxml_node_doc(owner);
+            let mirrored = mirror_node(env, owner.cast(), doc as usize);
+            wq(env, g, 0, mirrored);
+        }
+    }
+    g
 }
 
 fn sync_xpath_context(env: &mut Environment, ctx: u32) {
@@ -1661,8 +1709,12 @@ fn mirror_xpath_result(env: &mut Environment, result: *mut xml::xmlXPathObject) 
                 let entries = alloc_xpath_buffer(env, host, count.checked_mul(4).unwrap());
                 for i in 0..count {
                     let node = xml::hxml_nodeset_item(nodes, i as i32);
-                    let doc = xml::hxml_node_doc(node);
-                    let mirrored = mirror_node(env, node.cast(), doc as usize);
+                    let mirrored = if xml::hxml_node_type(node) == 18 {
+                        mirror_xpath_namespace(env, host, node.cast())
+                    } else {
+                        let doc = xml::hxml_node_doc(node);
+                        mirror_node(env, node.cast(), doc as usize)
+                    };
                     wq(env, entries, i * 4, mirrored);
                 }
                 wq(env, set, 8, entries);

@@ -141,3 +141,43 @@ int test_libxml_xpath_scalar_layouts(void) {
   xmlFreeDoc(doc);
   return 0;
 }
+
+int test_libxml_xpath_document_and_namespace_nodes(void) {
+  const char *source = "<!DOCTYPE root [<!ENTITY text 'hello'>]>"
+                       "<root xmlns:sdk='urn:ios'><sdk:item/></root>";
+  xmlDoc *doc = xmlReadMemory(source, strlen(source), NULL, NULL, 0);
+  XML_CHECK(doc);
+  xmlNode *root = xmlDocGetRootElement(doc);
+  xmlXPathContext *context = xmlXPathNewContext(doc);
+  XML_CHECK(root && context);
+  context->node = root;
+  xmlXPathObject *result =
+      xmlXPathEvalExpression((const unsigned char *)"/", context);
+  XML_CHECK(result && result->nodesetval->nodeNr == 1);
+  XML_CHECK(result->nodesetval->nodeTab[0]->type == 9);
+  xmlXPathFreeObject(result);
+
+  // Namespace results have xmlNs's layout, and belong to the XPath result.
+  // Interpreting them as xmlNode reads beyond the host allocation.
+  typedef struct {
+    void *next;
+    int type;
+    const unsigned char *href, *prefix;
+    void *_private;
+    xmlDoc *context;
+  } xmlNs;
+  context->node = root;
+  result =
+      xmlXPathEvalExpression((const unsigned char *)"namespace::sdk", context);
+  XML_CHECK(result && result->nodesetval->nodeNr == 1);
+  xmlNs *ns = (xmlNs *)result->nodesetval->nodeTab[0];
+  XML_CHECK(ns && ns->type == 18);
+  XML_CHECK(ns->href && !strcmp((const char *)ns->href, "urn:ios"));
+  XML_CHECK(ns->prefix && !strcmp((const char *)ns->prefix, "sdk"));
+  XML_CHECK(ns->next == root);
+  xmlXPathFreeObject(result);
+  XML_CHECK(root->doc == doc && root->type == 1);
+  xmlXPathFreeContext(context);
+  xmlFreeDoc(doc);
+  return 0;
+}
