@@ -268,6 +268,12 @@ Debugging options:
         the executable's original linker instructions. This supports engines
         that checksum their own code. Disabled unless an app default enables it.
 
+    --dladdr / --no-dladdr
+        Enable the real dladdr() implementation instead of the default
+        failure stub. Some legacy games hang during startup when dladdr()
+        resolves their images and symbols; enable this only for apps that
+        need it (for example Earn to Die).
+
     --disable-direct-memory-access
         Force dynarmic to always access guest memory via the memory access
         callbacks, rather than using the fast direct access path (page tables).

@@ -213,6 +213,9 @@ pub struct Options {
     /// Bind through lazy-symbol data pointers without changing instructions.
     /// Needed by engines that hash their executable code during startup.
     pub preserve_dyld_stubs: bool,
+    /// `--dladdr`: enable the real `dladdr()` implementation. Off by default;
+    /// the failure stub is safer for legacy games that hang during startup.
+    pub dladdr: bool,
     /// CPU affinity policy for the emulator thread on Android
     /// (`--affinity=`): `None` = default (big cores), or one of
     /// `all` / `off` / `big` / an explicit CPU list like `4-7`.
@@ -414,6 +417,7 @@ impl Default for Options {
             gles2_compat: false,
             direct_memory_access: true,
             preserve_dyld_stubs: false,
+            dladdr: false,
             affinity: None,
             gdb_listen_addrs: None,
             preferred_languages: None,
@@ -687,6 +691,10 @@ impl Options {
             self.preserve_dyld_stubs = true;
         } else if arg == "--no-preserve-dyld-stubs" {
             self.preserve_dyld_stubs = false;
+        } else if arg == "--dladdr" {
+            self.dladdr = true;
+        } else if arg == "--no-dladdr" {
+            self.dladdr = false;
         } else if let Some(address) = arg.strip_prefix("--gdb=") {
             let addrs = address
                 .to_socket_addrs()

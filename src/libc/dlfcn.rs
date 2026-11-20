@@ -11,7 +11,7 @@
 //! https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dlerror.3.html
 
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, MutVoidPtr, Ptr};
+use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, MutVoidPtr, Ptr, SafeRead};
 use crate::{Environment, ThreadId};
 use std::collections::HashMap;
 
@@ -32,13 +32,96 @@ pub struct State {
     handles: HashMap<MutVoidPtr, LibraryHandle>,
     errors: HashMap<ThreadId, String>,
     returned_errors: HashMap<ThreadId, MutPtr<u8>>,
+    image_paths: HashMap<usize, ConstPtr<u8>>,
+    symbol_names: HashMap<(usize, String), ConstPtr<u8>>,
 }
 
-fn dladdr(_env: &mut Environment, _address: ConstVoidPtr, _info: MutVoidPtr) -> i32 {
-    // Stub by design: a real dladdr() implementation made several legacy
-    // games hang during startup. Callers must treat failure as "unknown
-    // image" and fall back to their non-symbolicated path.
-    0
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DlInfo {
+    filename: ConstPtr<u8>,
+    base: ConstVoidPtr,
+    symbol_name: ConstPtr<u8>,
+    symbol_address: ConstVoidPtr,
+}
+unsafe impl SafeRead for DlInfo {}
+
+/// Resolve an address to its image header and nearest defined symbol. Strings
+/// belong to the loaded image and remain valid across subsequent lookups.
+/// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dladdr.3.html
+/// https://github.com/apple-oss-distributions/dyld/blob/dyld-210.2.3/src/dyldAPIs.cpp
+fn dladdr(env: &mut Environment, address: ConstVoidPtr, info: MutPtr<DlInfo>) -> i32 {
+    // Default to the historical failure stub. The real implementation is
+    // opt-in because several legacy games hang when it starts resolving
+    // their images and symbols.
+    if !env.options.dladdr {
+        return 0;
+    }
+    let address = address.to_bits();
+    let Some(index) = env.bins.iter().position(|image| {
+        image
+            .mapped_segments
+            .iter()
+            .any(|range| range.contains(&address))
+    }) else {
+        return 0;
+    };
+    let image = &env.bins[index];
+    let base = image.text_base;
+    let symbol = if address == base {
+        Some(("__dso_handle".to_owned(), base))
+    } else {
+        // Compare the raw nlist address, preserving bit zero on data symbols.
+        // The returned function pointer still carries its recorded Thumb bit.
+        image
+            .exported_symbols
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name,
+                    *value,
+                    image.symbol_locations.get(name).copied().unwrap_or(*value),
+                )
+            })
+            .filter(|(_, _, location)| *location <= address)
+            .max_by_key(|(name, _, location)| {
+                (*location, image.external_symbols.contains_key(*name))
+            })
+            .filter(|(_, _, location)| *location != base)
+            .map(|(name, value, _)| (name.strip_prefix('_').unwrap_or(name).to_owned(), value))
+    };
+    let filename = *env
+        .libc_state
+        .dlfcn
+        .image_paths
+        .entry(index)
+        .or_insert_with(|| {
+            env.mem
+                .alloc_and_write_cstr(image.loaded_path.as_bytes())
+                .cast_const()
+        });
+    let (symbol_name, symbol_address) = if let Some((name, value)) = symbol {
+        let name = *env
+            .libc_state
+            .dlfcn
+            .symbol_names
+            .entry((index, name.clone()))
+            .or_insert_with(|| env.mem.alloc_and_write_cstr(name.as_bytes()).cast_const());
+        (name, Ptr::from_bits(value))
+    } else {
+        (Ptr::null(), Ptr::null())
+    };
+    env.mem.write(
+        info,
+        DlInfo {
+            filename,
+            base: Ptr::from_bits(base),
+            symbol_name,
+            symbol_address,
+        },
+    );
+    log_dbg!("dladdr({address:#x}) => image {index}, base {base:#x}");
+    1
 }
 
 fn error(env: &mut Environment, message: String) {
