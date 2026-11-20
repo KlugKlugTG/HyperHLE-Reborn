@@ -198,6 +198,16 @@ xmlNsPtr hxml_ns_next(const xmlNs *n) {
 
 /* ---------- XPath object accessors ---------- */
 
+xmlNodePtr hxml_xpath_context_node(const xmlXPathContext *ctx) {
+    return ctx ? ctx->node : NULL;
+}
+
+void hxml_xpath_context_set_document_and_node(xmlXPathContext *ctx,
+                                            xmlDocPtr doc, xmlNodePtr node) {
+    ctx->doc = doc;
+    ctx->node = node;
+}
+
 int hxml_xpath_object_type(const xmlXPathObject *o) {
     return o ? (int)o->type : 0;
 }
