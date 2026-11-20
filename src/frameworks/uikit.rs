@@ -645,33 +645,6 @@ pub const CONSTANTS: &[(&str, HostConstant)] = &[
         HostConstant::NSString("UICollectionElementKindSectionFooter"),
     ),
     // -----------------------------------------------------------------
-    // UIMenuController show / hide notification names (iOS 3.2+). Apple
-    // `UIMenuController.h` declares them as
-    // `UIKIT_EXTERN NSNotificationName const ...`; the posted value is
-    // each constant's own symbol name. See
-    // <https://developer.apple.com/documentation/uikit/uimenucontroller>.
-    // -----------------------------------------------------------------
-    (
-        "_UIMenuControllerWillShowMenuNotification",
-        HostConstant::NSString("UIMenuControllerWillShowMenuNotification"),
-    ),
-    (
-        "_UIMenuControllerDidShowMenuNotification",
-        HostConstant::NSString("UIMenuControllerDidShowMenuNotification"),
-    ),
-    (
-        "_UIMenuControllerWillHideMenuNotification",
-        HostConstant::NSString("UIMenuControllerWillHideMenuNotification"),
-    ),
-    (
-        "_UIMenuControllerDidHideMenuNotification",
-        HostConstant::NSString("UIMenuControllerDidHideMenuNotification"),
-    ),
-    (
-        "_UIMenuControllerMenuFrameDidChangeNotification",
-        HostConstant::NSString("UIMenuControllerMenuFrameDidChangeNotification"),
-    ),
-    // -----------------------------------------------------------------
     // UITableView selection notification, Apple `UITableView.h`. The
     // notification name is the constant's symbol name verbatim. See
     // <https://developer.apple.com/documentation/uikit/uitableviewselectiondidchangenotification>.
