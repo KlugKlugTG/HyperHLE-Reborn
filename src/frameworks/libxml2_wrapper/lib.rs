@@ -894,6 +894,12 @@ extern "C" {
     pub fn hxml_ns_prefix(n: *const xmlNs) -> *const xmlChar;
     pub fn hxml_ns_next(n: *const xmlNs) -> *mut xmlNs;
 
+    pub fn hxml_xpath_context_node(ctx: *const xmlXPathContext) -> *mut xmlNode;
+    pub fn hxml_xpath_context_set_document_and_node(
+        ctx: *mut xmlXPathContext,
+        doc: *mut xmlDoc,
+        node: *mut xmlNode,
+    );
     pub fn hxml_xpath_object_type(o: *const xmlXPathObject) -> c_int;
     pub fn hxml_xpath_object_floatval(o: *const xmlXPathObject) -> c_double;
     pub fn hxml_xpath_object_boolval(o: *const xmlXPathObject) -> c_int;

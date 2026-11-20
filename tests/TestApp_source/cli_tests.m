@@ -6499,6 +6499,9 @@ int test_NSNotificationCenter_addObserver_nilName_removeObserver() {
 // before the revert.
 
 int test_CFRunLoopTimerCreate_callout(void);
+int test_libxml_xpath_public_structs(void);
+int test_libxml_xpath_scalar_layouts(void);
+int test_libxml_xpath_document_and_namespace_nodes(void);
 int test_CFRunLoopTimerSetNextFireDate_NSTimer(void);
 int test_CFRunLoopContainsTimer(void);
 int test_CFURLCreatePropertyFromResource(void);
@@ -6717,6 +6720,9 @@ struct {
     FUNC_DEF(test_NSData_base64EncodedStringWithOptions),
     FUNC_DEF(test_munmap_partial_mapping),
     FUNC_DEF(test_NSUserDefaults_persistentDomain),
+    FUNC_DEF(test_libxml_xpath_public_structs),
+    FUNC_DEF(test_libxml_xpath_scalar_layouts),
+    FUNC_DEF(test_libxml_xpath_document_and_namespace_nodes),
 };
 
 // The dispatch tests that used to live here are gone with the revert of

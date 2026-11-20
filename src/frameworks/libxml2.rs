@@ -65,6 +65,9 @@ struct HandleTable {
     /// which matters because libxml2 reuses freed node addresses).
     mirror_doc_allocs: HashMap<usize, Vec<u32>>,
     mirror_doc_hosts: HashMap<usize, Vec<usize>>,
+    /// Context/result mirrors own their buffers, but not the document nodes
+    /// referenced by a result's node set.
+    xpath_mirror_allocs: HashMap<usize, Vec<u32>>,
 }
 
 // `*mut c_void` is not Send/Sync by default; we only ever access the table
@@ -92,6 +95,7 @@ where
             mirror_guest_to_host: HashMap::new(),
             mirror_doc_allocs: HashMap::new(),
             mirror_doc_hosts: HashMap::new(),
+            xpath_mirror_allocs: HashMap::new(),
         });
     }
     f(g.as_mut().unwrap())
@@ -154,7 +158,7 @@ fn h2attr(id: u32) -> *mut xml::xmlAttr {
     mirror_host_ptr(id).unwrap_or_else(|| ptr_for(id)) as *mut xml::xmlAttr
 }
 fn h2ns(id: u32) -> *mut xml::xmlNs {
-    ptr_for(id) as *mut xml::xmlNs
+    mirror_host_ptr(id).unwrap_or_else(|| ptr_for(id)) as *mut xml::xmlNs
 }
 fn h2parser_ctxt(id: u32) -> *mut xml::xmlParserCtxt {
     ptr_for(id) as *mut xml::xmlParserCtxt
@@ -166,10 +170,10 @@ fn h2writer(id: u32) -> *mut xml::xmlTextWriter {
     ptr_for(id) as *mut xml::xmlTextWriter
 }
 fn h2xpath_ctxt(id: u32) -> *mut xml::xmlXPathContext {
-    ptr_for(id) as *mut xml::xmlXPathContext
+    mirror_host_ptr(id).unwrap_or_else(|| ptr_for(id)) as *mut xml::xmlXPathContext
 }
 fn h2xpath_obj(id: u32) -> *mut xml::xmlXPathObject {
-    ptr_for(id) as *mut xml::xmlXPathObject
+    mirror_host_ptr(id).unwrap_or_else(|| ptr_for(id)) as *mut xml::xmlXPathObject
 }
 fn h2xpath_comp(id: u32) -> *mut xml::xmlXPathCompExpr {
     ptr_for(id) as *mut xml::xmlXPathCompExpr
@@ -263,6 +267,7 @@ const G_LAST: u32 = 16;
 const G_PARENT: u32 = 20;
 const G_NEXT: u32 = 24;
 const G_PREV: u32 = 28;
+const G_DOC: u32 = 32;
 const G_CONTENT: u32 = 40;
 const G_PROPERTIES: u32 = 44;
 const GUEST_NODE_SIZE: u32 = 60;
@@ -308,7 +313,10 @@ fn mirror_one(env: &mut Environment, host: *mut c_void, parent_guest: u32, doc_k
         s.mirror_host_to_guest.insert(host_key, g);
         s.mirror_guest_to_host.insert(g, host_key);
         s.mirror_doc_allocs.entry(doc_key).or_default().push(g);
-        s.mirror_doc_hosts.entry(doc_key).or_default().push(host_key);
+        s.mirror_doc_hosts
+            .entry(doc_key)
+            .or_default()
+            .push(host_key);
     });
     for off in (0..GUEST_NODE_SIZE).step_by(4) {
         wq(env, g, off, 0);
@@ -316,6 +324,7 @@ fn mirror_one(env: &mut Environment, host: *mut c_void, parent_guest: u32, doc_k
     let hn = unsafe { &*(host as *const HostXmlNode) };
     wq(env, g, G_TYPE, hn.type_ as u32);
     wq(env, g, G_PARENT, parent_guest);
+    wq(env, g, G_DOC, id_for(hn.doc));
     if !hn.name.is_null() {
         let bytes = unsafe { xml::read_xml_str(hn.name as *const xml::xmlChar) };
         let name_g = write_to_guest(env, &bytes);
@@ -327,8 +336,10 @@ fn mirror_one(env: &mut Environment, host: *mut c_void, parent_guest: u32, doc_k
     // layout past `ns`, so reading those offsets as pointers would dereference
     // garbage. An attribute's value is its children (a text node), which we
     // mirror below, and attributes have no properties.
-    const XML_ATTRIBUTE_NODE: c_int = 2;
-    if hn.type_ != XML_ATTRIBUTE_NODE && !hn.content.is_null() {
+    // Documents and DTD/declaration nodes also have a different tail after
+    // the common prefix. In particular, doc->intSubset is not text content.
+    let has_node_tail = matches!(hn.type_, 1 | 3 | 4 | 5 | 7 | 8 | 11 | 19 | 20);
+    if has_node_tail && !hn.content.is_null() {
         let bytes = unsafe { xml::read_xml_str(hn.content as *const xml::xmlChar) };
         let content_g = write_to_guest(env, &bytes);
         track_alloc(doc_key, content_g);
@@ -337,7 +348,7 @@ fn mirror_one(env: &mut Environment, host: *mut c_void, parent_guest: u32, doc_k
     let (first_child, last_child) = mirror_siblings(env, hn.children as *mut c_void, g, doc_key);
     wq(env, g, G_CHILDREN, first_child);
     wq(env, g, G_LAST, last_child);
-    if hn.type_ != XML_ATTRIBUTE_NODE {
+    if has_node_tail {
         let (first_prop, _) = mirror_siblings(env, hn.properties as *mut c_void, g, doc_key);
         wq(env, g, G_PROPERTIES, first_prop);
     }
@@ -379,10 +390,14 @@ fn mirror_node(env: &mut Environment, host: *mut c_void, doc_key: usize) -> u32 
     MIRROR_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
     let r = mirror_one(env, host, 0, doc_key);
     let n = MIRROR_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-    log_dbg!("XMLMIRROR built {} nodes for doc {:#x} -> {:#x}", n, doc_key, r);
+    log_dbg!(
+        "XMLMIRROR built {} nodes for doc {:#x} -> {:#x}",
+        n,
+        doc_key,
+        r
+    );
     r
 }
-
 
 static MIRROR_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Safety cap: a well-formed document tree is bounded, but guard against a
@@ -1547,15 +1562,182 @@ fn xmlTextReaderCurrentDoc(_env: &mut Environment, reader: u32) -> u32 {
 // XPath / XPointer / XInclude
 // ============================================================================
 
-#[allow(non_snake_case)]
-fn xmlXPathNewContext(_env: &mut Environment, doc: u32) -> u32 {
-    let p = unsafe { xml::xmlXPathNewContext(h2doc(doc)) };
-    id_for(p as *mut c_void)
+// libxml2's XPath context and result types are public structs. Apple's
+// XMLPerformance sample writes context->node and reads result->nodesetval
+// directly. Use the 32-bit iOS layout, including its 4-byte double alignment:
+// https://developer.apple.com/library/archive/samplecode/XMLPerformance/
+// https://github.com/GNOME/libxml2/blob/v2.9.14/include/libxml/xpath.h
+fn alloc_xpath_buffer(env: &mut Environment, host: *mut c_void, size: u32) -> u32 {
+    let g = env.mem.alloc(size).to_bits();
+    env.mem.bytes_at_mut(MutPtr::from_bits(g), size).fill(0);
+    with_state(|s| {
+        s.xpath_mirror_allocs
+            .entry(host as usize)
+            .or_default()
+            .push(g)
+    });
+    g
+}
+
+fn alloc_xpath_mirror(env: &mut Environment, host: *mut c_void, size: u32) -> u32 {
+    if host.is_null() {
+        return 0;
+    }
+    let g = alloc_xpath_buffer(env, host, size);
+    with_state(|s| {
+        s.mirror_host_to_guest.insert(host as usize, g);
+        s.mirror_guest_to_host.insert(g, host as usize);
+    });
+    g
+}
+
+fn release_xpath_mirror(env: &mut Environment, g: u32) -> *mut c_void {
+    let Some(host) = mirror_host_ptr(g) else {
+        return release_handle(g);
+    };
+    let allocations = with_state(|s| {
+        s.mirror_host_to_guest.remove(&(host as usize));
+        s.mirror_guest_to_host.remove(&g);
+        s.xpath_mirror_allocs
+            .remove(&(host as usize))
+            .unwrap_or_default()
+    });
+    for allocation in allocations {
+        // Namespace nodes are owned by the result, unlike ordinary nodes
+        // owned by the document. Remove their pointer aliases here too.
+        with_state(|s| {
+            if let Some(host) = s.mirror_guest_to_host.remove(&allocation) {
+                s.mirror_host_to_guest.remove(&host);
+            }
+        });
+        env.mem.free(MutPtr::<u8>::from_bits(allocation).cast());
+    }
+    host
+}
+
+fn mirror_xpath_namespace(
+    env: &mut Environment,
+    result: *mut c_void,
+    namespace: *mut xml::xmlNs,
+) -> u32 {
+    // XPath's namespace axis returns xmlNs, not xmlNode. Its 32-bit public
+    // layout is next/type/href/prefix/_private/context (six words).
+    let g = alloc_xpath_buffer(env, result, 24);
+    with_state(|s| {
+        s.mirror_host_to_guest.insert(namespace as usize, g);
+        s.mirror_guest_to_host.insert(g, namespace as usize);
+    });
+    wq(env, g, 4, 18); // XML_NAMESPACE_DECL
+    unsafe {
+        for (offset, string) in [
+            (8, xml::hxml_ns_href(namespace)),
+            (12, xml::hxml_ns_prefix(namespace)),
+        ] {
+            if !string.is_null() {
+                let bytes = xml::read_xml_str(string);
+                let buffer = alloc_xpath_buffer(env, result, bytes.len() as u32 + 1);
+                env.mem
+                    .bytes_at_mut(MutPtr::from_bits(buffer), bytes.len() as u32)
+                    .copy_from_slice(&bytes);
+                wq(env, g, offset, buffer);
+            }
+        }
+        // libxml2 uses next to point at the namespace's owning element in
+        // namespace-axis results, rather than at another namespace.
+        let owner = xml::hxml_ns_next(namespace).cast::<xml::xmlNode>();
+        if !owner.is_null() {
+            let doc = xml::hxml_node_doc(owner);
+            let mirrored = mirror_node(env, owner.cast(), doc as usize);
+            wq(env, g, 0, mirrored);
+        }
+    }
+    g
+}
+
+fn sync_xpath_context(env: &mut Environment, ctx: u32) {
+    if mirror_host_ptr(ctx).is_some() {
+        let doc = env.mem.read(MutPtr::<u32>::from_bits(ctx));
+        let node = env.mem.read(MutPtr::<u32>::from_bits(ctx + 4));
+        unsafe {
+            xml::hxml_xpath_context_set_document_and_node(
+                h2xpath_ctxt(ctx),
+                h2doc(doc),
+                h2node(node),
+            );
+        }
+    }
+}
+
+fn refresh_xpath_context(env: &mut Environment, ctx: u32) {
+    if mirror_host_ptr(ctx).is_some() {
+        let node = unsafe { xml::hxml_xpath_context_node(h2xpath_ctxt(ctx)) };
+        let doc = unsafe { xml::hxml_node_doc(node) };
+        let g = mirror_node(env, node.cast(), doc as usize);
+        wq(env, ctx, 4, g);
+    }
+}
+
+fn mirror_xpath_result(env: &mut Environment, result: *mut xml::xmlXPathObject) -> u32 {
+    let host = result as *mut c_void;
+    let g = alloc_xpath_mirror(env, host, 40);
+    if g == 0 {
+        return 0;
+    }
+    unsafe {
+        wq(env, g, 0, xml::hxml_xpath_object_type(result) as u32);
+        wq(env, g, 8, xml::hxml_xpath_object_boolval(result) as u32);
+        env.mem.write(
+            MutPtr::<f64>::from_bits(g + 12),
+            xml::hxml_xpath_object_floatval(result),
+        );
+        let string = xml::hxml_xpath_object_stringval(result);
+        if !string.is_null() {
+            let bytes = xml::read_xml_str(string);
+            let buffer = alloc_xpath_buffer(env, host, bytes.len() as u32 + 1);
+            env.mem
+                .bytes_at_mut(MutPtr::from_bits(buffer), bytes.len() as u32)
+                .copy_from_slice(&bytes);
+            wq(env, g, 20, buffer);
+        }
+        let nodes = xml::hxml_xpath_object_nodeset(result);
+        if !nodes.is_null() {
+            let count = xml::hxml_nodeset_length(nodes).max(0) as u32;
+            let set = alloc_xpath_buffer(env, host, 12);
+            wq(env, set, 0, count);
+            wq(env, set, 4, count);
+            if count != 0 {
+                let entries = alloc_xpath_buffer(env, host, count.checked_mul(4).unwrap());
+                for i in 0..count {
+                    let node = xml::hxml_nodeset_item(nodes, i as i32);
+                    let mirrored = if xml::hxml_node_type(node) == 18 {
+                        mirror_xpath_namespace(env, host, node.cast())
+                    } else {
+                        let doc = xml::hxml_node_doc(node);
+                        mirror_node(env, node.cast(), doc as usize)
+                    };
+                    wq(env, entries, i * 4, mirrored);
+                }
+                wq(env, set, 8, entries);
+            }
+            wq(env, g, 4, set);
+        }
+    }
+    g
 }
 
 #[allow(non_snake_case)]
-fn xmlXPathFreeContext(_env: &mut Environment, ctx: u32) {
-    let p = release_handle(ctx) as *mut xml::xmlXPathContext;
+fn xmlXPathNewContext(env: &mut Environment, doc: u32) -> u32 {
+    let p = unsafe { xml::xmlXPathNewContext(h2doc(doc)) };
+    let g = alloc_xpath_mirror(env, p.cast(), 8);
+    if g != 0 {
+        wq(env, g, 0, doc);
+    }
+    g
+}
+
+#[allow(non_snake_case)]
+fn xmlXPathFreeContext(env: &mut Environment, ctx: u32) {
+    let p = release_xpath_mirror(env, ctx) as *mut xml::xmlXPathContext;
     if !p.is_null() {
         unsafe { xml::xmlXPathFreeContext(p) };
     }
@@ -1571,15 +1753,19 @@ fn xmlXPathRegisterNs(env: &mut Environment, ctx: u32, prefix: u32, ns_uri: u32)
 #[allow(non_snake_case)]
 fn xmlXPathEval(env: &mut Environment, expr: u32, ctx: u32) -> u32 {
     let e = read_guest_cstring(env, expr);
+    sync_xpath_context(env, ctx);
     let r = unsafe { xml::xmlXPathEval(cstr_xml(&e), h2xpath_ctxt(ctx)) };
-    id_for(r as *mut c_void)
+    refresh_xpath_context(env, ctx);
+    mirror_xpath_result(env, r)
 }
 
 #[allow(non_snake_case)]
 fn xmlXPathEvalExpression(env: &mut Environment, expr: u32, ctx: u32) -> u32 {
     let e = read_guest_cstring(env, expr);
+    sync_xpath_context(env, ctx);
     let r = unsafe { xml::xmlXPathEvalExpression(cstr_xml(&e), h2xpath_ctxt(ctx)) };
-    id_for(r as *mut c_void)
+    refresh_xpath_context(env, ctx);
+    mirror_xpath_result(env, r)
 }
 
 #[allow(non_snake_case)]
@@ -1598,22 +1784,28 @@ fn xmlXPathFreeCompExpr(_env: &mut Environment, expr: u32) {
 }
 
 #[allow(non_snake_case)]
-fn xmlXPathCompiledEval(_env: &mut Environment, expr: u32, ctx: u32) -> u32 {
+fn xmlXPathCompiledEval(env: &mut Environment, expr: u32, ctx: u32) -> u32 {
+    sync_xpath_context(env, ctx);
     let r = unsafe { xml::xmlXPathCompiledEval(h2xpath_comp(expr), h2xpath_ctxt(ctx)) };
-    id_for(r as *mut c_void)
+    refresh_xpath_context(env, ctx);
+    mirror_xpath_result(env, r)
 }
 
 #[allow(non_snake_case)]
-fn xmlXPathFreeObject(_env: &mut Environment, obj: u32) {
-    let p = release_handle(obj) as *mut xml::xmlXPathObject;
+fn xmlXPathFreeObject(env: &mut Environment, obj: u32) {
+    let p = release_xpath_mirror(env, obj) as *mut xml::xmlXPathObject;
     if !p.is_null() {
         unsafe { xml::xmlXPathFreeObject(p) };
     }
 }
 
 #[allow(non_snake_case)]
-fn xmlXPathSetContextNode(_env: &mut Environment, node: u32, ctx: u32) -> i32 {
-    unsafe { xml::xmlXPathSetContextNode(h2node(node), h2xpath_ctxt(ctx)) }
+fn xmlXPathSetContextNode(env: &mut Environment, node: u32, ctx: u32) -> i32 {
+    let result = unsafe { xml::xmlXPathSetContextNode(h2node(node), h2xpath_ctxt(ctx)) };
+    if result == 0 && mirror_host_ptr(ctx).is_some() {
+        wq(env, ctx, 4, node);
+    }
+    result
 }
 
 // Accessors that turn xmlXPathObject into something the guest can inspect:
