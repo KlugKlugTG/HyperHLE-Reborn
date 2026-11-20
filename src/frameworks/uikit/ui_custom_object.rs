@@ -55,6 +55,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     log_dbg!("[(UICustomObject*){:?} awakeFromNib]", this);
 }
 
+// Add inside @implementation UICustomObject:
+- (())encodeWithCoder:(id)_coder {
+    // Stateless: nothing to encode. Real UICustomObject has no keys either.
+}
+
 // KVC (`setValue:forKey:`) is fully implemented by `NSObject` and works for
 // `UICustomObject` instances out of the box — this is how nib-loaded outlet
 // connections are wired up via `UIRuntimeOutletConnection`. No override is
