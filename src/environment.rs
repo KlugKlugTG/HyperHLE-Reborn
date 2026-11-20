@@ -39,6 +39,30 @@ pub type ThreadId = usize;
 
 pub type HostContext = Coroutine<Environment, Environment, Environment>;
 
+/// Keep panic ownership on a Rust ABI frame. With Windows release LTO,
+/// inlining this cleanup into corosensei's SysV entry breaks forced unwinding.
+/// A separate frame also preserves propagation of ordinary guest failures.
+/// https://docs.rs/corosensei/0.3.3/corosensei/struct.Coroutine.html#method.force_unwind
+#[inline(never)]
+fn run_guest_coroutine<F>(
+    yielder: &Yielder<Environment, Environment>,
+    mut env: Environment,
+    body: F,
+) -> Environment
+where
+    F: FnOnce(&mut Environment) + 'static,
+{
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env.with_yielder(yielder, body);
+    }));
+    if let Err(payload) = result {
+        let panic_cell = env.panic_cell.clone();
+        panic_cell.set(Some(env));
+        std::panic::resume_unwind(payload);
+    }
+    env
+}
+
 /// Bookkeeping for a thread.
 pub struct Thread {
     /// Once a thread finishes, this is set to false.
@@ -215,6 +239,9 @@ pub struct Environment {
     /// Guest process result, consumed at the return-to-host boundary without
     /// terminating the host process inside a linked libc function.
     guest_termination_requested: Option<GuestTermination>,
+    /// The interrupted main-thread coroutine while UIKit delivers the
+    /// user-requested shutdown callbacks. Kept for safe unwinding on drop.
+    interrupted_main_context: Option<HostContext>,
     /// A required Unity player archive could not be resolved or read from the
     /// mounted bundle. Retained to report the first missing archive once.
     missing_unity_player_archive: Option<String>,
@@ -467,6 +494,10 @@ fn generate_binary_load_order(graph: &[BinaryDependencyNode]) -> Result<Vec<usiz
 /// [Environment::with_yielder] for why this is needed.
 static ENVIRONMENT_INSTANCE_EXISTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Tests creating a real environment must respect its process-wide singleton.
+#[cfg(test)]
+pub(crate) static ENVIRONMENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Ceiling for the app's heap when the RAM limiter is left on "Default".
 ///
@@ -932,7 +963,13 @@ impl Environment {
         let mut objc = objc::ObjC::new();
 
         let mut dyld = dyld::Dyld::new();
-        dyld.do_initial_linking(&bundle, &bins, &mut mem, &mut objc);
+        dyld.do_initial_linking(
+            &bundle,
+            &bins,
+            &mut mem,
+            &mut objc,
+            options.preserve_dyld_stubs,
+        );
 
         let cpu = cpu::Cpu::new(match options.direct_memory_access {
             true => Some(&mut mem),
@@ -945,182 +982,163 @@ impl Environment {
         // StackOverflowError -> SIGABRT). Give it the same 16MB as SDLThread.
         let main_thread_init_stack = DefaultStack::new(16 * 1024 * 1024)
             .expect("failed to allocate main guest coroutine stack");
-        let main_thread_init_routine = Coroutine::with_stack(
-            main_thread_init_stack,
-            move |yielder, mut env: Environment| {
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    env.with_yielder(yielder, move |env| {
-                        echo!("CPU emulation begins now.");
-                        // Some apps use the stack inside the static initializer.
-                        // While properly behaving apps should be fine, some app
-                        // will try to poke the top of the stack, so we'll give
-                        // it some room.
-                        env.cpu.regs_mut()[Cpu::SP] = 0xFFFFF000;
+        let main_thread_init_routine =
+            Coroutine::with_stack(main_thread_init_stack, move |yielder, env: Environment| {
+                run_guest_coroutine(yielder, env, move |env| {
+                    echo!("CPU emulation begins now.");
+                    // Some apps use the stack inside the static initializer.
+                    // While properly behaving apps should be fine, some app
+                    // will try to poke the top of the stack, so we'll give
+                    // it some room.
+                    env.cpu.regs_mut()[Cpu::SP] = 0xFFFFF000;
 
-                        // Call `+load` method on classes where it's defined.
-                        // TODO: `+load` methods from our image should take priority
-                        // over frameworks ones.
-                        // TODO: a category `+load` method should be called after
-                        // the class's own +load method.
-                        // Note: `+load` is sent without triggering `+initialize`,
-                        // matching the runtime's guarantee that `+load` runs first.
-                        let mut to_be_loaded = Vec::new();
-                        let mut processed = HashSet::new();
-                        let load_sel: objc::SEL = env
+                    // Call `+load` method on classes where it's defined.
+                    // TODO: `+load` methods from our image should take priority
+                    // over frameworks ones.
+                    // TODO: a category `+load` method should be called after
+                    // the class's own +load method.
+                    // Note: `+load` is sent without triggering `+initialize`,
+                    // matching the runtime's guarantee that `+load` runs first.
+                    let mut to_be_loaded = Vec::new();
+                    let mut processed = HashSet::new();
+                    let load_sel: objc::SEL = env
+                        .objc
+                        .register_host_selector("load".to_string(), &mut env.mem);
+                    for (class_name, &class) in env.objc.all_classes() {
+                        if processed.contains(&class) {
+                            continue;
+                        }
+                        if env.objc.is_unimplemented_class(class) || env.objc.is_fake_class(class) {
+                            continue;
+                        }
+                        if env
                             .objc
-                            .register_host_selector("load".to_string(), &mut env.mem);
-                        for (class_name, &class) in env.objc.all_classes() {
-                            if processed.contains(&class) {
-                                continue;
-                            }
-                            if env.objc.is_unimplemented_class(class)
-                                || env.objc.is_fake_class(class)
-                            {
-                                continue;
-                            }
-                            if env
-                                .objc
-                                .object_has_uninherited_method(&env.mem, class, load_sel)
-                            {
-                                log_dbg!(
-                                    "Calling +load on inheritance chain of {} class",
-                                    class_name
-                                );
-                                let mut inherited = Vec::new();
-                                let mut curr_class = class;
-                                while curr_class != objc::nil
-                                    && !env.objc.is_unimplemented_class(curr_class)
-                                    && !env.objc.is_fake_class(curr_class)
-                                {
-                                    if !processed.contains(&curr_class)
-                                        && env.objc.object_has_uninherited_method(
-                                            &env.mem, curr_class, load_sel,
-                                        )
-                                    {
-                                        inherited.push(curr_class);
-                                        processed.insert(curr_class);
-                                    }
-                                    curr_class = env.objc.get_superclass(curr_class);
-                                }
-                                to_be_loaded.extend(inherited.into_iter().rev());
-                            }
-                        }
-                        for &class in &to_be_loaded {
-                            () = objc::msg_send_no_initialize(env, (class, load_sel));
-                        }
-
-                        // Static initializers for libraries must be run before
-                        // the initializer in the app binary.
-                        for bin_idx in env.get_sorted_bin_indices().unwrap() {
-                            let Some(bin) = env.bins.get(bin_idx) else {
-                                continue;
-                            };
-                            let Some(section) =
-                                bin.get_section(mach_o::SectionType::ModInitFuncPointers)
-                            else {
-                                continue;
-                            };
-
-                            log_dbg!("Calling static initializers for {:?}", bin.name);
-                            assert!(section.size % 4 == 0);
-
-                            let base: mem::ConstPtr<abi::GuestFunction> =
-                                mem::Ptr::from_bits(section.addr);
-
-                            let count = section.size / 4;
-                            for i in 0..count {
-                                let func = env.mem.read(base + i);
-
-                                log_dbg!(
-                                    "Calling static initializer at {:?} from {:?}",
-                                    func,
-                                    (base + i)
-                                );
-
-                                () = func.call_from_host(env, ());
-                            }
-                            log_dbg!("Static initialization done");
-                        }
-
+                            .object_has_uninherited_method(&env.mem, class, load_sel)
                         {
-                            let bin_path = env.bundle.executable_path();
-
-                            let envp_list: Vec<String> = env
-                                .env_vars
-                                .clone()
-                                .iter_mut()
-                                .map(|tuple| {
-                                    [
-                                        std::str::from_utf8(tuple.0).unwrap(),
-                                        "=",
-                                        env.mem.cstr_at_utf8(*tuple.1).unwrap(),
-                                    ]
-                                    .concat()
-                                })
-                                .collect();
-
-                            let envp_ref_list: Vec<&str> =
-                                envp_list.iter().map(|keyvalue| keyvalue.as_str()).collect();
-
-                            let bin_path_apple_key =
-                                format!("executable_path={}", bin_path.as_str());
-
-                            let argv = Vec::from_iter(
-                                std::iter::once(bin_path.as_str())
-                                    .chain(app_args.iter().map(|s| s.as_str())),
-                            );
-
-                            let envp = envp_ref_list.as_slice();
-                            let apple = &[bin_path_apple_key.as_str()];
-                            stack::prep_stack_for_start(
-                                &mut env.mem,
-                                &mut env.cpu,
-                                &argv,
-                                envp,
-                                apple,
-                                entry_point_is_lc_main,
-                            );
-                        }
-
-                        // Manually call here, since running call_from_host pushes
-                        // a stack frame and disrupts abi for _start.
-                        env.cpu
-                            .branch_with_link(entry_point_addr, env.dyld.thread_exit_routine());
-
-                        env.run_call();
-
-                        let exited_via_pthread = env.threads[0].return_value.is_some();
-                        if exited_via_pthread {
-                            if !env.is_guest_termination_requested() {
-                                libc::pthread::key::cleanup_thread_tsd(env);
+                            log_dbg!("Calling +load on inheritance chain of {} class", class_name);
+                            let mut inherited = Vec::new();
+                            let mut curr_class = class;
+                            while curr_class != objc::nil
+                                && !env.objc.is_unimplemented_class(curr_class)
+                                && !env.objc.is_fake_class(curr_class)
+                            {
+                                if !processed.contains(&curr_class)
+                                    && env.objc.object_has_uninherited_method(
+                                        &env.mem, curr_class, load_sel,
+                                    )
+                                {
+                                    inherited.push(curr_class);
+                                    processed.insert(curr_class);
+                                }
+                                curr_class = env.objc.get_superclass(curr_class);
                             }
-                            env.exit_if_last_thread();
-                        } else if entry_point_is_lc_main && !env.is_guest_termination_requested() {
-                            // LC_MAIN enters main directly: dyld normally
-                            // passes its return value to exit(), including
-                            // the registered atexit handlers.
-                            let code = env.cpu.regs()[0] as i32;
-                            crate::libc::stdlib::exit_session(env, code);
+                            to_be_loaded.extend(inherited.into_iter().rev());
                         }
+                    }
+                    for &class in &to_be_loaded {
+                        () = objc::msg_send_no_initialize(env, (class, load_sel));
+                    }
 
-                        if env.guest_termination_requested.is_some() {
-                            echo!(
-                                "Guest requested controlled termination; returning to the host."
+                    // Static initializers for libraries must be run before
+                    // the initializer in the app binary.
+                    for bin_idx in env.get_sorted_bin_indices().unwrap() {
+                        let Some(bin) = env.bins.get(bin_idx) else {
+                            continue;
+                        };
+                        let Some(section) =
+                            bin.get_section(mach_o::SectionType::ModInitFuncPointers)
+                        else {
+                            continue;
+                        };
+
+                        log_dbg!("Calling static initializers for {:?}", bin.name);
+                        assert!(section.size % 4 == 0);
+
+                        let base: mem::ConstPtr<abi::GuestFunction> =
+                            mem::Ptr::from_bits(section.addr);
+
+                        let count = section.size / 4;
+                        for i in 0..count {
+                            let func = env.mem.read(base + i);
+
+                            log_dbg!(
+                                "Calling static initializer at {:?} from {:?}",
+                                func,
+                                (base + i)
                             );
-                        } else if !exited_via_pthread {
-                            panic!("Main function exited unexpectedly!");
-                        }
-                    })
-                }));
 
-                if let Err(e) = res {
-                    let panic_cell = env.panic_cell.clone();
-                    panic_cell.set(Some(env));
-                    std::panic::resume_unwind(e);
-                }
-                env
-            },
-        );
+                            () = func.call_from_host(env, ());
+                        }
+                        log_dbg!("Static initialization done");
+                    }
+
+                    {
+                        let bin_path = env.bundle.executable_path();
+
+                        let envp_list: Vec<String> = env
+                            .env_vars
+                            .clone()
+                            .iter_mut()
+                            .map(|tuple| {
+                                [
+                                    std::str::from_utf8(tuple.0).unwrap(),
+                                    "=",
+                                    env.mem.cstr_at_utf8(*tuple.1).unwrap(),
+                                ]
+                                .concat()
+                            })
+                            .collect();
+
+                        let envp_ref_list: Vec<&str> =
+                            envp_list.iter().map(|keyvalue| keyvalue.as_str()).collect();
+
+                        let bin_path_apple_key = format!("executable_path={}", bin_path.as_str());
+
+                        let argv = Vec::from_iter(
+                            std::iter::once(bin_path.as_str())
+                                .chain(app_args.iter().map(|s| s.as_str())),
+                        );
+
+                        let envp = envp_ref_list.as_slice();
+                        let apple = &[bin_path_apple_key.as_str()];
+                        stack::prep_stack_for_start(
+                            &mut env.mem,
+                            &mut env.cpu,
+                            &argv,
+                            envp,
+                            apple,
+                            entry_point_is_lc_main,
+                        );
+                    }
+
+                    // Manually call here, since running call_from_host pushes
+                    // a stack frame and disrupts abi for _start.
+                    env.cpu
+                        .branch_with_link(entry_point_addr, env.dyld.thread_exit_routine());
+
+                    env.run_call();
+
+                    let exited_via_pthread = env.threads[0].return_value.is_some();
+                    if exited_via_pthread {
+                        if !env.is_guest_termination_requested() {
+                            libc::pthread::key::cleanup_thread_tsd(env);
+                        }
+                        env.exit_if_last_thread();
+                    } else if entry_point_is_lc_main && !env.is_guest_termination_requested() {
+                        // LC_MAIN enters main directly: dyld normally
+                        // passes its return value to exit(), including
+                        // the registered atexit handlers.
+                        let code = env.cpu.regs()[0] as i32;
+                        crate::libc::stdlib::exit_session(env, code);
+                    }
+
+                    if env.guest_termination_requested.is_some() {
+                        echo!("Guest requested controlled termination; returning to the host.");
+                    } else if !exited_via_pthread {
+                        panic!("Main function exited unexpectedly!");
+                    }
+                })
+            });
 
         let main_thread = Thread {
             active: true,
@@ -1167,6 +1185,7 @@ impl Environment {
             last_deliberate_trap_bypass: None,
             cpu_skipped_instruction_sites: HashMap::new(),
             guest_termination_requested: None,
+            interrupted_main_context: None,
             missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
             host_to_guest_stack_frames: Vec::new(),
@@ -1256,6 +1275,7 @@ impl Environment {
     }
 
     /// Set up the emulator environment without loading an app binary.
+    /// Headless mode also supports framework and lifecycle regression tests.
     ///
     /// This is a special mode that only exists to support the app picker, which
     /// uses the emulated environment to draw its UI and process input. Filling
@@ -1279,7 +1299,6 @@ impl Environment {
 
         let launch_image = None;
 
-        assert!(!options.headless);
         // On macOS, passing no icon restores the bundle's Dock icon after a
         // game has replaced it through SDL_SetWindowIcon.
         #[cfg(target_os = "macos")]
@@ -1289,23 +1308,27 @@ impl Environment {
         };
         #[cfg(not(target_os = "macos"))]
         let window_icon = Some(icon);
-        let window = Some(Box::new(window::Window::new(
-            &format!(
-                "{} {}{}{}",
-                super::DISPLAY_NAME,
-                super::branding(),
-                if super::branding().is_empty() {
-                    ""
-                } else {
-                    " "
-                },
-                super::VERSION
-            ),
-            window_icon,
-            launch_image,
-            &options,
-            /* is_app_picker: */ true,
-        )?));
+        let window = if options.headless {
+            None
+        } else {
+            Some(Box::new(window::Window::new(
+                &format!(
+                    "{} {}{}{}",
+                    super::DISPLAY_NAME,
+                    super::branding(),
+                    if super::branding().is_empty() {
+                        ""
+                    } else {
+                        " "
+                    },
+                    super::VERSION
+                ),
+                window_icon,
+                launch_image,
+                &options,
+                /* is_app_picker: */ true,
+            )?))
+        };
 
         let mut mem = mem::Mem::new();
         let heap_cap = match options.memory_limit_mb {
@@ -1376,6 +1399,7 @@ impl Environment {
             last_deliberate_trap_bypass: None,
             cpu_skipped_instruction_sites: HashMap::new(),
             guest_termination_requested: None,
+            interrupted_main_context: None,
             missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
             host_to_guest_stack_frames: Vec::new(),
@@ -1397,7 +1421,9 @@ impl Environment {
         env.cpu.set_cpsr(cpu::Cpu::CPSR_USER_MODE);
 
         // The quick menu belongs to games, not to the picker's own screen.
-        crate::quick_menu::disable();
+        if !env.options.headless {
+            crate::quick_menu::disable();
+        }
 
         // GDB server setup would be done here, but there's no need for it.
 
@@ -1453,6 +1479,7 @@ impl Environment {
             last_deliberate_trap_bypass: None,
             cpu_skipped_instruction_sites: HashMap::new(),
             guest_termination_requested: None,
+            interrupted_main_context: None,
             missing_unity_player_archive: None,
             guest_control_flow_redirected: false,
             host_to_guest_stack_frames: Vec::new(),
@@ -1735,39 +1762,31 @@ impl Environment {
         let thread_stack =
             DefaultStack::new(16 * 1024 * 1024).expect("failed to allocate guest coroutine stack");
         let thread_routine =
-            Coroutine::with_stack(thread_stack, move |yielder, mut env: Environment| {
+            Coroutine::with_stack(thread_stack, move |yielder, env: Environment| {
                 log_dbg!(
                     "touchHLE: guest worker thread now running (start_routine={:#x})",
                     start_routine.addr_with_thumb_bit()
                 );
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    env.with_yielder(yielder, move |env| {
-                        let regs = env.cpu.regs_mut();
-                        regs[cpu::Cpu::LR] = env.dyld.thread_exit_routine().addr_with_thumb_bit();
-                        regs[cpu::Cpu::SP] = stack_high_addr;
-                        regs[0] = user_data.to_bits();
+                run_guest_coroutine(yielder, env, move |env| {
+                    let regs = env.cpu.regs_mut();
+                    regs[cpu::Cpu::LR] = env.dyld.thread_exit_routine().addr_with_thumb_bit();
+                    regs[cpu::Cpu::SP] = stack_high_addr;
+                    regs[0] = user_data.to_bits();
 
-                        env.cpu.set_cpsr(
-                            cpu::Cpu::CPSR_USER_MODE
-                                | ((start_routine.is_thumb() as u32) * cpu::Cpu::CPSR_THUMB),
-                        );
-                        let return_value: mem::MutVoidPtr =
-                            start_routine.call_from_host(env, (user_data,));
-                        if !env.is_guest_termination_requested() {
-                            libc::pthread::key::cleanup_thread_tsd(env);
-                        }
-                        let curr_thread = &mut env.threads[env.current_thread];
-                        curr_thread.return_value = Some(return_value);
-                        env.exit_if_last_thread();
-                        env.threads[env.current_thread].active = false;
-                    });
-                }));
-                if let Err(e) = res {
-                    let panic_cell = env.panic_cell.clone();
-                    panic_cell.set(Some(env));
-                    std::panic::resume_unwind(e);
-                }
-                env
+                    env.cpu.set_cpsr(
+                        cpu::Cpu::CPSR_USER_MODE
+                            | ((start_routine.is_thumb() as u32) * cpu::Cpu::CPSR_THUMB),
+                    );
+                    let return_value: mem::MutVoidPtr =
+                        start_routine.call_from_host(env, (user_data,));
+                    if !env.is_guest_termination_requested() {
+                        libc::pthread::key::cleanup_thread_tsd(env);
+                    }
+                    let curr_thread = &mut env.threads[env.current_thread];
+                    curr_thread.return_value = Some(return_value);
+                    env.exit_if_last_thread();
+                    env.threads[env.current_thread].active = false;
+                })
             });
 
         self.threads.push(Thread {
@@ -2077,6 +2096,33 @@ impl Environment {
         );
     }
 
+    /// Deliver a user-requested shutdown on the guest main thread. Its
+    /// interrupted call stays parked while callbacks can wait for worker
+    /// threads (for example, to finish saving a world).
+    fn begin_return_to_picker(&mut self, current_context: &mut HostContext) -> bool {
+        if self.interrupted_main_context.is_some() {
+            return true;
+        }
+        if !self.threads[0].active {
+            return false;
+        }
+        let stack = DefaultStack::new(16 * 1024 * 1024)
+            .expect("failed to allocate UIKit shutdown coroutine stack");
+        let shutdown = Coroutine::with_stack(stack, |yielder, env: Environment| {
+            run_guest_coroutine(yielder, env, |env| {
+                crate::frameworks::uikit::ui_application::prepare_for_termination(env);
+                env.request_guest_termination(GuestTermination::ReturnToPicker);
+            })
+        });
+        let mut interrupted = Some(std::mem::replace(current_context, shutdown));
+        if self.current_thread != 0 {
+            self.switch_thread(&mut interrupted, 0);
+        }
+        self.interrupted_main_context = interrupted;
+        self.threads[0].blocked_by = ThreadBlock::NotBlocked;
+        true
+    }
+
     pub(crate) fn run(mut self) -> Option<GuestTermination> {
         let mut curr_host_context = self.threads[0].host_context.take().unwrap();
         let panic_cell = self.panic_cell.clone();
@@ -2092,9 +2138,18 @@ impl Environment {
             }
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            if self.window.as_ref().is_some_and(|window| window.close_requested()) {
-                self.threads[self.current_thread].host_context = Some(curr_host_context);
-                return Some(GuestTermination::ReturnToPicker);
+            if !self.is_app_picker
+                && self.interrupted_main_context.is_none()
+                && self
+                    .window
+                    .as_ref()
+                    .is_some_and(|window| window.close_requested())
+            {
+                echo!("Game window closed; saving app state before returning to the app picker.");
+                if !self.begin_return_to_picker(&mut curr_host_context) {
+                    self.threads[self.current_thread].host_context = Some(curr_host_context);
+                    return Some(GuestTermination::ReturnToPicker);
+                }
             }
 
             if stepping {
@@ -2158,8 +2213,10 @@ impl Environment {
                 self.apply_quick_menu(&applied);
             }
             if crate::quick_menu::take_exit_request() {
-                self.threads[self.current_thread].host_context = Some(curr_host_context);
-                return Some(GuestTermination::ReturnToPicker);
+                if !self.begin_return_to_picker(&mut curr_host_context) {
+                    self.threads[self.current_thread].host_context = Some(curr_host_context);
+                    return Some(GuestTermination::ReturnToPicker);
+                }
             }
             if let Some(speed) = crate::trainer_ui::take_speed_request() {
                 self.guest_clock.set_speed(speed);
@@ -4516,11 +4573,12 @@ impl Drop for Environment {
         if let Some(w) = self.window.as_mut() {
             w.on_main_stack = false;
         }
-        if self.threads.is_empty()
-            || self
-                .threads
-                .iter()
-                .all(|thread| thread.host_context.is_none())
+        if self.interrupted_main_context.is_none()
+            && (self.threads.is_empty()
+                || self
+                    .threads
+                    .iter()
+                    .all(|thread| thread.host_context.is_none()))
         {
             ENVIRONMENT_INSTANCE_EXISTS.store(false, std::sync::atomic::Ordering::SeqCst);
             return;
@@ -4528,6 +4586,13 @@ impl Drop for Environment {
         unsafe {
             let mut env = std::mem::replace(self, Environment::new_fake());
             let panic_cell = env.panic_cell.clone();
+            let interrupted = env.interrupted_main_context.take();
+            panic_cell.set(Some(env));
+            std::mem::drop(interrupted);
+            env = panic_cell.take().unwrap_or_else(|| {
+                log_no_panic!("Did not receive env from interrupted shutdown context!");
+                std::process::exit(-1)
+            });
             let threads_len = env.threads.len();
             for i in 0..threads_len {
                 let host_context = env.threads[i].host_context.take();
@@ -4641,6 +4706,194 @@ fn direct_call_is_consistent_with_fault(call_site: u32, target: u32, fault_pc: u
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use crate::frameworks::foundation::ns_string;
+    use crate::objc::{class_addMethod, id, msg, msg_class, SEL};
+    use std::sync::Mutex;
+
+    static CALLBACKS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn delegate_callback(env: &mut Environment, _: id, selector: SEL, application: id) {
+        assert_eq!(env.current_thread, 0);
+        let shared: id = msg_class![env; UIApplication sharedApplication];
+        assert_eq!(application, shared);
+        let name = selector.as_str(&env.mem).to_owned();
+        CALLBACKS.lock().unwrap().push(name.clone());
+        if name == "applicationWillTerminate:" {
+            // Re-entrancy must not deliver the lifecycle twice.
+            crate::frameworks::uikit::ui_application::prepare_for_termination(env);
+            let result = env.mem.alloc_and_write(mem::MutVoidPtr::null());
+            env.join_with_thread(1, result);
+            assert!(env.mem.read(result).is_null());
+            env.mem.free(result.cast_void());
+        }
+    }
+
+    fn notification_callback(env: &mut Environment, _: id, _: SEL, notification: id) {
+        assert_eq!(env.current_thread, 0);
+        let name: id = msg![env; notification name];
+        let object: id = msg![env; notification object];
+        let shared: id = msg_class![env; UIApplication sharedApplication];
+        assert_eq!(object, shared);
+        CALLBACKS
+            .lock()
+            .unwrap()
+            .push(ns_string::to_rust_string(env, name).into_owned());
+    }
+
+    fn save_worker(env: &mut Environment, _: mem::MutVoidPtr) -> mem::MutVoidPtr {
+        assert_eq!(env.current_thread, 1);
+        CALLBACKS
+            .lock()
+            .unwrap()
+            .push("save worker completed".to_owned());
+        mem::MutVoidPtr::null()
+    }
+
+    // UIKit calls the delegate before posting each notification. Apps can
+    // finish saving on worker threads before the environment is destroyed.
+    // https://developer.apple.com/documentation/uikit/uiapplicationdelegate/applicationwillterminate(_:)
+    #[test]
+    fn return_to_picker_delivers_main_thread_lifecycle_and_waits_for_save_worker() {
+        let _lock = ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        CALLBACKS.lock().unwrap().clear();
+        let options = options::Options {
+            headless: true,
+            popup_errors: false,
+            ..Default::default()
+        };
+        let icon = image::Image::from_pixels(1, 1, vec![0; 4]);
+        let mut env = Environment::new_without_app(options, icon).unwrap();
+        let class = env.objc.get_known_class("NSObject", &mut env.mem);
+        let types = env.mem.alloc_and_write_cstr(b"v@:@");
+        let delegate_imp = env.dyld.create_guest_function(
+            &mut env.mem,
+            "[shutdown delegate test]",
+            &(delegate_callback as fn(&mut Environment, id, SEL, id)),
+        );
+        let notification_imp = env.dyld.create_guest_function(
+            &mut env.mem,
+            "[shutdown observer test]",
+            &(notification_callback as fn(&mut Environment, id, SEL, id)),
+        );
+        for (name, imp) in [
+            ("applicationWillResignActive:", delegate_imp),
+            ("applicationWillTerminate:", delegate_imp),
+            ("recordShutdownNotification:", notification_imp),
+        ] {
+            let selector = env
+                .objc
+                .register_host_selector(name.to_owned(), &mut env.mem);
+            assert!(class_addMethod(
+                &mut env,
+                class,
+                selector,
+                imp.to_ptr(),
+                types.cast_const()
+            ));
+        }
+        let (delegate, application, center) = {
+            let env = &mut env;
+            let delegate: id = msg_class![env; NSObject new];
+            let application =
+                crate::frameworks::uikit::ui_application::create_test_application(env);
+            assert!(!application.is_null());
+            () = msg![env; application setDelegate:delegate];
+            let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+            (delegate, application, center)
+        };
+        let selector = env
+            .objc
+            .lookup_selector("recordShutdownNotification:")
+            .unwrap();
+        for name in [
+            "UIApplicationWillResignActiveNotification",
+            "UIApplicationWillTerminateNotification",
+        ] {
+            let name = ns_string::get_static_str(&mut env, name);
+            () = msg![&mut env; center addObserver:delegate selector:selector name:name object:application];
+        }
+        let worker = env.dyld.create_guest_function(
+            &mut env.mem,
+            "[shutdown save worker test]",
+            &(save_worker as fn(&mut Environment, mem::MutVoidPtr) -> mem::MutVoidPtr),
+        );
+        assert_eq!(
+            env.new_thread(
+                worker,
+                mem::MutVoidPtr::null(),
+                mem::Mem::SECONDARY_THREAD_DEFAULT_STACK_SIZE
+            ),
+            1
+        );
+        let stack = DefaultStack::new(16 * 1024 * 1024).unwrap();
+        let mut original: HostContext =
+            Coroutine::with_stack(stack, |yielder, env: Environment| {
+                run_guest_coroutine(yielder, env, |env| {
+                    let run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
+                    () = msg![env; run_loop run];
+                    panic!("interrupted guest execution resumed during shutdown");
+                })
+            });
+        env = match original.resume(env) {
+            corosensei::CoroutineResult::Yield(env) => env,
+            corosensei::CoroutineResult::Return(_) => panic!("guest did not suspend"),
+        };
+        assert!(env.begin_return_to_picker(&mut original));
+        env.threads[0].host_context = Some(original);
+        assert!(matches!(env.run(), Some(GuestTermination::ReturnToPicker)));
+        assert_eq!(
+            *CALLBACKS.lock().unwrap(),
+            [
+                "applicationWillResignActive:",
+                "UIApplicationWillResignActiveNotification",
+                "applicationWillTerminate:",
+                "save worker completed",
+                "UIApplicationWillTerminateNotification",
+            ]
+        );
+    }
+
+    /// Ordinary failures must leave the coroutine as errors, including when
+    /// the entry is isolated for Windows forced-unwind compatibility.
+    #[test]
+    fn guest_coroutine_preserves_panic_and_environment_ownership() {
+        let _lock = ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        let options = options::Options {
+            headless: true,
+            popup_errors: false,
+            ..Default::default()
+        };
+        let icon = image::Image::from_pixels(1, 1, vec![0; 4]);
+        let env = Environment::new_without_app(options, icon).unwrap();
+        let panic_cell = env.panic_cell.clone();
+        let mut context: HostContext = Coroutine::new(|yielder, env: Environment| {
+            run_guest_coroutine(yielder, env, |env| {
+                env.cpu.regs_mut()[3] = 42;
+                panic!("intentional guest coroutine failure");
+            })
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| context.resume(env)));
+        let payload = match result {
+            Err(payload) => payload,
+            Ok(_) => panic!("guest coroutine failure was masked"),
+        };
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"intentional guest coroutine failure")
+        );
+        let recovered = panic_cell.take().expect("guest panic lost the environment");
+        assert!(recovered.options.headless);
+        assert!(recovered.yielder.is_null());
+        assert_eq!(recovered.cpu.regs()[3], 42);
+        drop(context);
+        drop(recovered);
+        assert!(panic_cell.take().is_none());
+    }
 }
 
 #[cfg(test)]

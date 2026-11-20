@@ -5,6 +5,31 @@
  */
 //! Cross-platform memory management wrappers using the host's system calls.
 
+/// Windows kernel I/O cannot invoke the user-mode fault handler that commits
+/// guest pages. Touch each page before passing a buffer to ReadFile/Winsock.
+/// Reading preserves its contents and is cheap for already committed pages.
+/// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile
+pub(super) fn prepare_for_host_io(bytes: &[u8]) {
+    #[cfg(windows)]
+    if !bytes.is_empty() {
+        let pointer = bytes.as_ptr();
+        let page = crate::mem::PAGE_SIZE as usize;
+        // SAFETY: All offsets are within the validated guest buffer. Access
+        // faults inside the guest mapping commit its reserved backing pages.
+        unsafe {
+            std::ptr::read_volatile(pointer);
+        }
+        let first_boundary = page - (pointer as usize & (page - 1));
+        for offset in (first_boundary..bytes.len()).step_by(page) {
+            unsafe {
+                std::ptr::read_volatile(pointer.add(offset));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = bytes;
+}
+
 /// Protects a guest memory segment from host reads and writes.
 ///
 /// # Safety

@@ -401,6 +401,35 @@ impl Allocator {
             .any(|unused_chunk| unused_chunk.trisect_by(chunk).is_some())
     }
 
+    /// Allocate free pages at a fixed address, accounting for them like heap
+    /// allocations so the RAM limit and subsequent free remain balanced.
+    pub fn alloc_fixed(&mut self, base: VAddr, size: GuestUSize) -> bool {
+        assert!(size != 0 && size.is_multiple_of(PAGE_SIZE));
+        let chunk = Chunk::new(base, size);
+        if !self.is_free(chunk) || !self.fits_under_limit(size) {
+            return false;
+        }
+        self.reserve(chunk);
+        self.set_allocated_bytes(self.allocated_bytes.saturating_add(size));
+        true
+    }
+
+    /// Find free pages at or above `minimum`, honoring a Mach alignment mask.
+    pub fn alloc_aligned(&mut self, size: GuestUSize, mask: VAddr, minimum: VAddr) -> VAddr {
+        let mask = mask | PAGE_SIZE_ALIGN_MASK;
+        let base = self.unused_chunks.iter().find_map(|chunk| {
+            let start = chunk.base.max(minimum);
+            let address = start.checked_add(mask)? & !mask;
+            let end = u64::from(address) + u64::from(size);
+            (address >= start && end <= u64::from(chunk.base) + u64::from(chunk.size.get()))
+                .then_some(address)
+        });
+        match base {
+            Some(base) if self.alloc_fixed(base, size) => base,
+            _ => 0,
+        }
+    }
+
     pub fn alloc(&mut self, size: GuestUSize) -> VAddr {
         // ИСПРАВЛЕНИЕ: Выравнивание может привести к переполнению (overflow),
         // если игра запрашивает гигантский объем памяти (например, 0xffffffff).
@@ -646,6 +675,32 @@ mod memory_limit_tests {
         allocator.reserve(Chunk::new(0, PAGE_SIZE));
         allocator.reserve(Chunk::new(PAGE_SIZE, 64 * PAGE_SIZE));
         allocator
+    }
+
+    #[test]
+    fn fixed_and_aligned_pages_obey_limits_and_release_their_space() {
+        let mut allocator = arena();
+        allocator.set_memory_limit(Some(2 * PAGE_SIZE));
+        let fixed = 0x100000;
+        assert!(allocator.alloc_fixed(fixed, PAGE_SIZE));
+        assert!(!allocator.alloc_fixed(fixed, PAGE_SIZE));
+        let aligned = allocator.alloc_aligned(PAGE_SIZE, 0xffff, fixed + PAGE_SIZE);
+        assert!(aligned > fixed && aligned & 0xffff == 0);
+        assert_eq!(allocator.alloc(PAGE_SIZE), 0);
+        assert_eq!(allocator.free(fixed), PAGE_SIZE);
+        assert!(allocator.alloc_fixed(fixed, PAGE_SIZE));
+        assert_eq!(allocator.free(aligned), PAGE_SIZE);
+        assert_eq!(allocator.free(fixed), PAGE_SIZE);
+        // Releasing fixed mappings must not subtract an unrelated live block
+        // from the heap total or leave their address ranges reserved.
+        let live = allocator.alloc(PAGE_SIZE);
+        let other_fixed = 0x200000;
+        assert_ne!(live, other_fixed);
+        assert!(allocator.alloc_fixed(other_fixed, PAGE_SIZE));
+        assert_eq!(allocator.free(other_fixed), PAGE_SIZE);
+        assert_eq!(allocator.alloc(2 * PAGE_SIZE), 0);
+        assert_eq!(allocator.free(live), PAGE_SIZE);
+        assert_eq!(allocator.allocated_bytes, 0);
     }
 
     #[test]

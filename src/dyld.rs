@@ -442,7 +442,8 @@ pub struct Dyld {
     linked_host_functions: Vec<(&'static str, HostFunction)>,
     return_to_host_routine: Option<GuestFunction>,
     thread_exit_routine: Option<GuestFunction>,
-    constants_to_link_later: Vec<(MutPtr<ConstVoidPtr>, &'static HostConstant)>,
+    constants_to_link_later: Vec<(MutPtr<ConstVoidPtr>, &'static str)>,
+    host_constant_addresses: HashMap<&'static str, ConstVoidPtr>,
     non_lazy_host_functions: HashMap<&'static str, GuestFunction>,
     /// Cache of Swift runtime function trampolines (see `swift_runtime`).
     swift_fn_cache: HashMap<String, GuestFunction>,
@@ -495,6 +496,7 @@ impl Dyld {
             return_to_host_routine: None,
             thread_exit_routine: None,
             constants_to_link_later: Vec::new(),
+            host_constant_addresses: HashMap::new(),
             non_lazy_host_functions: HashMap::new(),
             swift_fn_cache: HashMap::new(),
             swift_fn_names: HashMap::new(),
@@ -540,6 +542,7 @@ impl Dyld {
         bins: &[MachO],
         mem: &mut Mem,
         objc: &mut ObjC,
+        preserve_stubs: bool,
     ) {
         assert!(self.return_to_host_routine.is_none());
         assert!(self.thread_exit_routine.is_none());
@@ -580,10 +583,13 @@ impl Dyld {
         }
         objc.register_host_selectors(mem);
         for bin in bins {
-            self.setup_lazy_linking(bin, mem);
             // Must happen before `register_bin_classes`, else superclass
             // pointers will be wrong.
             self.do_non_lazy_linking(bin, bins, mem, objc);
+            // Eager binding overwrites pointer slots. Apply relocation addends
+            // first so a slot shared with an external relocation is not bound
+            // twice, treating the first resolved address as an addend.
+            self.setup_lazy_linking(bin, mem, preserve_stubs.then_some(bins));
         }
 
         for bin in bins {
@@ -843,7 +849,7 @@ impl Dyld {
     ///
     /// These stubs already exist in the binary, but they need to be rewritten
     /// so that they will invoke our dynamic linker.
-    fn setup_lazy_linking(&self, bin: &MachO, mem: &mut Mem) {
+    fn setup_lazy_linking(&mut self, bin: &MachO, mem: &mut Mem, preserve: Option<&[MachO]>) {
         let Some(stubs) = bin.get_section(SectionType::SymbolStubs) else {
             return;
         };
@@ -916,6 +922,31 @@ impl Dyld {
                 continue;
             }
 
+            if let Some(bins) = preserve {
+                // iOS dyld binds the pointer slot, leaving these instructions
+                // intact. Engines can therefore inspect/checksum their code.
+                // https://github.com/apple-oss-distributions/dyld/blob/dyld-210.2.3/src/ImageLoaderMachOClassic.cpp
+                let slot = match entry_size {
+                    4 => {
+                        let instruction = mem.read(ptr);
+                        assert_eq!(instruction & !0xfff, Self::SYMBOL_STUB1_INSTRUCTIONS[0]);
+                        ptr.to_bits().wrapping_add(8 + (instruction & 0xfff))
+                    }
+                    12 => mem.read(ptr + 2),
+                    16 => ptr
+                        .to_bits()
+                        .wrapping_add(12)
+                        .wrapping_add(mem.read(ptr + 3)),
+                    _ => unreachable!(),
+                };
+                let symbol = indirect_info.indirect_undef_symbols[i as usize]
+                    .as_deref()
+                    .unwrap();
+                let target = self.resolve_preserved_stub(bin, bins, mem, symbol);
+                mem.write(Ptr::<u32, true>::from_bits(slot), target);
+                continue;
+            }
+
             // For convenience, make the stub return once the SVC is done
             // (Otherwise we have to manually update the PC)
             if entry_size == 4 {
@@ -943,6 +974,58 @@ impl Dyld {
                 skipped_stubs
             );
         }
+    }
+
+    /// Use the same symbol precedence as the lazy linker, but bind up front
+    /// so calls need no patches inside the app's instruction stream.
+    fn resolve_preserved_stub(
+        &mut self,
+        bin: &MachO,
+        bins: &[MachO],
+        mem: &mut Mem,
+        symbol: &str,
+    ) -> u32 {
+        if let Some(address) = self.guest_cxxabi_export(symbol) {
+            register_cxxabi_typeinfo_vtable(
+                symbol,
+                address,
+                &mut self.cxxabi_typeinfo_vtable_kinds,
+            );
+            return address;
+        }
+        if let Some(address) = self.non_lazy_host_functions.get(symbol) {
+            return address.addr_with_thumb_bit();
+        }
+        if let Some(address) = self.cxxabi_intercept(mem, symbol) {
+            return address.addr_with_thumb_bit();
+        }
+        if let Some(address) = bins
+            .iter()
+            .find_map(|image| image.external_symbols.get(symbol))
+        {
+            let address = *address;
+            register_cxxabi_typeinfo_vtable(
+                symbol,
+                address,
+                &mut self.cxxabi_typeinfo_vtable_kinds,
+            );
+            return address;
+        }
+        if let Ok(address) = self.create_proc_address_no_inval(mem, symbol) {
+            return address.addr_with_thumb_bit();
+        }
+        if let Some(address) = local_code_symbol(bin, symbol) {
+            return address;
+        }
+        log!("Warning: unimplemented import {symbol}; binding existing return-0 handler");
+        let symbol: &'static str = Box::leak(symbol.to_owned().into_boxed_str());
+        let function = self.create_guest_function(
+            mem,
+            symbol,
+            &(unimplemented_function_stub as fn(&mut Environment) -> i32),
+        );
+        self.non_lazy_host_functions.insert(symbol, function);
+        function.addr_with_thumb_bit()
     }
 
     /// Link non-lazy symbols for a loaded binary.
@@ -1103,47 +1186,6 @@ impl Dyld {
                 mem.write(fn_ptr + 1, encode_a32_trap());
                 log_dbg!("Stubbed ___gxx_personality_sj0 -> {:#x}", fn_ptr.to_bits());
                 fn_ptr.cast().cast_const()
-            } else if name == "_objc_msgSendSuper" || name == "_objc_msgSendSuper_stret" {
-                // `objc_msgSendSuper` (the non-`2` variant) takes a pointer to
-                // an `objc_super` struct where the `class` field points directly
-                // to the *superclass* to start method lookup from (unlike
-                // `objc_msgSendSuper2` where it's the *current* class and the
-                // runtime dereferences to the super).
-                //
-                // Some apps (FlyCraft, GameStop) have non-lazy relocations to
-                // these symbols from WebKit/SDK stubs compiled with older
-                // toolchains.  We resolve them to `objc_msgSendSuper2` /
-                // `objc_msgSendSuper2_stret` respectively because:
-                //   1. The runtime always finds the method by walking up from
-                //      the given class — whether we start from superclass or
-                //      from (class whose super we look up) the result is
-                //      identical in practice for apps.
-                //   2. All touchHLE-implemented classes use the `2` variant
-                //      internally anyway.
-                //
-                // Create a trampoline that calls our existing host
-                // implementation of the `2` variant.
-                let target_name = if name == "_objc_msgSendSuper" {
-                    "_objc_msgSendSuper2"
-                } else {
-                    "_objc_msgSendSuper2_stret"
-                };
-                if let Some((sym, _)) =
-                    search_host_dylibs(|dylib| dylib.function_exports, target_name)
-                {
-                    let trampoline_ptr = self
-                        .create_proc_address_no_inval(mem, sym)
-                        .unwrap()
-                        .to_ptr();
-                    log_dbg!("Linked {} -> {} at {:?}", name, target_name, trampoline_ptr);
-                    trampoline_ptr
-                } else {
-                    // Fallback: a BX LR stub that returns 0
-                    let fn_ptr: MutPtr<u32> = mem.alloc(8).cast();
-                    mem.write(fn_ptr + 0, encode_a32_ret());
-                    mem.write(fn_ptr + 1, encode_a32_trap());
-                    fn_ptr.cast().cast_const()
-                }
             } else if name == "__ZTId"
                 || name == "__ZTIf"
                 || name == "__ZTIi"
@@ -1296,7 +1338,7 @@ impl Dyld {
                     trampoline_ptr
                 );
                 trampoline_ptr
-            } else if let Some((_, template)) =
+            } else if let Some((symbol, _)) =
                 search_host_dylibs(|dylib| dylib.constant_exports, name)
             {
                 // Constants from host dylibs need late linking (they may
@@ -1306,7 +1348,7 @@ impl Dyld {
                 // constant ONLY via external relocations without a matching
                 // __nl_symbol_ptr entry (e.g. ___sF in Digital Chocolate
                 // games compiled with older toolchains).
-                self.constants_to_link_later.push((ptr_ptr, template));
+                self.constants_to_link_later.push((ptr_ptr, symbol));
                 continue;
             } else {
                 unhandled_relocations
@@ -1393,35 +1435,6 @@ impl Dyld {
                 continue;
             }
 
-            // `objc_msgSendSuper` / `objc_msgSendSuper_stret` referenced
-            // through `__nl_symbol_ptr` (same symbols as the special case in
-            // the external-relocation loop above: apps built with older
-            // toolchains emit non-lazy references from SDK stubs). Resolve to
-            // the existing host `objc_msgSendSuper2` / `_stret` trampolines.
-            if symbol == "_objc_msgSendSuper" || symbol == "_objc_msgSendSuper_stret" {
-                let target_name = if symbol == "_objc_msgSendSuper" {
-                    "_objc_msgSendSuper2"
-                } else {
-                    "_objc_msgSendSuper2_stret"
-                };
-                if let Some((sym, _)) =
-                    search_host_dylibs(|dylib| dylib.function_exports, target_name)
-                {
-                    let trampoline_ptr = self
-                        .create_proc_address_no_inval(mem, sym)
-                        .unwrap()
-                        .to_ptr();
-                    mem.write(ptr_ptr, trampoline_ptr);
-                    log_dbg!(
-                        "Linked non-lazy {} -> {} at {:?}",
-                        symbol,
-                        target_name,
-                        trampoline_ptr
-                    );
-                    continue;
-                }
-            }
-
             if let Some((symbol, _)) = search_host_dylibs(|dylib| dylib.function_exports, symbol) {
                 // We want the same symbol name to always point to the same
                 // function. It could point to a specific stub entry, but it's
@@ -1440,11 +1453,10 @@ impl Dyld {
                 log_dbg!("{:?}", self.non_lazy_host_functions);
                 continue;
             }
-            if let Some((_, template)) = search_host_dylibs(|dylib| dylib.constant_exports, symbol)
-            {
+            if let Some((symbol, _)) = search_host_dylibs(|dylib| dylib.constant_exports, symbol) {
                 // Delay linking of constant until we have a `&mut Environment`,
                 // that makes it much easier to build NSString objects etc.
-                self.constants_to_link_later.push((ptr_ptr, template));
+                self.constants_to_link_later.push((ptr_ptr, symbol));
                 continue;
             }
 
@@ -1686,22 +1698,34 @@ impl Dyld {
     pub fn do_late_linking(env: &mut Environment) {
         // TODO: do symbols ever appear in __nl_symbol_ptr multiple times?
         let to_link = std::mem::take(&mut env.dyld.constants_to_link_later);
-        for (symbol_ptr_ptr, template) in to_link {
-            let symbol_ptr: ConstVoidPtr = match template {
-                HostConstant::NSString(static_str) => {
-                    let string_ptr = ns_string::get_static_str(env, static_str);
-                    let string_ptr_ptr = env.mem.alloc_and_write(string_ptr);
-                    string_ptr_ptr.cast().cast_const()
-                }
-                HostConstant::NullPtr => {
-                    let null_ptr: ConstVoidPtr = Ptr::null();
-                    let null_ptr_ptr = env.mem.alloc_and_write(null_ptr);
-                    null_ptr_ptr.cast().cast_const()
-                }
-                HostConstant::Custom(f) => f(env),
-            };
+        for (symbol_ptr_ptr, symbol) in to_link {
+            let symbol_ptr = Self::constant_address(env, symbol).unwrap();
             env.mem.write(symbol_ptr_ptr, symbol_ptr.cast());
         }
+    }
+
+    /// Return the address of an exported data symbol, sharing its storage
+    /// between normal linking and dlsym. A pointer-valued constant needs a
+    /// slot containing the pointer, not the pointee's address.
+    pub(crate) fn constant_address(env: &mut Environment, symbol: &str) -> Option<ConstVoidPtr> {
+        if let Some(&address) = env.dyld.host_constant_addresses.get(symbol) {
+            return Some(address);
+        }
+        let &(symbol, ref template) = search_host_dylibs(|dylib| dylib.constant_exports, symbol)?;
+        let address = match template {
+            HostConstant::NSString(value) => {
+                let value = ns_string::get_static_str(env, value);
+                env.mem.alloc_and_write(value).cast().cast_const()
+            }
+            HostConstant::NullPtr => env
+                .mem
+                .alloc_and_write(ConstVoidPtr::null())
+                .cast()
+                .cast_const(),
+            HostConstant::Custom(create) => create(env),
+        };
+        env.dyld.host_constant_addresses.insert(symbol, address);
+        Some(address)
     }
 
     /// Return a host function that can be called to handle an SVC instruction
@@ -2550,12 +2574,14 @@ mod lazy_link_recovery_tests {
                 dyld_indirect_symbol_info: None,
             }],
             exported_symbols,
+            symbol_locations: HashMap::new(),
             external_symbols,
             external_relocations: Vec::new(),
             entry_point_pc: None,
             entry_point_is_lc_main: false,
             last_segment_end: 0x2000,
             text_base: 0x1000,
+            mapped_segments: vec![0x1000..0x2000],
         }
     }
 
@@ -2600,7 +2626,7 @@ mod lazy_link_recovery_tests {
             }),
         }];
 
-        Dyld::new().setup_lazy_linking(&bin, &mut mem);
+        Dyld::new().setup_lazy_linking(&bin, &mut mem, None);
         for (index, &instruction) in original.iter().enumerate() {
             assert_eq!(mem.read(stubs + index as u32), instruction);
         }
@@ -2610,5 +2636,72 @@ mod lazy_link_recovery_tests {
         );
         assert_eq!(mem.read(stubs + 5), super::encode_a32_ret());
         assert_eq!(mem.read(stubs + 7), original[3]);
+    }
+
+    // Exercise the original ARM stub instructions, including PC-relative
+    // pointer loads. Binding must not change the code a checksum would read.
+    // https://github.com/apple-oss-distributions/dyld/blob/dyld-210.2.3/src/ImageLoaderMachOClassic.cpp
+    #[test]
+    fn preserved_stubs_execute_through_bound_pointers() {
+        for entry_size in [4, 12, 16] {
+            let mut mem = Mem::new();
+            mem.set_null_segment_size(0x1000);
+            let code: MutPtr<u32> = mem.alloc(12).cast();
+            mem.write(code, 0xe3a0002a); // MOV r0, #42
+            mem.write(code + 1, super::encode_a32_ret());
+            mem.write(code + 2, 0xe1200070); // BKPT
+            let stub: MutPtr<u32> = mem.alloc(32).cast();
+            let slot = stub + 6;
+            let instructions = match entry_size {
+                4 => vec![Dyld::SYMBOL_STUB1_INSTRUCTIONS[0] | 16],
+                12 => vec![0xe59fc000, 0xe59cf000, slot.to_bits()],
+                16 => vec![0xe59fc004, 0xe08fc00c, 0xe59cf000, 12],
+                _ => unreachable!(),
+            };
+            for (index, &instruction) in instructions.iter().enumerate() {
+                mem.write(stub + index as u32, instruction);
+            }
+            let mut bin = mock_binary("_stub_target", code.to_bits(), "__text", true);
+            bin.sections = vec![Section {
+                name: "__symbol_stubs".to_owned(),
+                segment_name: "__TEXT".to_owned(),
+                addr: stub.to_bits(),
+                size: entry_size,
+                type_: SectionType::SymbolStubs,
+                dyld_indirect_symbol_info: Some(DyldIndirectSymbolInfo {
+                    entry_size,
+                    indirect_undef_symbols: vec![Some("_stub_target".to_owned())],
+                }),
+            }];
+            // Compressed Mach-O binding can also describe this lazy slot as
+            // an external relocation with addend zero. Initial linking must
+            // not add the function address to an already bound pointer.
+            bin.external_relocations
+                .push((slot.to_bits(), "_stub_target".to_owned()));
+            mem.write(slot, 0);
+            let mut dyld = Dyld::new();
+            dyld.do_initial_linking(
+                &crate::bundle::Bundle::new_fake_bundle(),
+                std::slice::from_ref(&bin),
+                &mut mem,
+                &mut crate::objc::ObjC::new(),
+                true,
+            );
+            assert_eq!(mem.read(slot), code.to_bits());
+            for (index, &instruction) in instructions.iter().enumerate() {
+                assert_eq!(mem.read(stub + index as u32), instruction);
+            }
+            let mut cpu = Cpu::new(None);
+            cpu.branch(crate::abi::GuestFunction::from_addr_with_thumb_bit(
+                stub.to_bits(),
+            ));
+            cpu.regs_mut()[Cpu::LR] = (code + 2).to_bits();
+            let state = cpu.run_or_step(&mut mem, Some(&mut 100));
+            assert!(matches!(
+                state,
+                crate::cpu::CpuState::Error(crate::cpu::CpuError::Breakpoint)
+            ));
+            assert_eq!(cpu.regs()[0], 42);
+        }
     }
 }

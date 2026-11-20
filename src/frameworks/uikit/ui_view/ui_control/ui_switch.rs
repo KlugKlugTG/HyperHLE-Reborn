@@ -185,7 +185,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     let this = init_common(env, this);
 
     let key_ns_string = get_static_str(env, "UISwitchEnabled");
-    let enabled: bool = msg![env; coder decodeBoolForKey:key_ns_string];
+    // Nibs can omit properties whose values match UIKit's defaults.
+    // https://developer.apple.com/documentation/uikit/uicontrol/isenabled
+    let enabled: bool = if msg![env; coder containsValueForKey:key_ns_string] {
+        msg![env; coder decodeBoolForKey:key_ns_string]
+    } else {
+        true
+    };
 
     let key_ns_string = get_static_str(env, "UISwitchOn");
     let is_on: bool = msg![env; coder decodeBoolForKey:key_ns_string];

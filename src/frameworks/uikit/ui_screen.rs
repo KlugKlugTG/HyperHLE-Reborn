@@ -40,12 +40,28 @@ pub struct State {
     overscan_compensation: NSInteger,
 }
 
+/// Screen metrics describe the emulated device even without an SDL window.
+/// This also lets TestApp instantiate UIKit views in headless mode.
+/// https://developer.apple.com/documentation/uikit/uiscreen/scale
+fn screen_scale(env: &crate::Environment) -> CGFloat {
+    if let Some(window) = &env.window {
+        window.screen_scale()
+    } else if env.options.host_screen_size.is_some() {
+        1.0
+    } else {
+        env.options
+            .device_family
+            .unwrap_or(crate::window::DeviceFamily::iPhone)
+            .scale_factor()
+    }
+}
+
 /// Return the main screen's physical pixel size for the current orientation.
 /// UIKit `bounds` is expressed in logical points; `nativeBounds` and
 /// `UIScreenMode.size` are expressed in pixels.
 fn screen_pixel_size_for_current_orientation(env: &mut crate::Environment) -> (CGFloat, CGFloat) {
     let (width, height) = screen_size_for_current_orientation(env);
-    let scale = env.window().screen_scale() as CGFloat;
+    let scale = screen_scale(env);
     (width as CGFloat * scale, height as CGFloat * scale)
 }
 
@@ -56,8 +72,21 @@ fn screen_size_for_current_orientation(env: &mut crate::Environment) -> (u32, u3
     // Previously this read `device_family().portrait_size()` directly, so a
     // custom/auto resolution was stored but never actually exposed to the guest
     // — the app kept rendering at the device's native point size.
-    let portrait_size = env.window().screen_size();
-    let orientation = env.window().current_rotation();
+    let (portrait_size, orientation) = if let Some(window) = &env.window {
+        (window.screen_size(), window.current_rotation())
+    } else {
+        let size = env
+            .options
+            .host_screen_size
+            .map(|(width, height)| (width.min(height), width.max(height)))
+            .unwrap_or_else(|| {
+                env.options
+                    .device_family
+                    .unwrap_or(crate::window::DeviceFamily::iPhone)
+                    .portrait_size()
+            });
+        (size, env.options.initial_orientation)
+    };
     let landscape_bounds = crate::env_flag_cached!("TOUCHHLE_LANDSCAPE_UISCREEN_BOUNDS");
     screen_size_for_orientation(portrait_size, orientation, landscape_bounds)
 }
@@ -273,7 +302,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // aliasing it to point-sized bounds made games render at half resolution
     // on Retina device profiles.
     let bounds: CGRect = msg![env; this bounds];
-    let scale = env.window().screen_scale() as CGFloat;
+    let scale = screen_scale(env);
     CGRect {
         origin: CGPoint { x: 0.0, y: 0.0 },
         size: CGSize {
@@ -297,7 +326,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 
 - (CGFloat)scale {
-    env.window().screen_scale() as CGFloat
+    screen_scale(env)
 }
 
 - (CGFloat)nativeScale {
@@ -306,7 +335,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // size their framebuffers; reporting 1.0 while `scale` reports 2.0
     // made such games allocate a half-resolution framebuffer and draw
     // zoomed / cropped.
-    env.window().screen_scale() as CGFloat
+    screen_scale(env)
 }
 
 // MARK: - Brightness
@@ -352,7 +381,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // area and draw the scene into a corner of the screen on Retina
     // device profiles.
     let (width, height) = screen_size_for_current_orientation(env);
-    let scale = env.window().screen_scale() as CGFloat;
+    let scale = screen_scale(env);
     let size = CGSize {
         width:  width  as CGFloat * scale,
         height: height as CGFloat * scale,

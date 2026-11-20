@@ -56,6 +56,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // TODO: more?
 
+// UIApplication calls this before delivering touches to views, allowing
+// subclasses to inspect or intercept the event by overriding sendEvent:.
+// https://developer.apple.com/documentation/uikit/uiwindow/sendevent(_:)
+- (())sendEvent:(id)event {
+    crate::frameworks::uikit::ui_touch::send_event_to_views(env, this, event);
+}
+
 // UIWindow levels are only relevant when multiple windows overlap. The
 // compositor already draws windows in insertion order, so retain the value
 // for API compatibility without changing the single-screen ordering.
@@ -421,7 +428,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     //        are really equivalent and should all trigger autorotation.
     // `env.window` is `None` in headless mode; skip autorotation instead of
     // unwrapping (which would panic the host).
-    let rotation = env.window.as_ref().map(|window| window.current_rotation());
+    let rotation = env.window.as_ref()
+        .filter(|_| !env.options.manual_ui_rotation)
+        .map(|window| window.current_rotation());
     if let Some(orientation) = rotation.and_then(|rotation| match rotation {
         crate::window::DeviceOrientation::LandscapeLeft => Some(UIDeviceOrientationLandscapeLeft),
         crate::window::DeviceOrientation::LandscapeRight => Some(UIDeviceOrientationLandscapeRight),

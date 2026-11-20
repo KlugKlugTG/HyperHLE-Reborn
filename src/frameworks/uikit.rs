@@ -1067,7 +1067,10 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
             Event::CloseWindow => {
                 if !env.is_app_picker && cfg!(not(any(target_os = "android", target_os = "ios"))) {
                     echo!("Game window closed; returning to the app picker.");
-                    env.request_guest_termination(crate::environment::GuestTermination::ReturnToPicker);
+                    ui_application::prepare_for_termination(env);
+                    env.request_guest_termination(
+                        crate::environment::GuestTermination::ReturnToPicker,
+                    );
                     break;
                 } else {
                     echo!("User closed the app picker window, exiting.");
@@ -1133,7 +1136,9 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                     if env.objc.class_is_subclass_of(class, ui_text_field_class) {
                         match text_event {
                             TextInputEvent::Text(text) => {
-                                ui_view::ui_control::ui_text_field::handle_text(env, responder, text)
+                                ui_view::ui_control::ui_text_field::handle_text(
+                                    env, responder, text,
+                                )
                             }
                             TextInputEvent::Backspace => {
                                 ui_view::ui_control::ui_text_field::handle_backspace(env, responder)
@@ -1147,13 +1152,19 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                         if env.objc.class_is_subclass_of(class, ui_text_view_class) {
                             match text_event {
                                 TextInputEvent::Text(text) => {
-                                    ui_view::ui_scroll_view::ui_text_view::handle_text(env, responder, text)
+                                    ui_view::ui_scroll_view::ui_text_view::handle_text(
+                                        env, responder, text,
+                                    )
                                 }
                                 TextInputEvent::Backspace => {
-                                    ui_view::ui_scroll_view::ui_text_view::handle_backspace(env, responder)
+                                    ui_view::ui_scroll_view::ui_text_view::handle_backspace(
+                                        env, responder,
+                                    )
                                 }
                                 TextInputEvent::Return => {
-                                    ui_view::ui_scroll_view::ui_text_view::handle_return(env, responder)
+                                    ui_view::ui_scroll_view::ui_text_view::handle_return(
+                                        env, responder,
+                                    )
                                 }
                             }
                         } else {

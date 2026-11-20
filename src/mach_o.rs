@@ -52,6 +52,10 @@ pub struct MachO {
     /// `external_symbols` for dependent-dylib resolution. Thumb function symbols
     /// always have the Thumb bit set.
     pub exported_symbols: HashMap<String, u32>,
+    /// Raw nlist addresses for dladdr comparisons. Only function pointers with
+    /// N_ARM_THUMB_DEF acquire a Thumb bit; odd-address data must stay odd.
+    /// https://github.com/apple-oss-distributions/dyld/blob/dyld-210.2.3/src/ImageLoaderMachOClassic.cpp
+    pub symbol_locations: HashMap<String, u32>,
     /// Defined symbols marked external in the Mach-O symbol table, used for
     /// dependent-dylib resolution.
     pub external_symbols: HashMap<String, u32>,
@@ -74,6 +78,9 @@ pub struct MachO {
     /// Base address of the __TEXT segment (where the mach_header lives in
     /// memory). Used by `_dyld_get_image_header`.
     pub text_base: u32,
+    /// Ranges actually mapped for this image, excluding PAGEZERO and LINKEDIT.
+    /// Images can have large holes between their segments.
+    pub mapped_segments: Vec<std::ops::Range<u32>>,
 }
 
 #[derive(Debug)]
@@ -561,11 +568,13 @@ impl MachO {
         let mut dynamic_libraries = Vec::new();
         let mut run_paths = Vec::new();
         let mut exported_symbols = HashMap::new();
+        let mut symbol_locations = HashMap::new();
         let mut external_symbols = HashMap::new();
         let mut indirect_undef_symbols: Vec<Option<String>> = Vec::new();
         let mut external_relocations: Vec<(u32, String)> = Vec::new();
         let mut entry_point_pc: Option<u32> = None;
         let mut entry_point_is_lc_main = false;
+        let mut mapped_segments = Vec::new();
 
         for MachCommand(command, _size) in commands {
             match command {
@@ -659,6 +668,7 @@ impl MachO {
                             vmsize
                         );
                         into_mem.reserve(vmaddr + slide, vmsize);
+                        mapped_segments.push(vmaddr + slide..vmaddr + slide + vmsize);
 
                         // If filesize is less than vmsize, the rest of the
                         // segment should be filled with zeroes. We are assuming
@@ -714,6 +724,7 @@ impl MachO {
                             } = symbol
                             {
                                 let entry: u32 = entry.try_into().unwrap();
+                                symbol_locations.insert(name.to_owned(), slide + entry);
                                 let entry = if desc & N_ARM_THUMB_DEF != 0 {
                                     entry | GuestFunction::THUMB_BIT
                                 } else {
@@ -1266,12 +1277,14 @@ impl MachO {
             slide,
             sections,
             exported_symbols,
+            symbol_locations,
             external_symbols,
             external_relocations,
             entry_point_pc,
             entry_point_is_lc_main,
             last_segment_end,
             text_base: text_segment_base.unwrap_or(first_segment_base.unwrap_or(0)),
+            mapped_segments,
         })
     }
 
@@ -1533,6 +1546,29 @@ mod segment_validation_tests {
             mem.read::<u32, false>(Ptr::from_bits(second.text_base)),
             0xfeedface
         );
+    }
+
+    #[test]
+    fn image_mapping_keeps_segment_holes_and_zero_fill_boundaries() {
+        let mut bytes = thin(9, 0x1000, 140);
+        bytes[16..20].copy_from_slice(&2u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&112u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&56u32.to_le_bytes());
+        let mut name = [0u8; 16];
+        name[..6].copy_from_slice(b"__DATA");
+        bytes.extend_from_slice(&name);
+        for word in [0x10000u32, 0x1000, 0, 0, 3, 3, 0, 0] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(0x1000);
+        let image = MachO::load_with_placement(&bytes, &mut mem, "split".into(), Some(0)).unwrap();
+        assert_eq!(
+            image.mapped_segments,
+            vec![0x1000..0x3000, 0x10000..0x11000]
+        );
+        assert_eq!(mem.read::<u32, false>(Ptr::from_bits(0x10000)), 0);
     }
 
     #[test]

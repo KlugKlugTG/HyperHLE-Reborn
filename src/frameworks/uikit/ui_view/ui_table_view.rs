@@ -278,18 +278,45 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithCoder:(id)coder {
     let this: id = msg_super![env; this initWithCoder:coder];
-    // При загрузке из NIB contentView обычно уже внутри (как под-вьюха).
-    // Мы можем просто инициализировать поле, если NIB его создал,
-    // но для безопасности создадим пустой, если его нет.
-    let frame = <CGRect as Default>::default();
-
-    // Исправлено здесь: убран get_known_class и переменная, имя класса передано
-    // напрямую
-    let content_view: id = msg_class![env; UITableViewCellContentView alloc];
-    let content_view: id = msg![env; content_view initWithFrame:frame];
-
-    () = msg![env; this addSubview:content_view];
+    // Custom nib cells already contain their content view and controls.
+    // Adding an empty replacement on top intercepts touches to that content.
+    // https://developer.apple.com/library/archive/documentation/UserExperience/Conceptual/TableView_iPhone/TableViewCells/TableViewCells.html
+    let key = get_static_str(env, "UIContentView");
+    let mut content_view: id = msg![env; coder decodeObjectForKey:key];
+    if content_view == nil {
+        let content_class = env.objc.get_known_class("UITableViewCellContentView", &mut env.mem);
+        let subviews = env.objc.borrow::<ui_view::UIViewHostObject>(this).subviews.clone();
+        for subview in subviews {
+            if msg![env; subview isKindOfClass:content_class] {
+                content_view = subview;
+                break;
+            }
+        }
+    }
+    if content_view != nil {
+        retain(env, content_view);
+    } else {
+        let bounds: CGRect = msg![env; this bounds];
+        content_view = msg_class![env; UITableViewCellContentView alloc];
+        content_view = msg![env; content_view initWithFrame:bounds];
+    }
+    let parent: id = msg![env; content_view superview];
+    if parent != this {
+        () = msg![env; this addSubview:content_view];
+    }
     env.objc.borrow_mut::<UITableViewCellHostObject>(this).content_view = content_view;
+
+    for (name, slot) in [("UITextLabel", 0), ("UIDetailTextLabel", 1), ("UIImageView", 2)] {
+        let key = get_static_str(env, name);
+        let view: id = msg![env; coder decodeObjectForKey:key];
+        retain(env, view);
+        let host = env.objc.borrow_mut::<UITableViewCellHostObject>(this);
+        match slot {
+            0 => host.text_label = view,
+            1 => host.detail_text_label = view,
+            _ => host.image_view = view,
+        }
+    }
     this
 }
 

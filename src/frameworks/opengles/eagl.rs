@@ -23,7 +23,7 @@ use crate::gles::{
 };
 use crate::mem::MutPtr;
 use crate::objc::{
-    id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
+    id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, ObjC,
 };
 use crate::options::{Options, PresentMode};
 use crate::Environment;
@@ -394,6 +394,7 @@ pub(super) struct EAGLContextHostObject {
     /// Guest object addresses can be reused when a game session restarts.
     present_token: usize,
     resource_group_token: usize,
+    sharegroup: id,
     /// See [GLShadowState].
     pub(super) shadow: GLShadowState,
     /// Which EAGL rendering API was requested. This influences how
@@ -422,6 +423,124 @@ pub(super) struct EAGLContextHostObject {
 }
 impl HostObject for EAGLContextHostObject {}
 
+#[derive(Default)]
+struct EAGLSharegroupHostObject {
+    /// Weak context references avoid a cycle with contexts retaining the group.
+    contexts: Vec<id>,
+    /// Keep native resources alive if the sharegroup outlives its contexts.
+    retired_context: Option<Box<dyn GLESContext>>,
+    resource_group_token: usize,
+    renderbuffer_drawable_bindings: Rc<RefCell<HashMap<GLuint, id>>>,
+}
+impl HostObject for EAGLSharegroupHostObject {}
+
+/// EAGLContext.sharegroup returns an EAGLSharegroup with stable identity.
+/// The context owns it; contexts initialized with that group share resources.
+/// https://developer.apple.com/documentation/opengles/eaglcontext/sharegroup
+fn attach_sharegroup(objc: &mut ObjC, mem: &mut crate::mem::Mem, context: id, group: id) -> id {
+    let group = if group == nil {
+        let host = objc.borrow::<EAGLContextHostObject>(context);
+        let object = EAGLSharegroupHostObject {
+            contexts: Vec::new(),
+            retired_context: None,
+            resource_group_token: host.present_token,
+            renderbuffer_drawable_bindings: host.renderbuffer_drawable_bindings.clone(),
+        };
+        let class = objc.get_known_class("EAGLSharegroup", mem);
+        objc.alloc_object(class, Box::new(object), mem)
+    } else {
+        objc.increment_refcount(group);
+        group
+    };
+    let (token, bindings) = {
+        let host = objc.borrow_mut::<EAGLSharegroupHostObject>(group);
+        host.contexts.push(context);
+        (
+            host.resource_group_token,
+            host.renderbuffer_drawable_bindings.clone(),
+        )
+    };
+    let host = objc.borrow_mut::<EAGLContextHostObject>(context);
+    host.sharegroup = group;
+    host.resource_group_token = token;
+    host.shadow.resource_group_token = token;
+    host.renderbuffer_drawable_bindings = bindings;
+    group
+}
+
+fn detach_sharegroup(objc: &mut ObjC, context: id) -> id {
+    let group = objc.borrow::<EAGLContextHostObject>(context).sharegroup;
+    if group != nil {
+        let needs_anchor = {
+            let host = objc.borrow_mut::<EAGLSharegroupHostObject>(group);
+            host.contexts.retain(|&other| other != context);
+            host.contexts.is_empty() && host.retired_context.is_none()
+        };
+        if needs_anchor {
+            let native = objc
+                .borrow_mut::<EAGLContextHostObject>(context)
+                .gles_ctx
+                .take();
+            objc.borrow_mut::<EAGLSharegroupHostObject>(group)
+                .retired_context = native;
+        }
+    }
+    group
+}
+
+#[cfg(test)]
+#[test]
+fn sharegroup_preserves_type_identity_and_resources() {
+    let mut mem = crate::mem::Mem::new();
+    mem.set_null_segment_size(0x1000);
+    let mut objc = ObjC::new();
+    objc.register_host_selectors(&mut mem);
+    let class = objc.get_known_class("EAGLContext", &mut mem);
+    let context = || EAGLContextHostObject {
+        present_token: crate::gles::perf_overlay::allocate_context_token(),
+        ..Default::default()
+    };
+    let first = objc.alloc_object(class, Box::new(context()), &mut mem);
+    let second = objc.alloc_object(class, Box::new(context()), &mut mem);
+    let group = attach_sharegroup(&mut objc, &mut mem, first, nil);
+    assert_ne!(group, first);
+    assert_eq!(
+        objc.get_class_name(ObjC::read_isa(group, &mem)),
+        "EAGLSharegroup"
+    );
+    assert_eq!(attach_sharegroup(&mut objc, &mut mem, second, group), group);
+    assert_eq!(objc.get_refcount(group).get(), 2);
+    let first_host = objc.borrow::<EAGLContextHostObject>(first);
+    let second_host = objc.borrow::<EAGLContextHostObject>(second);
+    assert_eq!(first_host.sharegroup, second_host.sharegroup);
+    assert_eq!(
+        first_host.resource_group_token,
+        second_host.resource_group_token
+    );
+    assert!(Rc::ptr_eq(
+        &first_host.renderbuffer_drawable_bindings,
+        &second_host.renderbuffer_drawable_bindings
+    ));
+    assert_eq!(detach_sharegroup(&mut objc, first), group);
+    assert!(!objc.decrement_refcount(group));
+    objc.dealloc_object(first, &mut mem);
+    assert_eq!(
+        objc.borrow::<EAGLSharegroupHostObject>(group).contexts,
+        vec![second]
+    );
+    assert_eq!(
+        objc.borrow::<EAGLContextHostObject>(second).sharegroup,
+        group
+    );
+    assert_eq!(detach_sharegroup(&mut objc, second), group);
+    assert!(objc.decrement_refcount(group));
+    objc.dealloc_object(second, &mut mem);
+    assert!(objc
+        .borrow::<EAGLSharegroupHostObject>(group)
+        .contexts
+        .is_empty());
+    objc.dealloc_object(group, &mut mem);
+}
 
 /// Log the effective state of the `fix_texture_min_filter` option once,
 /// the first time an EAGL context is created. This makes it easy to
@@ -466,6 +585,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         gles_ctx: None,
         present_token: crate::gles::perf_overlay::allocate_context_token(),
         resource_group_token: 0,
+        sharegroup: nil,
         shadow: GLShadowState::default(),
         api: kEAGLRenderingAPIOpenGLES1,
         drawable_framebuffer: 0,
@@ -516,17 +636,16 @@ pub const CLASSES: ClassExports = objc_classes! {
         return msg![env; this initWithAPI:api];
     }
 
-    let resource_group_token = {
-        let group_context = env.objc.borrow::<EAGLContextHostObject>(group);
-        if group_context.resource_group_token != 0 {
-            group_context.resource_group_token
-        } else {
-            group_context.present_token
-        }
-    };
+    let group_host = env.objc.borrow::<EAGLSharegroupHostObject>(group);
+    let resource_group_token = group_host.resource_group_token;
+    let representative = group_host.contexts.first().copied();
 
     let window = env.window.as_mut().expect("OpenGL ES is not supported in headless mode");
-    let prev_context = env.objc.borrow_mut::<EAGLContextHostObject>(group).gles_ctx.as_mut().unwrap();
+    let prev_context = if let Some(context) = representative {
+        env.objc.borrow_mut::<EAGLContextHostObject>(context).gles_ctx.as_mut().unwrap()
+    } else {
+        env.objc.borrow_mut::<EAGLSharegroupHostObject>(group).retired_context.as_mut().unwrap()
+    };
 
     // This is sort of a hack - we set the "current" context, then immediately
     // drop it. Since we know all the code between here and creating the new
@@ -576,7 +695,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     env.window.as_mut().unwrap().set_share_with_current_context(false);
 
-    env.objc.borrow_mut::<EAGLContextHostObject>(this).renderbuffer_drawable_bindings = env.objc.borrow::<EAGLContextHostObject>(group).renderbuffer_drawable_bindings.clone();
+    attach_sharegroup(&mut env.objc, &mut env.mem, this, group);
     this
 }
 
@@ -631,6 +750,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     crate::gles::perf_overlay::register_gl_resource_context(resource_group_token);
 
+    attach_sharegroup(&mut env.objc, &mut env.mem, this, nil);
     this
 }
 
@@ -639,12 +759,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)sharegroup {
-    // We use object itself as the sharegroup.
-    // Check initWithAPI:sharegroup: for more info
-    this
+    env.objc.borrow::<EAGLContextHostObject>(this).sharegroup
 }
 
 - (())dealloc {
+    let group = detach_sharegroup(&mut env.objc, this);
     let (resource_group_token, drawables, mapped_guest_buffers) = {
         let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(this);
         let mapped_guest_buffers = host_obj
@@ -671,6 +790,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     crate::gles::perf_overlay::unregister_gl_resource_context(resource_group_token);
     env.objc.dealloc_object(this, &mut env.mem);
+    release(env, group);
 }
 
 - (bool)renderbufferStorage:(NSUInteger)target
@@ -1467,6 +1587,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     true
 }
 
+@end
+
+@implementation EAGLSharegroup: NSObject
+- (())dealloc {
+    let drawables = {
+        let host = env.objc.borrow_mut::<EAGLSharegroupHostObject>(this);
+        std::mem::take(&mut *host.renderbuffer_drawable_bindings.borrow_mut())
+            .into_values().collect::<Vec<_>>()
+    };
+    for drawable in drawables {
+        release(env, drawable);
+    }
+    env.objc.dealloc_object(this, &mut env.mem);
+}
 @end
 
 };

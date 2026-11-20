@@ -58,6 +58,7 @@ pub const UITouchPhaseBegan: UITouchPhase = 0;
 pub const UITouchPhaseMoved: UITouchPhase = 1;
 pub const UITouchPhaseStationary: UITouchPhase = 2;
 pub const UITouchPhaseEnded: UITouchPhase = 3;
+pub const UITouchPhaseCancelled: UITouchPhase = 4;
 
 pub type UITouchType = NSInteger;
 pub const UITouchTypeDirect: UITouchType = 0;
@@ -612,6 +613,78 @@ pub fn handle_event(env: &mut Environment, event: Event) {
     }
 }
 
+/// UIApplication and UIWindow subclasses must see events before view delivery.
+/// Marmalade, for example, processes input in its window's sendEvent: override.
+/// https://developer.apple.com/documentation/uikit/uiapplication/sendevent(_:)
+fn dispatch_event(env: &mut Environment, event: id) {
+    let application: id = msg_class![env; UIApplication sharedApplication];
+    () = msg![env; application sendEvent:event];
+}
+
+/// The default UIWindow implementation dispatches each changed touch to its
+/// original view. Stationary touches remain in UIEvent.allTouches but must not
+/// produce another began/moved/ended callback.
+/// https://developer.apple.com/documentation/uikit/uiwindow/sendevent(_:)
+pub(super) fn send_event_to_views(env: &mut Environment, window: id, event: id) {
+    let touches: id = msg![env; event allTouches];
+    let array: id = msg![env; touches allObjects];
+    let count: NSUInteger = msg![env; array count];
+    let mut groups: HashMap<(id, UITouchPhase), id> = HashMap::new();
+    for i in 0..count {
+        let touch: id = msg![env; array objectAtIndex:i];
+        let touch_window: id = msg![env; touch window];
+        let view: id = msg![env; touch view];
+        let phase: UITouchPhase = msg![env; touch phase];
+        if touch_window != window || view == nil || phase == UITouchPhaseStationary {
+            continue;
+        }
+        let set = *groups
+            .entry((view, phase))
+            .or_insert_with(|| msg_class![env; NSMutableSet new]);
+        () = msg![env; set addObject:touch];
+    }
+    for ((view, phase), touches) in groups {
+        match phase {
+            UITouchPhaseBegan => {
+                () = msg![env; view touchesBegan:touches withEvent:event];
+                super::ui_gesture_recognizer::touches_began(env, view, touches);
+                touchhle_send_cocos_touch_aliases_to_chain(env, view, "began", touches, event);
+                let count: NSUInteger = msg![env; touches count];
+                log_touch_delivery("TOUCH-DIAG", &TOUCH_BEGAN_DIAGNOSTICS, count as usize);
+            }
+            UITouchPhaseMoved | UITouchPhaseEnded => {
+                if phase == UITouchPhaseMoved {
+                    super::ui_gesture_recognizer::touches_moved(env, view, touches);
+                } else {
+                    super::ui_gesture_recognizer::touches_ended(env, view, touches);
+                }
+                let deliver = touches_for_view_delivery(env, touches);
+                let count: NSUInteger = msg![env; deliver count];
+                if count != 0 {
+                    if phase == UITouchPhaseMoved {
+                        () = msg![env; view touchesMoved:deliver withEvent:event];
+                        touchhle_send_cocos_touch_aliases_to_chain(
+                            env, view, "moved", deliver, event,
+                        );
+                    } else {
+                        () = msg![env; view touchesEnded:deliver withEvent:event];
+                        touchhle_send_cocos_touch_aliases_to_chain(
+                            env, view, "ended", deliver, event,
+                        );
+                        log_touch_delivery("TOUCH-END", &TOUCH_ENDED_DIAGNOSTICS, count as usize);
+                    }
+                }
+                release(env, deliver);
+            }
+            UITouchPhaseCancelled => {
+                () = msg![env; view touchesCancelled:touches withEvent:event];
+            }
+            _ => {}
+        }
+        release(env, touches);
+    }
+}
+
 fn touchhle_cocos_touch_aliases_enabled(env: &mut Environment, view: id) -> bool {
     if crate::env_flag_cached!("TOUCHHLE_DISABLE_COCOS_TOUCH_ALIASES") {
         return false;
@@ -1163,13 +1236,8 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         });
     }
 
-    for (view, v_set) in view_touches {
-        let _: () = msg![env;
-            view touchesBegan:v_set withEvent:event];
-        super::ui_gesture_recognizer::touches_began(env, view, v_set);
-        touchhle_send_cocos_touch_aliases_to_chain(env, view, "began", v_set, event);
-        let count: NSUInteger = msg![env; v_set count];
-        log_touch_delivery("TOUCH-DIAG", &TOUCH_BEGAN_DIAGNOSTICS, count as usize);
+    if !view_touches.is_empty() {
+        dispatch_event(env, event);
     }
     release(env, pool);
 }
@@ -1248,15 +1316,8 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 
     let event = ui_event::new_event(env, all_touches_set);
     autorelease(env, event);
-    for (view, v_set) in view_touches {
-        super::ui_gesture_recognizer::touches_moved(env, view, v_set);
-        let deliver = touches_for_view_delivery(env, v_set);
-        let count: NSUInteger = msg![env; deliver count];
-        if count != 0 {
-            let _: () = msg![env; view touchesMoved:deliver withEvent:event];
-            touchhle_send_cocos_touch_aliases_to_chain(env, view, "moved", deliver, event);
-        }
-        release(env, deliver);
+    if !view_touches.is_empty() {
+        dispatch_event(env, event);
     }
     release(env, pool);
 }
@@ -1413,16 +1474,8 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 
     let event = ui_event::new_event(env, all_touches_set);
     autorelease(env, event);
-    for (view, v_set) in view_touches {
-        super::ui_gesture_recognizer::touches_ended(env, view, v_set);
-        let deliver = touches_for_view_delivery(env, v_set);
-        let count: NSUInteger = msg![env; deliver count];
-        if count != 0 {
-            let _: () = msg![env; view touchesEnded:deliver withEvent:event];
-            touchhle_send_cocos_touch_aliases_to_chain(env, view, "ended", deliver, event);
-            log_touch_delivery("TOUCH-END", &TOUCH_ENDED_DIAGNOSTICS, count as usize);
-        }
-        release(env, deliver);
+    if !view_touches.is_empty() {
+        dispatch_event(env, event);
     }
 
     // Now that all touchesEnded: callbacks have returned, remove the touches
@@ -1451,4 +1504,205 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     // ULTRAHLE_MINIONJUMP_DRAIN_POST_END
 
     release(env, pool);
+}
+
+#[cfg(test)]
+mod event_dispatch_tests {
+    use super::*;
+    use crate::abi::{CallFromHost, GuestFunction};
+    use crate::objc::{
+        class_addMethod, class_replaceMethod, msg_super, objc_allocateClassPair,
+        objc_registerClassPair, Class, SEL,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::Mutex;
+
+    static DELIVERY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static APPLICATION_IMP: AtomicU32 = AtomicU32::new(0);
+    static FORWARD: AtomicBool = AtomicBool::new(true);
+
+    fn application_event(env: &mut Environment, this: id, selector: SEL, event: id) {
+        DELIVERY.lock().unwrap().push("application".to_owned());
+        let original =
+            GuestFunction::from_addr_with_thumb_bit(APPLICATION_IMP.load(Ordering::Relaxed));
+        let _: () = original.call_from_host(env, (this, selector, event));
+    }
+
+    fn window_event(env: &mut Environment, this: id, _selector: SEL, event: id) {
+        const _OBJC_CURRENT_CLASS: &str = "TouchDispatchWindow";
+        DELIVERY.lock().unwrap().push("window".to_owned());
+        if FORWARD.load(Ordering::Relaxed) {
+            () = msg_super![env; this sendEvent:event];
+        }
+    }
+
+    fn view_touch(env: &mut Environment, this: id, selector: SEL, touches: id, event: id) {
+        let touch: id = msg![env; touches anyObject];
+        let view: id = msg![env; touch view];
+        let window: id = msg![env; touch window];
+        let actual_window: id = msg![env; this window];
+        assert_eq!(view, this);
+        assert_eq!(window, actual_window);
+        let count: NSUInteger = msg![env; touches count];
+        assert_eq!(count, 1);
+        let all: id = msg![env; event allTouches];
+        assert!(msg![env; all containsObject:touch]);
+        DELIVERY
+            .lock()
+            .unwrap()
+            .push(selector.as_str(&env.mem).to_owned());
+    }
+
+    fn subclass(env: &mut Environment, parent: &str, name: &str) -> Class {
+        let parent = env.objc.get_known_class(parent, &mut env.mem);
+        let name = env.mem.alloc_and_write_cstr(name.as_bytes());
+        let class = objc_allocateClassPair(env, parent, name.cast_const(), 0);
+        assert_ne!(class, nil);
+        objc_registerClassPair(env, class);
+        class
+    }
+
+    // Inject real host touch events because headless TestApp cannot generate
+    // SDL input. Check the full application -> window -> view path, including
+    // interception and a key-window change halfway through a gesture.
+    // https://developer.apple.com/documentation/uikit/uiwindow/sendevent(_:)
+    #[test]
+    fn host_touches_pass_through_application_and_original_window() {
+        let _lock = crate::environment::ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        DELIVERY.lock().unwrap().clear();
+        FORWARD.store(true, Ordering::Relaxed);
+        let options = crate::options::Options {
+            headless: true,
+            popup_errors: false,
+            ..Default::default()
+        };
+        let icon = crate::image::Image::from_pixels(1, 1, vec![0; 4]);
+        let mut env = Environment::new_without_app(options, icon).unwrap();
+        let pool: id = {
+            let env = &mut env;
+            msg_class![env; NSAutoreleasePool new]
+        };
+        let application = super::super::ui_application::create_test_application(&mut env);
+        let application_class = env.objc.get_known_class("UIApplication", &mut env.mem);
+        let window_class = subclass(&mut env, "UIWindow", "TouchDispatchWindow");
+        let view_class = subclass(&mut env, "UIView", "TouchDispatchView");
+        let types = env.mem.alloc_and_write_cstr(b"v@:@");
+        let event_selector = env.objc.lookup_selector("sendEvent:").unwrap();
+        let imp = env.dyld.create_guest_function(
+            &mut env.mem,
+            "[test application event]",
+            &(application_event as fn(&mut Environment, id, SEL, id)),
+        );
+        let original = class_replaceMethod(
+            &mut env,
+            application_class,
+            event_selector,
+            imp.to_ptr(),
+            types.cast_const(),
+        );
+        assert!(!original.is_null());
+        APPLICATION_IMP.store(original.to_bits(), Ordering::Relaxed);
+        let imp = env.dyld.create_guest_function(
+            &mut env.mem,
+            "[test window event]",
+            &(window_event as fn(&mut Environment, id, SEL, id)),
+        );
+        assert!(class_addMethod(
+            &mut env,
+            window_class,
+            event_selector,
+            imp.to_ptr(),
+            types.cast_const()
+        ));
+        let types = env.mem.alloc_and_write_cstr(b"v@:@@");
+        let imp = env.dyld.create_guest_function(
+            &mut env.mem,
+            "[test view touch]",
+            &(view_touch as fn(&mut Environment, id, SEL, id, id)),
+        );
+        for name in [
+            "touchesBegan:withEvent:",
+            "touchesMoved:withEvent:",
+            "touchesEnded:withEvent:",
+        ] {
+            let selector = env.objc.lookup_selector(name).unwrap();
+            assert!(class_addMethod(
+                &mut env,
+                view_class,
+                selector,
+                imp.to_ptr(),
+                types.cast_const()
+            ));
+        }
+        let frame = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: crate::frameworks::core_graphics::CGSize {
+                width: 320.0,
+                height: 480.0,
+            },
+        };
+        let window: id = msg![&mut env; window_class alloc];
+        let window: id = msg![&mut env; window initWithFrame:frame];
+        let view: id = msg![&mut env; view_class alloc];
+        let view: id = msg![&mut env; view initWithFrame:frame];
+        () = msg![&mut env; window addSubview:view];
+        () = msg![&mut env; view setMultipleTouchEnabled:true];
+        () = msg![&mut env; window makeKeyAndVisible];
+        handle_event(
+            &mut env,
+            Event::TouchesDown(HashMap::from([(FingerId::Mouse, (20.0, 30.0))])),
+        );
+        // This second finger must not redeliver began for the stationary first.
+        handle_event(
+            &mut env,
+            Event::TouchesDown(HashMap::from([(FingerId::Touch(1), (40.0, 50.0))])),
+        );
+        let other: id = {
+            let env = &mut env;
+            msg_class![env; UIWindow alloc]
+        };
+        let other: id = msg![&mut env; other initWithFrame:frame];
+        () = msg![&mut env; other makeKeyWindow];
+        let key: id = msg![&mut env; application keyWindow];
+        assert_eq!(key, other);
+        handle_event(
+            &mut env,
+            Event::TouchesMove(HashMap::from([(FingerId::Mouse, (25.0, 35.0))])),
+        );
+        handle_event(
+            &mut env,
+            Event::TouchesUp(HashMap::from([(FingerId::Mouse, (25.0, 35.0))])),
+        );
+        assert_eq!(
+            *DELIVERY.lock().unwrap(),
+            [
+                "application",
+                "window",
+                "touchesBegan:withEvent:",
+                "application",
+                "window",
+                "touchesBegan:withEvent:",
+                "application",
+                "window",
+                "touchesMoved:withEvent:",
+                "application",
+                "window",
+                "touchesEnded:withEvent:",
+            ]
+        );
+        DELIVERY.lock().unwrap().clear();
+        FORWARD.store(false, Ordering::Relaxed);
+        handle_event(
+            &mut env,
+            Event::TouchesUp(HashMap::from([(FingerId::Touch(1), (40.0, 50.0))])),
+        );
+        assert_eq!(*DELIVERY.lock().unwrap(), ["application", "window"]);
+        assert!(env
+            .framework_state
+            .uikit
+            .ui_touch
+            .current_touches
+            .is_empty());
+        release(&mut env, pool);
+    }
 }

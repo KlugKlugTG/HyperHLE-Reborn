@@ -323,6 +323,19 @@ impl std::borrow::Borrow<GuestPath> for GuestPathBuf {
     }
 }
 
+/// HFSX catalog entries use binary UTF-16 name order on case-sensitive
+/// volumes. Preserve that order instead of leaking HashMap's random order to
+/// readdir, NSDirectoryEnumerator and NSBundle resource arrays.
+/// https://developer.apple.com/library/archive/technotes/tn/tn1150.html#CatalogFile
+fn ordered_directory_entries(children: &HashMap<String, FsNode>) -> Vec<(&str, &FsNode)> {
+    let mut entries: Vec<_> = children
+        .iter()
+        .map(|(name, node)| (name.as_str(), node))
+        .collect();
+    entries.sort_unstable_by(|(left, _), (right, _)| left.encode_utf16().cmp(right.encode_utf16()));
+    entries
+}
+
 fn apply_path_component<'a>(components: &mut Vec<&'a str>, component: &'a str) {
     match component {
         "" => (),
@@ -1505,7 +1518,9 @@ impl Fs {
         let Some(FsNode::Directory { children, .. }) = self.lookup_node(path.as_ref()) else {
             return Err(());
         };
-        Ok(children.keys().map(|name| name.as_str()))
+        Ok(ordered_directory_entries(children)
+            .into_iter()
+            .map(|(name, _)| name))
     }
 
     /// Similar to [Fs::enumerate], but also returns fs node type.
@@ -1516,15 +1531,17 @@ impl Fs {
         let Some(FsNode::Directory { children, .. }) = self.lookup_node(path.as_ref()) else {
             return Err(());
         };
-        Ok(children.iter().map(|(name, node)| {
-            (
-                name.as_str(),
-                match node {
-                    FsNode::File { .. } => FsNodeType::File,
-                    FsNode::Directory { .. } => FsNodeType::Directory,
-                },
-            )
-        }))
+        Ok(ordered_directory_entries(children)
+            .into_iter()
+            .map(|(name, node)| {
+                (
+                    name,
+                    match node {
+                        FsNode::File { .. } => FsNodeType::File,
+                        FsNode::Directory { .. } => FsNodeType::Directory,
+                    },
+                )
+            }))
     }
 
     /// Recursively list the paths of files/directories in a directory.
@@ -1539,14 +1556,14 @@ impl Fs {
 
         let mut paths = Vec::new();
         let mut component_stack: Vec<&str> = Vec::new();
-        let mut iterator_stack = vec![children.iter()];
+        let mut iterator_stack = vec![ordered_directory_entries(children).into_iter()];
         loop {
             let current_iterator = iterator_stack.last_mut().unwrap();
             if let Some((next_component, next_node)) = current_iterator.next() {
                 component_stack.push(next_component);
                 paths.push(GuestPathBuf::from(component_stack.join("/")));
                 if let FsNode::Directory { children, .. } = next_node {
-                    iterator_stack.push(children.iter());
+                    iterator_stack.push(ordered_directory_entries(children).into_iter());
                 } else {
                     component_stack.pop();
                 }
@@ -2204,6 +2221,64 @@ mod tests {
         assert!(fs
             .resolve_case_insensitive_path(GuestPath::new("Data/not-present"))
             .is_none());
+    }
+
+    #[test]
+    fn enumerators_preserve_catalog_name_order() {
+        let mut fs = case_test_fs();
+        let file = || FsNode::resource_file("unused".to_string());
+        fs.root = FsNode::dir().with_child(
+            "frames",
+            FsNode::dir()
+                .with_child("frame02.png", file())
+                .with_child("frame01.png", file())
+                .with_child("Frame00.png", file())
+                .with_child("\u{e000}", file())
+                .with_child("\u{10000}", file())
+                .with_child(
+                    "nested",
+                    FsNode::dir()
+                        .with_child("z.png", file())
+                        .with_child("a.png", file()),
+                ),
+        );
+        let expected = [
+            "Frame00.png",
+            "frame01.png",
+            "frame02.png",
+            "nested",
+            "\u{10000}",
+            "\u{e000}",
+        ];
+        assert_eq!(
+            fs.enumerate("/frames").unwrap().collect::<Vec<_>>(),
+            expected
+        );
+        let typed: Vec<_> = fs.enumerate_with_types("/frames").unwrap().collect();
+        assert_eq!(
+            typed.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(matches!(typed[3].1, FsNodeType::Directory));
+        let recursive: Vec<String> = fs
+            .enumerate_recursive("/frames")
+            .unwrap()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(
+            recursive,
+            [
+                "Frame00.png",
+                "frame01.png",
+                "frame02.png",
+                "nested",
+                "nested/a.png",
+                "nested/z.png",
+                "\u{10000}",
+                "\u{e000}"
+            ]
+        );
     }
 
     #[test]
