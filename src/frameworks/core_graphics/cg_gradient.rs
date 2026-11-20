@@ -1,27 +1,34 @@
 /*
  * This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0.
- * If a copy of the MPL was not distributed with this
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 #![allow(dead_code)]
 //! `CGGradient.h`
+//!
+//! The rasterisation lives in `CGContextDrawLinearGradient` /
+//! `CGContextDrawRadialGradient` in `cg_context.rs`, which sample the
+//! gradient through [gradient_color_at] / [color_sampler].
 
-use crate::dyld::FunctionExports;
-use crate::export_c_func;
+use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::core_foundation::{CFRelease, CFRetain, CFTypeRef};
+use crate::frameworks::core_graphics::cg_color;
 use crate::frameworks::core_graphics::cg_color_space::CGColorSpaceRef;
 use crate::frameworks::core_graphics::CGFloat;
 use crate::mem::{ConstPtr, GuestUSize};
-use crate::objc::{objc_classes, ClassExports, HostObject};
+use crate::objc::{id, msg, nil, objc_classes, ClassExports, HostObject};
 use crate::Environment;
 
 pub type CGGradientRef = CFTypeRef;
 
 /// Drawing options — can be combined.
-type CGGradientDrawingOptions = u32;
-const kCGGradientDrawsBeforeStartLocation: CGGradientDrawingOptions = 1 << 0;
-const kCGGradientDrawsAfterEndLocation: CGGradientDrawingOptions = 1 << 1;
+pub type CGGradientDrawingOptions = u32;
+pub const kCGGradientDrawsBeforeStartLocation: CGGradientDrawingOptions = 1 << 0;
+pub const kCGGradientDrawsAfterEndLocation: CGGradientDrawingOptions = 1 << 1;
+
+/// Upper bound for up-front `Vec` capacity. `count` comes from the guest, so
+/// it must not be trusted for a single huge allocation.
+const MAX_PREALLOC_STOPS: usize = 1024;
 
 /// One colour stop: a normalised location in [0, 1] plus RGBA components.
 #[derive(Clone, Debug)]
@@ -64,6 +71,54 @@ fn alloc_gradient(env: &mut Environment, stops: Vec<ColorStop>) -> CGGradientRef
         Box::new(CGGradientHostObject { stops }),
         &mut env.mem,
     )
+}
+
+/// Evenly spaced location for stop `i` of `count` when the app passed no
+/// locations array.
+fn default_location(i: usize, count: GuestUSize) -> CGFloat {
+    if count <= 1 {
+        0.0
+    } else {
+        i as CGFloat / (count as CGFloat - 1.0)
+    }
+}
+
+/// Stable sort by location. `total_cmp`, not `partial_cmp().unwrap()`, because
+/// a guest can pass NaN.
+fn sort_stops(stops: &mut [ColorStop]) {
+    stops.sort_by(|a, b| a.location.total_cmp(&b.location));
+}
+
+/// Read stop colour `index` from a flat component array whose colour space has
+/// `n` non-alpha components, i.e. a stride of `n + 1`. Returns RGBA.
+fn read_components_color(
+    env: &mut Environment,
+    components: ConstPtr<CGFloat>,
+    index: usize,
+    n: usize,
+) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
+    let base = index * (n + 1);
+    let mut get = |k: usize| -> CGFloat { env.mem.read(components + (base + k) as u32) };
+    match n {
+        // RGB
+        3 => (get(0), get(1), get(2), get(3)),
+        // CMYK → RGB (same conversion as CGColorCreate)
+        4 => {
+            let (c, m, y, k, a) = (get(0), get(1), get(2), get(3), get(4));
+            (
+                (1.0 - c) * (1.0 - k),
+                (1.0 - m) * (1.0 - k),
+                (1.0 - y) * (1.0 - k),
+                a,
+            )
+        }
+        // Grey (and anything unexpected): one value + alpha at `n`.
+        _ => {
+            let w = get(0);
+            let a = get(n);
+            (w, w, w, a)
+        }
+    }
 }
 
 /// Interpolate the gradient colour at a normalised position `t` in [0, 1].
@@ -138,12 +193,18 @@ pub fn CGGradientRelease(env: &mut Environment, gradient: CGGradientRef) {
     }
 }
 
+fn CGGradientGetTypeID(_env: &mut Environment) -> u32 {
+    // Stable non-zero value; apps only compare it against CFGetTypeID().
+    0x4347_4752 // 'CGGR'
+}
+
 // MARK: - Constructors
 
 /// Create from a flat array of `CGFloat` colour components.
 /// `components` layout depends on the colour space:
 ///   - RGB  → [r, g, b, a,  r, g, b, a, ...]
 ///   - Grey → [w, a,  w, a, ...]
+///   - CMYK → [c, m, y, k, a,  ...]
 fn CGGradientCreateWithColorComponents(
     env: &mut Environment,
     color_space: CGColorSpaceRef,
@@ -154,53 +215,33 @@ fn CGGradientCreateWithColorComponents(
     if count == 0 {
         return alloc_gradient(env, vec![]);
     }
+    if components.is_null() {
+        return nil;
+    }
 
-    // Determine components-per-colour from the colour space model.
-    // We support RGB (4 components incl. alpha) and Grey (2 components).
-    let components_per_color: usize = if color_space.is_null() {
-        4
+    // Number of non-alpha components in the colour space (RGB when NULL).
+    let n: usize = if color_space.is_null() {
+        3
     } else {
-        // CGColorSpaceGetNumberOfComponents returns the non-alpha count.
         let n: GuestUSize =
             crate::frameworks::core_graphics::cg_color_space::CGColorSpaceGetNumberOfComponents(
                 env,
                 color_space,
             );
-        (n + 1) as usize // +1 for alpha
+        n as usize
     };
 
-    let mut stops = Vec::with_capacity(count as usize);
+    let mut stops = Vec::with_capacity((count as usize).min(MAX_PREALLOC_STOPS));
 
     for i in 0..count as usize {
-        let loc: CGFloat = if locations.is_null() {
-            // Evenly spaced when no locations are provided.
-            if count == 1 {
-                0.0
-            } else {
-                i as CGFloat / (count as CGFloat - 1.0)
-            }
+        let location: CGFloat = if locations.is_null() {
+            default_location(i, count)
         } else {
             env.mem.read(locations + i as u32)
         };
-
-        let base = i * components_per_color;
-
-        let (r, g, b, a) = if components_per_color >= 4 {
-            (
-                env.mem.read(components + (base) as u32),
-                env.mem.read(components + (base + 1) as u32),
-                env.mem.read(components + (base + 2) as u32),
-                env.mem.read(components + (base + 3) as u32),
-            )
-        } else {
-            // Greyscale: w, a
-            let w = env.mem.read(components + (base) as u32);
-            let a = env.mem.read(components + (base + 1) as u32);
-            (w, w, w, a)
-        };
-
+        let (r, g, b, a) = read_components_color(env, components, i, n);
         stops.push(ColorStop {
-            location: loc,
+            location,
             r,
             g,
             b,
@@ -208,8 +249,7 @@ fn CGGradientCreateWithColorComponents(
         });
     }
 
-    // Ensure stops are sorted by location.
-    stops.sort_by(|a, b| a.location.partial_cmp(&b.location).unwrap());
+    sort_stops(&mut stops);
 
     alloc_gradient(env, stops)
 }
@@ -219,40 +259,35 @@ fn CGGradientCreateWithColorComponents(
 fn CGGradientCreateWithColors(
     env: &mut Environment,
     _color_space: CGColorSpaceRef,
-    colors: crate::objc::id, // CFArrayRef / NSArray* of CGColorRef
+    colors: id, // CFArrayRef / NSArray* of CGColorRef
     locations: ConstPtr<CGFloat>,
 ) -> CGGradientRef {
-    use crate::frameworks::core_graphics::cg_color::CGColorGetComponents;
-    use crate::objc::msg;
+    if colors.is_null() {
+        return nil;
+    }
 
     let count: GuestUSize = msg![env; colors count];
     if count == 0 {
         return alloc_gradient(env, vec![]);
     }
 
-    let mut stops = Vec::with_capacity(count as usize);
+    let mut stops = Vec::with_capacity((count as usize).min(MAX_PREALLOC_STOPS));
 
     for i in 0..count as usize {
-        let color: crate::objc::id = msg![env; colors objectAtIndex:(i as GuestUSize)];
-        let comps: ConstPtr<CGFloat> = CGColorGetComponents(env, color);
+        let color: id = msg![env; colors objectAtIndex:(i as GuestUSize)];
 
-        let loc: CGFloat = if locations.is_null() {
-            if count == 1 {
-                0.0
-            } else {
-                i as CGFloat / (count as CGFloat - 1.0)
-            }
+        let location: CGFloat = if locations.is_null() {
+            default_location(i, count)
         } else {
             env.mem.read(locations + i as u32)
         };
 
-        let r = env.mem.read(comps);
-        let g = env.mem.read(comps + 1);
-        let b = env.mem.read(comps + 2);
-        let a = env.mem.read(comps + 3);
+        // Read the colour straight from its host object. Going through
+        // CGColorGetComponents would allocate a fresh guest buffer per colour.
+        let (r, g, b, a) = cg_color::to_rgba(&env.objc, color);
 
         stops.push(ColorStop {
-            location: loc,
+            location,
             r,
             g,
             b,
@@ -260,19 +295,71 @@ fn CGGradientCreateWithColors(
         });
     }
 
-    stops.sort_by(|a, b| a.location.partial_cmp(&b.location).unwrap());
+    sort_stops(&mut stops);
 
     alloc_gradient(env, stops)
 }
 
-// MARK: - Drawing (delegated to cg_context)
-// The actual rasterisation lives in CGContextDrawLinearGradient /
-// CGContextDrawRadialGradient in cg_context.rs, which call gradient_color_at.
-// These stubs exist so the symbols resolve and forward to that module.
-
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGGradientRetain(_)),
     export_c_func!(CGGradientRelease(_)),
+    export_c_func!(CGGradientGetTypeID()),
     export_c_func!(CGGradientCreateWithColorComponents(_, _, _, _)),
     export_c_func!(CGGradientCreateWithColors(_, _, _)),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stop(location: CGFloat, r: CGFloat) -> ColorStop {
+        ColorStop {
+            location,
+            r,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        }
+    }
+
+    #[test]
+    fn interpolates_between_stops() {
+        let stops = vec![stop(0.0, 0.0), stop(1.0, 1.0)];
+        assert_eq!(color_at(&stops, 0.5).0, 0.5);
+        assert_eq!(color_at(&stops, 0.25).0, 0.25);
+    }
+
+    #[test]
+    fn clamps_outside_range() {
+        let stops = vec![stop(0.2, 0.0), stop(0.8, 1.0)];
+        assert_eq!(color_at(&stops, 0.0).0, 0.0);
+        assert_eq!(color_at(&stops, 1.0).0, 1.0);
+    }
+
+    #[test]
+    fn duplicate_locations_do_not_divide_by_zero() {
+        let stops = vec![stop(0.0, 0.0), stop(0.5, 0.25), stop(0.5, 0.75), stop(1.0, 1.0)];
+        let (r, ..) = color_at(&stops, 0.5);
+        assert!(r.is_finite());
+    }
+
+    #[test]
+    fn empty_is_opaque_black() {
+        assert_eq!(color_at(&[], 0.5), (0.0, 0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn sort_survives_nan() {
+        let mut stops = vec![stop(CGFloat::NAN, 0.0), stop(0.5, 0.0), stop(0.1, 0.0)];
+        sort_stops(&mut stops); // must not panic
+        assert_eq!(stops[0].location, 0.1);
+    }
+
+    #[test]
+    fn default_locations_are_evenly_spaced() {
+        assert_eq!(default_location(0, 1), 0.0);
+        assert_eq!(default_location(0, 3), 0.0);
+        assert_eq!(default_location(1, 3), 0.5);
+        assert_eq!(default_location(2, 3), 1.0);
+    }
+}
