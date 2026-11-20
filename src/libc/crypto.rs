@@ -216,7 +216,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CC_MD5(_, _, _)),
     export_c_func!(CC_MD4(_, _, _)),
     export_c_func!(CC_MD2(_, _, _)),
-    export_c_func!(CCHmacInit(_, _, _, _, _)),
+    export_c_func!(CCHmacInit(_, _, _, _)),
     export_c_func!(CCHmacUpdate(_, _, _)),
     export_c_func!(CCHmacFinal(_, _)),
     export_c_func!(CCHmac(_, _, _, _, _, _)),
