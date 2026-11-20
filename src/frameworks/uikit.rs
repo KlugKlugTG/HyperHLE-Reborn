@@ -645,14 +645,6 @@ pub const CONSTANTS: &[(&str, HostConstant)] = &[
         HostConstant::NSString("UICollectionElementKindSectionFooter"),
     ),
     // -----------------------------------------------------------------
-    // UIDocument state-change notification (iOS 5+),
-    // <https://developer.apple.com/documentation/uikit/uidocument>.
-    // -----------------------------------------------------------------
-    (
-        "_UIDocumentStateChangedNotification",
-        HostConstant::NSString("UIDocumentStateChangedNotification"),
-    ),
-    // -----------------------------------------------------------------
     // UIMenuController show / hide notification names (iOS 3.2+). Apple
     // `UIMenuController.h` declares them as
     // `UIKIT_EXTERN NSNotificationName const ...`; the posted value is
@@ -997,6 +989,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     constant_exports: &[
         ui_application::CONSTANTS,
         ui_device::CONSTANTS,
+        ui_document::CONSTANTS,
         ui_screen::CONSTANTS,
         ui_geometry::CONSTANTS,
         ui_keyboard::CONSTANTS,
