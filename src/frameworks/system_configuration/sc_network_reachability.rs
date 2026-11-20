@@ -12,7 +12,7 @@ use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::core_foundation::cf_allocator::CFAllocatorRef;
 use crate::frameworks::core_foundation::{CFRelease, CFRetain, CFTypeRef};
 use crate::mem::{guest_size_of, ConstPtr, GuestISize, Mem, MutPtr, MutVoidPtr, SafeRead};
-use crate::objc::{objc_classes, ClassExports, HostObject};
+use crate::objc::{nil, objc_classes, ClassExports, HostObject};
 use crate::Environment;
 
 type SCNetworkReachabilityFlags = u32;
@@ -116,6 +116,10 @@ struct SCNetworkReachabilityHostObject {
     context: Option<SCNetworkReachabilityContext>,
     active_callbacks: usize,
     retired_contexts: Vec<SCNetworkReachabilityContext>,
+    /// Set by ScheduleWithRunLoop, cleared by UnscheduleFromRunLoop. Only used
+    /// to give Unschedule a truthful return value: there is no real run-loop
+    /// source behind it.
+    scheduled: bool,
 }
 impl HostObject for SCNetworkReachabilityHostObject {}
 
@@ -147,13 +151,35 @@ impl SCNetworkReachabilityHostObject {
     }
 }
 
+type SCNetworkReachabilityRef = CFTypeRef;
+
+/// Whether `target` is a live reachability object. NULL and objects of other
+/// classes are rejected; the guest controls this value, so it must not reach
+/// a typed borrow unchecked.
 fn is_reachability(env: &Environment, target: SCNetworkReachabilityRef) -> bool {
+    if target.is_null() {
+        return false;
+    }
     env.objc
         .get_host_object(target)
         .is_some_and(|host| host.as_any().is::<SCNetworkReachabilityHostObject>())
 }
 
-type SCNetworkReachabilityRef = CFTypeRef;
+/// Common tail of the three `SCNetworkReachabilityCreate*` functions. Returns
+/// a +1 object, as a Create function owes.
+fn alloc_reachability(env: &mut Environment, name: Option<String>) -> SCNetworkReachabilityRef {
+    let isa = env
+        .objc
+        .get_known_class("_touchHLE_SCNetworkReachability", &mut env.mem);
+    env.objc.alloc_object(
+        isa,
+        Box::new(SCNetworkReachabilityHostObject {
+            name,
+            ..Default::default()
+        }),
+        &mut env.mem,
+    )
+}
 
 pub fn SCNetworkReachabilityRetain(
     env: &mut Environment,
@@ -172,60 +198,46 @@ pub fn SCNetworkReachabilityRelease(env: &mut Environment, target: SCNetworkReac
     }
 }
 
+fn SCNetworkReachabilityGetTypeID(_env: &mut Environment) -> u32 {
+    // Stable non-zero value; apps only compare it against CFGetTypeID().
+    0x5343_5243 // 'SCRC'
+}
+
 fn SCNetworkReachabilityCreateWithName(
     env: &mut Environment,
     _allocator: CFAllocatorRef,
     name: ConstPtr<u8>,
 ) -> SCNetworkReachabilityRef {
+    // Real SC returns NULL for a NULL node name.
+    if name.is_null() {
+        return nil;
+    }
     let name_str = env.mem.cstr_at_utf8(name).unwrap_or("").to_string();
-    let isa = env
-        .objc
-        .get_known_class("_touchHLE_SCNetworkReachability", &mut env.mem);
-    env.objc.alloc_object(
-        isa,
-        Box::new(SCNetworkReachabilityHostObject {
-            name: Some(name_str),
-            ..Default::default()
-        }),
-        &mut env.mem,
-    )
+    alloc_reachability(env, Some(name_str))
 }
 
 fn SCNetworkReachabilityCreateWithAddress(
     env: &mut Environment,
     _allocator: CFAllocatorRef,
-    _address: ConstPtr<u8>,
+    address: ConstPtr<u8>,
 ) -> SCNetworkReachabilityRef {
-    let isa = env
-        .objc
-        .get_known_class("_touchHLE_SCNetworkReachability", &mut env.mem);
-    env.objc.alloc_object(
-        isa,
-        Box::new(SCNetworkReachabilityHostObject {
-            name: None,
-            ..Default::default()
-        }),
-        &mut env.mem,
-    )
+    if address.is_null() {
+        return nil;
+    }
+    alloc_reachability(env, None)
 }
 
 fn SCNetworkReachabilityCreateWithAddressPair(
     env: &mut Environment,
     _allocator: CFAllocatorRef,
-    _local: ConstPtr<u8>,
-    _remote: ConstPtr<u8>,
+    local: ConstPtr<u8>,
+    remote: ConstPtr<u8>,
 ) -> SCNetworkReachabilityRef {
-    let isa = env
-        .objc
-        .get_known_class("_touchHLE_SCNetworkReachability", &mut env.mem);
-    env.objc.alloc_object(
-        isa,
-        Box::new(SCNetworkReachabilityHostObject {
-            name: None,
-            ..Default::default()
-        }),
-        &mut env.mem,
-    )
+    // Both addresses are optional, but at least one must be given.
+    if local.is_null() && remote.is_null() {
+        return nil;
+    }
+    alloc_reachability(env, None)
 }
 
 /// Report a Wi-Fi-style route for real networking or local StoreKit emulation.
@@ -249,9 +261,13 @@ fn current_flags(env: &Environment) -> SCNetworkReachabilityFlags {
 
 fn SCNetworkReachabilityGetFlags(
     env: &mut Environment,
-    _target: SCNetworkReachabilityRef,
+    target: SCNetworkReachabilityRef,
     flags: MutPtr<SCNetworkReachabilityFlags>,
 ) -> bool {
+    // Real SC fails (and leaves *flags alone) for an invalid target.
+    if !is_reachability(env, target) {
+        return false;
+    }
     let flags_value = current_flags(env);
     if !flags.is_null() {
         env.mem.write(flags, flags_value);
@@ -313,6 +329,7 @@ fn SCNetworkReachabilityScheduleWithRunLoop(
         let host = env
             .objc
             .borrow_mut::<SCNetworkReachabilityHostObject>(target);
+        host.scheduled = true;
         if host.callout.is_some() {
             host.active_callbacks += 1;
         }
@@ -336,25 +353,45 @@ fn SCNetworkReachabilityScheduleWithRunLoop(
     CFRelease(env, target);
     true
 }
+
 fn SCNetworkReachabilityUnscheduleFromRunLoop(
-    _env: &mut Environment,
-    _target: SCNetworkReachabilityRef,
+    env: &mut Environment,
+    target: SCNetworkReachabilityRef,
     _run_loop: CFTypeRef,
     _run_loop_mode: CFTypeRef,
 ) -> bool {
-    false
+    if !is_reachability(env, target) {
+        return false;
+    }
+    // Nothing real to tear down (notifications are delivered synchronously at
+    // schedule time), so just report whether it had been scheduled.
+    std::mem::replace(
+        &mut env
+            .objc
+            .borrow_mut::<SCNetworkReachabilityHostObject>(target)
+            .scheduled,
+        false,
+    )
 }
+
 fn SCNetworkReachabilitySetDispatchQueue(
     _env: &mut Environment,
     _target: SCNetworkReachabilityRef,
-    _queue: MutVoidPtr,
+    queue: MutVoidPtr,
 ) -> bool {
+    // Delivering callbacks on a dispatch queue isn't implemented; callers
+    // should fall back to the run-loop path.
+    log_dbg!(
+        "SCNetworkReachabilitySetDispatchQueue({:?}): not supported, returning false",
+        queue
+    );
     false
 }
 
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(SCNetworkReachabilityRetain(_)),
     export_c_func!(SCNetworkReachabilityRelease(_)),
+    export_c_func!(SCNetworkReachabilityGetTypeID()),
     export_c_func!(SCNetworkReachabilityCreateWithName(_, _)),
     export_c_func!(SCNetworkReachabilityCreateWithAddress(_, _)),
     export_c_func!(SCNetworkReachabilityCreateWithAddressPair(_, _, _)),
