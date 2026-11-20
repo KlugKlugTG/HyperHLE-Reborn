@@ -8,21 +8,68 @@
 //! Editing menus (Copy/Paste, and custom items added by the app). Chrome and
 //! other text-heavy apps construct menu items during launch; touchHLE does
 //! not draw the menu, but the object model has to exist so that those calls
-//! don't fail.
+//! don't fail. Showing and hiding only updates state and posts the
+//! `UIMenuController*MenuNotification`s.
 //!
 //! References:
 //! - <https://developer.apple.com/documentation/uikit/uimenucontroller>
 //! - <https://developer.apple.com/documentation/uikit/uimenuitem>
 
+use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::CGRect;
+use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::NSInteger;
 use crate::objc::{
-    id, msg, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr, SEL,
+    id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
+    SEL,
 };
+use crate::Environment;
+
+/// `UIMenuControllerArrowDirection`
+pub type UIMenuControllerArrowDirection = NSInteger;
+pub const UIMenuControllerArrowDefault: UIMenuControllerArrowDirection = 0;
+pub const UIMenuControllerArrowUp: UIMenuControllerArrowDirection = 1;
+pub const UIMenuControllerArrowDown: UIMenuControllerArrowDirection = 2;
+pub const UIMenuControllerArrowLeft: UIMenuControllerArrowDirection = 3;
+pub const UIMenuControllerArrowRight: UIMenuControllerArrowDirection = 4;
+
+pub const UIMenuControllerWillShowMenuNotification: &str =
+    "UIMenuControllerWillShowMenuNotification";
+pub const UIMenuControllerDidShowMenuNotification: &str =
+    "UIMenuControllerDidShowMenuNotification";
+pub const UIMenuControllerWillHideMenuNotification: &str =
+    "UIMenuControllerWillHideMenuNotification";
+pub const UIMenuControllerDidHideMenuNotification: &str =
+    "UIMenuControllerDidHideMenuNotification";
+pub const UIMenuControllerMenuFrameDidChangeNotification: &str =
+    "UIMenuControllerMenuFrameDidChangeNotification";
+
+pub const CONSTANTS: ConstantExports = &[
+    (
+        "_UIMenuControllerWillShowMenuNotification",
+        HostConstant::NSString(UIMenuControllerWillShowMenuNotification),
+    ),
+    (
+        "_UIMenuControllerDidShowMenuNotification",
+        HostConstant::NSString(UIMenuControllerDidShowMenuNotification),
+    ),
+    (
+        "_UIMenuControllerWillHideMenuNotification",
+        HostConstant::NSString(UIMenuControllerWillHideMenuNotification),
+    ),
+    (
+        "_UIMenuControllerDidHideMenuNotification",
+        HostConstant::NSString(UIMenuControllerDidHideMenuNotification),
+    ),
+    (
+        "_UIMenuControllerMenuFrameDidChangeNotification",
+        HostConstant::NSString(UIMenuControllerMenuFrameDidChangeNotification),
+    ),
+];
 
 #[derive(Default)]
 struct UIMenuItemHostObject {
-    /// `NSString *`
+    /// `NSString *`, copied.
     title: id,
     action: SEL,
 }
@@ -30,17 +77,15 @@ impl HostObject for UIMenuItemHostObject {}
 
 #[derive(Default)]
 struct UIMenuControllerHostObject {
-    /// `NSArray *` of `UIMenuItem *`, retained.
+    /// `NSArray *` of `UIMenuItem *`, copied.
     menu_items: id,
     /// The target rectangle, in `target_view`'s coordinate space.
-    #[allow(dead_code)] // Only the (unrendered) menu consumes it.
     target_rect: CGRect,
-    /// Weak (UIKit does not retain the view).
-    #[allow(dead_code)]
+    /// Weak (UIKit does not retain the view). Never dereferenced here.
     target_view: id,
     visible: bool,
     /// `UIMenuControllerArrowDirection`
-    arrow_direction: NSInteger,
+    arrow_direction: UIMenuControllerArrowDirection,
 }
 impl HostObject for UIMenuControllerHostObject {}
 
@@ -48,6 +93,41 @@ impl HostObject for UIMenuControllerHostObject {}
 pub struct State {
     /// The shared menu controller (lazily created).
     shared_menu_controller: id,
+}
+
+/// Post `name` with `controller` as the sender.
+fn post_notification(env: &mut Environment, controller: id, name: &'static str) {
+    let name = get_static_str(env, name);
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    let _: () = msg![env; center postNotificationName:name object:controller];
+}
+
+/// Change visibility, posting the Will/Did notifications only if it actually
+/// changes (real UIKit does not post for a redundant show or hide).
+fn set_visible(env: &mut Environment, controller: id, visible: bool) {
+    let was_visible = env
+        .objc
+        .borrow::<UIMenuControllerHostObject>(controller)
+        .visible;
+    if was_visible == visible {
+        return;
+    }
+    let (will, did) = if visible {
+        (
+            UIMenuControllerWillShowMenuNotification,
+            UIMenuControllerDidShowMenuNotification,
+        )
+    } else {
+        (
+            UIMenuControllerWillHideMenuNotification,
+            UIMenuControllerDidHideMenuNotification,
+        )
+    };
+    post_notification(env, controller, will);
+    env.objc
+        .borrow_mut::<UIMenuControllerHostObject>(controller)
+        .visible = visible;
+    post_notification(env, controller, did);
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -61,9 +141,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithTitle:(id)title action:(SEL)action {
-    retain(env, title);
+    // `title` is a copy property. `copy` returns +1 (and nil for nil), which
+    // is the reference the host object keeps.
+    let title: id = msg![env; title copy];
     let old = {
-        let mut host = env.objc.borrow_mut::<UIMenuItemHostObject>(this);
+        let host = env.objc.borrow_mut::<UIMenuItemHostObject>(this);
         let old = std::mem::replace(&mut host.title, title);
         host.action = action;
         old
@@ -74,7 +156,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)title { env.objc.borrow::<UIMenuItemHostObject>(this).title }
 - (())setTitle:(id)title {
-    retain(env, title);
+    let title: id = msg![env; title copy];
     let old = std::mem::replace(
         &mut env.objc.borrow_mut::<UIMenuItemHostObject>(this).title,
         title,
@@ -112,29 +194,57 @@ pub const CLASSES: ClassExports = objc_classes! {
     new_instance
 }
 
+// MARK: - Visibility
+
 - (bool)isMenuVisible {
     env.objc.borrow::<UIMenuControllerHostObject>(this).visible
 }
 - (())setMenuVisible:(bool)visible {
-    env.objc.borrow_mut::<UIMenuControllerHostObject>(this).visible = visible;
+    set_visible(env, this, visible);
 }
 - (())setMenuVisible:(bool)visible animated:(bool)_animated {
-    env.objc.borrow_mut::<UIMenuControllerHostObject>(this).visible = visible;
+    set_visible(env, this, visible);
 }
 
-- (CGRect)menuFrame { CGRect::default() }
+// iOS 13+
+- (())showMenuFromView:(id)view rect:(CGRect)rect {
+    let _: () = msg![env; this setTargetRect:rect inView:view];
+    set_visible(env, this, true);
+}
+- (())hideMenuFromView:(id)_view {
+    set_visible(env, this, false);
+}
+- (())hideMenu {
+    set_visible(env, this, false);
+}
+
+// The real value is the menu's frame in window coordinates. Nothing is drawn
+// here, so the target rect (view coordinates) is the closest approximation.
+- (CGRect)menuFrame {
+    let (visible, rect) = {
+        let host = env.objc.borrow::<UIMenuControllerHostObject>(this);
+        (host.visible, host.target_rect)
+    };
+    if visible { rect } else { CGRect::default() }
+}
+
+// MARK: - Items
 
 - (id)menuItems {
     env.objc.borrow::<UIMenuControllerHostObject>(this).menu_items
 }
 - (())setMenuItems:(id)items {
-    retain(env, items);
+    // `menuItems` is a copy property: keep our own snapshot, so the app
+    // mutating the array it passed in later can't change the menu.
+    let items: id = msg![env; items copy];
     let old = std::mem::replace(
         &mut env.objc.borrow_mut::<UIMenuControllerHostObject>(this).menu_items,
         items,
     );
     release(env, old);
 }
+
+// MARK: - Target
 
 // Per Apple, the rectangle is in the view's coordinate space. It is only a
 // positioning hint for the (unrendered) menu, so storing it is enough.
