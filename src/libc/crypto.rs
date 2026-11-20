@@ -194,23 +194,6 @@ fn CCHmacFinal(env: &mut Environment, ctx: MutVoidPtr, mac: MutPtr<u8>) {
     env.mem.bytes_at_mut(mac, digest.len() as GuestUSize).copy_from_slice(&digest);
 }
 
-fn CCHmac(
-    env: &mut Environment,
-    alg: u32,
-    key: ConstVoidPtr,
-    key_len: GuestUSize,
-    data: ConstVoidPtr,
-    data_len: GuestUSize,
-    mac: MutPtr<u8>,
-) {
-    let Some(alg) = HmacAlgorithm::from_cc(alg) else {
-        return;
-    };
-    let key = env.mem.bytes_at(key.cast(), key_len);
-    let data = env.mem.bytes_at(data.cast(), data_len);
-    let digest = hmac_digest(alg, key, data);
-    env.mem.bytes_at_mut(mac, digest.len() as GuestUSize).copy_from_slice(&digest);
-}
 
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CC_MD5(_, _, _)),
@@ -219,5 +202,4 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CCHmacInit(_, _, _, _)),
     export_c_func!(CCHmacUpdate(_, _, _)),
     export_c_func!(CCHmacFinal(_, _)),
-    export_c_func!(CCHmac(_, _, _, _, _, _)),
 ];
