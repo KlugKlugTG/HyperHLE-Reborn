@@ -84,6 +84,7 @@ struct GKSessionHostObject {
 }
 impl HostObject for GKSessionHostObject {}
 
+#[derive(Default)]
 struct GKPeerPickerControllerHostObject {
     /// Weak.
     delegate: id,
