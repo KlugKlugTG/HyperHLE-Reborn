@@ -6,7 +6,7 @@
 #
 # This file contains touchHLE's recommended default options for various apps.
 #
-# *** Don't edit this file yourself! Use touchHLE_options.txt instead. ***
+# *** Don't edit this file yourself! Use HyperHLE_options.txt instead. ***
 #
 # ---
 #

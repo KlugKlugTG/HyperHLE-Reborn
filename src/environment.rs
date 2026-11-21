@@ -1535,7 +1535,7 @@ impl Environment {
     /// headless mode.
     pub fn window(&self) -> &window::Window {
         self.window.as_ref().expect(
-            "Tried to do something that needs a window, but touchHLE is running in headless mode!",
+            "Tried to do something that needs a window, but HyperHLE is running in headless mode!",
         )
     }
 
@@ -1543,7 +1543,7 @@ impl Environment {
     /// in headless mode.
     pub fn window_mut(&mut self) -> &mut window::Window {
         self.window.as_mut().expect(
-            "Tried to do something that needs a window, but touchHLE is running in headless mode!",
+            "Tried to do something that needs a window, but HyperHLE is running in headless mode!",
         )
     }
 
@@ -1764,7 +1764,7 @@ impl Environment {
         let thread_routine =
             Coroutine::with_stack(thread_stack, move |yielder, env: Environment| {
                 log_dbg!(
-                    "touchHLE: guest worker thread now running (start_routine={:#x})",
+                    "HyperHLE: guest worker thread now running (start_routine={:#x})",
                     start_routine.addr_with_thumb_bit()
                 );
                 run_guest_coroutine(yielder, env, move |env| {

@@ -39,9 +39,16 @@ const IPA = 'https://archive.org/download/Over700iOSGames/Red%20Ball%203.ipa';
 const BUG = 'The game freezes a few seconds after the first level loads.';
 const LOG = `touchHLE UNOFFICIAL v0.2.3 (f0fcd6e-dirty)
 touchHLE::window: Using bundled ANGLE for Android OpenGL ES`;
+const HYPERHLE_LOG = `HyperHLE UNOFFICIAL v0.2.3 (f0fcd6e-dirty)
+HyperHLE::window: Using bundled ANGLE for Android OpenGL ES`;
 
 test('complete fix request passes', () => {
   const body = fixForm({ ipa: IPA, bug: BUG, log: LOG });
+  assert.deepStrictEqual(checkIssue(body), { missing: [], needsLog: false });
+});
+
+test('complete fix request passes (HyperHLE log)', () => {
+  const body = fixForm({ ipa: IPA, bug: BUG, log: HYPERHLE_LOG });
   assert.deepStrictEqual(checkIssue(body), { missing: [], needsLog: false });
 });
 

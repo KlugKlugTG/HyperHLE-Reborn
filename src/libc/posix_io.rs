@@ -912,7 +912,7 @@ pub fn write(
             // A guest's C library and assertion machinery report failures
             // straight to fd 2: dlmalloc prints "free(): invalid pointer" and
             // friends, and libc prints uncaught-abort reasons. The host
-            // process's stdout is not captured into touchHLE_log.txt, so a
+            // process's stdout is not captured into HyperHLE_log.txt, so a
             // crash report would lose the one line that explains it. Mirror
             // stderr into the file log; stdout is left alone because games
             // print there constantly.

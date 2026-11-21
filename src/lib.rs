@@ -244,11 +244,11 @@ pub extern "C" fn SDL_main(
     match main([String::new()].into_iter()) {
         Ok(termination) => {
             let code = termination.map_or(0, |result| result.exit_code());
-            echo!("touchHLE finished with status {code}");
+            echo!("HyperHLE finished with status {code}");
             code
         }
         Err(e) => {
-            echo!("touchHLE errored: {e:?}");
+            echo!("HyperHLE errored: {e:?}");
             1
         }
     }
@@ -256,7 +256,7 @@ pub extern "C" fn SDL_main(
 
 const USAGE: &str = "\
 Usage:
-    touchHLE [PATH] [OPTIONS]
+    HyperHLE [PATH] [OPTIONS]
 
 PATH should be a path to a .app bundle or .ipa file.
 
@@ -299,6 +299,10 @@ fn run_session<T: Iterator<Item = String>>(
     mut args: T,
     returning_to_picker: bool,
 ) -> Result<Option<GuestTermination>, String> {
+    // Copy any legacy touchHLE_* user data forward before anything uses the
+    // renamed paths. Safe to call on every launch: it does nothing (or only
+    // logs) when the legacy paths don't exist.
+    paths::migrate_legacy_user_data();
     // Headless CI boxes have no sound devices; when asked, point OpenAL
     // Soft's wave writer at a capture file before any OpenAL call happens.
     if std::env::var_os("TOUCHHLE_CAPTURE_AUDIO").is_some()
@@ -337,7 +341,7 @@ fn run_session<T: Iterator<Item = String>>(
     }
 
     echo!(
-        "touchHLE {}{}{}",
+        "HyperHLE {}{}{}",
         branding(),
         if branding().is_empty() { "" } else { " " },
         VERSION,
@@ -356,7 +360,7 @@ fn run_session<T: Iterator<Item = String>>(
 
     {
         let base_path = paths::user_data_base_path();
-        log!("Base path for touchHLE files: {}", base_path.display());
+        log!("Base path for HyperHLE files: {}", base_path.display());
         paths::prepopulate_user_data_dir();
         paths::remove_legacy_pvrtc_disk_cache();
     }
@@ -589,7 +593,7 @@ fn run_session<T: Iterator<Item = String>>(
         // missing post-iOS-9 APIs becomes the rule rather than the exception.
         if major > 9 || (major == 9 && minor > 0) {
             echo!(
-                "Warning: app requires OS version {}. touchHLE currently aims \
+                "Warning: app requires OS version {}. HyperHLE currently aims \
                  for iOS 2.x–9.0; newer APIs may be missing.",
                 version
             );

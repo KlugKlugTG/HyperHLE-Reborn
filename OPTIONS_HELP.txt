@@ -24,12 +24,12 @@ View options:
         --landscape-right means rotate 90° clockwise from portrait.
         --upside-down means rotate 180° from portrait (portrait upside-down).
 
-        Usually apps that require landscape mode will tell touchHLE about this,
+        Usually apps that require landscape mode will tell HyperHLE about this,
         and it will automatically rotate the window, but some apps neglect to
         do this. These options may be useful in that case.
 
     --scale-hack=...
-        Set a scaling factor for the window. touchHLE will attempt to run the
+        Set a scaling factor for the window. HyperHLE will attempt to run the
         app with an increased internal resolution. This is a hack and there's
         no guarantee it will work correctly for all apps.
 
@@ -39,7 +39,7 @@ View options:
         This is a natural number that is at least 1.
 
     --ui-scale=...
-        Set a resolution multiplier for the user interface that touchHLE
+        Set a resolution multiplier for the user interface that HyperHLE
         itself renders (the app picker and UIKit-based app UIs). Layer
         bitmaps (including text) are rasterized at N times their logical
         size and composited into a proportionally larger framebuffer, which
@@ -80,7 +80,7 @@ Device options:
 
         A model's hardware identifier (e.g. "iphone4,1") is also accepted.
 
-        Use "auto" to let touchHLE inspect your host display's resolution,
+        Use "auto" to let HyperHLE inspect your host display's resolution,
         expose that resolution directly to the app, and still pick the device
         family whose bundled resources are the closest match. The chosen family
         is still validated against what the app bundle supports, so an
@@ -116,7 +116,7 @@ Game controller options:
         Disables mapping of analog stick input to simulated rotation of the
         device.
 
-        By default, if touchHLE detects a game controller, its analog sticks
+        By default, if HyperHLE detects a game controller, its analog sticks
         will be used for simulated accelerometer tilt controls. When this
         happens, the real accelerometer (e.g. on an Android phone), if present,
         is ignored. By setting this option, the real accelerometer can be used
@@ -124,7 +124,7 @@ Game controller options:
         that integrates both an accelerometer and a game controller, or if you
         do not want to disconnect your game controller.
 
-        Note that touchHLE does not currently support accelerometers contained
+        Note that HyperHLE does not currently support accelerometers contained
         within game controllers.
 
     --x-tilt-range=...
@@ -248,18 +248,18 @@ Game controller options:
 
 Graphics driver options:
     --gles2-compat
-        Enables touchHLE's experimental OpenGL ES 2.0 subset using the desktop
+        Enables HyperHLE's experimental OpenGL ES 2.0 subset using the desktop
         OpenGL 2.1 compatibility backend. This is an app-specific option and
         is not a complete implementation of OpenGL ES 2.0.
 
     --gles1=...
-        Force touchHLE to use a particular OpenGL ES 1.1 implementation.
+        Force HyperHLE to use a particular OpenGL ES 1.1 implementation.
         This may be useful for troubleshooting graphics driver issues.
 
-        --gles1=gles1_on_gl2 will use touchHLE's GLES1-on-GL2 layer.
+        --gles1=gles1_on_gl2 will use HyperHLE's GLES1-on-GL2 layer.
         --gles1=gles1_native will use native OpenGL ES 1.1.
 
-        When this option isn't in use, touchHLE will try each in order and use
+        When this option isn't in use, HyperHLE will try each in order and use
         the first one that works.
 
 Debugging options:
@@ -279,10 +279,10 @@ Debugging options:
         callbacks, rather than using the fast direct access path (page tables).
 
     --gdb=...
-        Starts touchHLE in debugging mode, listening for GDB remote serial
+        Starts HyperHLE in debugging mode, listening for GDB remote serial
         protocol connections over TCP on the specified host and port.
 
-        You can then connect to touchHLE with GDB and make use of its features
+        You can then connect to HyperHLE with GDB and make use of its features
         to inspect memory and registers, set up software breakpoints, and
         continue or step execution.
 
@@ -326,7 +326,7 @@ Other options:
         language is supported, is determined entirely by the app.
 
     --headless
-        Run in headless mode. touchHLE will not create a window, so there will
+        Run in headless mode. HyperHLE will not create a window, so there will
         be no graphical output and no input. Only useful for command-line apps.
         Implies --no-error-popup.
 
@@ -334,7 +334,7 @@ Other options:
         Skip decoding and showing the game's launch image (splash screen) on
         startup. Makes game launch noticeably faster, at the cost of not
         seeing the app's launch artwork. Decoded images are cached in the
-        touchHLE user data directory, so the first launch still pays the
+        HyperHLE user data directory, so the first launch still pays the
         decode cost but every later launch loads the raw pixels from disk.
 
     --no-skip-launch-image
@@ -342,8 +342,8 @@ Other options:
 
     --args
         All arguments following this option will be passed to the app (via C's
-        argc/argv) rather than processed by touchHLE. This option can't be used
-        via touchHLE_options.txt or touchHLE_default_options.txt.
+        argc/argv) rather than processed by HyperHLE. This option can't be used
+        via HyperHLE_options.txt or touchHLE_default_options.txt.
 
     --overlay=on|off
         Start the performance display enabled or hidden. It is enabled by
@@ -378,7 +378,7 @@ Other options:
     --fps-limit=...
         Modify or disable the framerate (FPS) limit.
 
-        By default, touchHLE limits the framerate of an app to 60fps, because
+        By default, HyperHLE limits the framerate of an app to 60fps, because
         this is required for accurate emulation. Some apps can however run
         correctly at a higher framerate than normal.
 
@@ -513,7 +513,7 @@ Other options:
         KERN_SUCCESS as if it had been signalled. 0 disables it (the default).
 
         This is a last-resort workaround for an app whose worker thread parks
-        on a Mach semaphore that never gets signalled under touchHLE's
+        on a Mach semaphore that never gets signalled under HyperHLE's
         cooperative scheduler, and whose wait loop re-checks its own state on
         wake (FMOD's worker threads in Minecraft: Story Mode).
 
@@ -540,7 +540,7 @@ Other options:
 
     --allow-network-access
     --no-network-access
-        Allow apps running in touchHLE to access the Internet and the local network,
+        Allow apps running in HyperHLE to access the Internet and the local network,
         including HTTP/HTTPS URL-loading APIs (NSURLConnection, NSURLSession, and NSData).
         Disabled by default.
 
@@ -622,7 +622,7 @@ Other options:
         automatically. Disabled globally; the bundled default-options file
         enables it for GTA III. To enable it manually for a run, pass this
         flag after the app path. For example:
-        touchHLE GTA3.app --fix-movie-player
+        HyperHLE GTA3.app --fix-movie-player
         Also available as "Movie player fix" in Settings > Graphics. The
         switch is off on a fresh install: leaving it alone keeps the
         app-specific defaults, flipping it (on or off) overrides them.

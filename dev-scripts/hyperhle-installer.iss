@@ -63,7 +63,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Dirs]
 Name: "{app}"; Permissions: users-modify; Check: IsAdminInstallMode
-Name: "{app}\touchHLE_apps"
+Name: "{app}\HyperHLE_apps"
 
 [Files]
 Source: "{#BundleDir}\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
@@ -72,8 +72,8 @@ Source: "{#BundleDir}\touchHLE_fonts\*"; DestDir: "{app}\touchHLE_fonts"; Flags:
 Source: "{#BundleDir}\touchHLE_default_options.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; The user is expected to edit or replace these, so keep their copies.
 Source: "{#BundleDir}\touchHLE_wallpaper.png"; DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall
-Source: "..\touchHLE_options.txt"; DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall
-Source: "..\touchHLE_apps\README.txt"; DestDir: "{app}\touchHLE_apps"; Flags: ignoreversion
+Source: "..\HyperHLE_options.txt"; DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall
+Source: "..\HyperHLE_apps\README.txt"; DestDir: "{app}\HyperHLE_apps"; Flags: ignoreversion
 Source: "..\OPTIONS_HELP.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
@@ -81,7 +81,7 @@ Source: "gpl-3.0.txt"; DestDir: "{app}"; DestName: "COPYING.txt"; Flags: ignorev
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"
-Name: "{group}\{#AppName} apps folder"; Filename: "{app}\touchHLE_apps"
+Name: "{group}\{#AppName} apps folder"; Filename: "{app}\HyperHLE_apps"
 Name: "{group}\{cm:UninstallProgram,{#AppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 

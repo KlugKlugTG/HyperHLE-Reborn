@@ -13,7 +13,7 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::from(termination.map_or(0, |result| result.exit_code()) as u8)
         }
         Err(error) => {
-            eprintln!("touchHLE failed: {error}");
+            eprintln!("HyperHLE failed: {error}");
             std::process::ExitCode::FAILURE
         }
     }

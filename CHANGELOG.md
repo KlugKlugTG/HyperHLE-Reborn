@@ -283,6 +283,10 @@ Usability:
 
 - The guest heap now reports who is filling it. The guest heap is one shared address space, so an app whose heap grows to gigabytes gives no clue where the memory went (a Unity game can report a few tens of megabytes used while the heap holds everything). Every large allocation (4 KiB and up) made through `malloc`, `calloc`, `vm_allocate` or `mmap` is attributed to the guest return address it came from, and the biggest call sites are logged as the attributed total passes 256 MiB, 512 MiB, 1 GiB and so on. Requests of 8 MiB or more, and releases of that size, are logged individually with the heap total, so a sudden multi-hundred-megabyte jump names the request behind it. The "out of memory (could not find a large enough chunk)" warning now shares the rate-limited budget too.
 
+- A 64-bit executable now gets a clear, specific failure instead of a confusing one. `touchHLE` used to reject any 64-bit Mach-O with `Could not load executable: Executable is not for an ARM CPU!`, which sends users looking for the wrong IPA — the file really is ARM, it is just 64-bit. The loader now rejects 64-bit executables as soon as the word size is known, with `Executable is 64-bit! HyperHLE supports 32-bit only`, for thin executables and for fat binaries whose slices are all 64-bit alike. (@arena-agent)
+
+- The user-facing touchHLE names now read HyperHLE. The log prefix (`touchHLE::gles` → `HyperHLE::gles`), the console banner and usage line, the crash/terminal messages and the log file all carry the new name, and the app folder, options file, sandbox, SQLite dir, picker settings, last-app file and default wallpaper moved from their `touchHLE_` names to `HyperHLE_` ones — with existing user data copied forward automatically on first launch (nothing is overwritten or merged; the legacy paths are kept in place alongside the new ones). The bundled resource names (`touchHLE_dylibs`, `touchHLE_fonts`, `touchHLE_default_options.txt`, `touchHLE_wallpaper.png`) and all internal identifiers are deliberately unchanged. `TOUCHHLE_*` environment variables stay as-is. (@arena-agent)
+
 ## v0.2.3 (2026-01-02)
 
 Compatibility:

@@ -107,28 +107,39 @@ pub const RESOURCES_ARE_EXTERNAL_FILES: bool =
 
 /// Name of the directory where the user can put apps if they want them to
 /// appear in the app picker.
-pub const APPS_DIR: &str = "touchHLE_apps";
+pub const APPS_DIR: &str = "HyperHLE_apps";
 
 /// Name of the file intended for the user's own options.
-pub const USER_OPTIONS_FILE: &str = "touchHLE_options.txt";
+pub const USER_OPTIONS_FILE: &str = "HyperHLE_options.txt";
+
+/// Name of the log file written by HyperHLE.
+pub const LOG_FILE: &str = "HyperHLE_log.txt";
 
 /// Persistent preferences for the graphical app picker.
-pub const PICKER_SETTINGS_FILE: &str = "touchHLE_picker_settings.txt";
+pub const PICKER_SETTINGS_FILE: &str = "HyperHLE_picker_settings.txt";
+
+/// Name of the file recording the most recently launched app.
+pub const LAST_APP_FILE: &str = "HyperHLE_last_app.txt";
 
 /// Names of files the user can put a wallpaper image (for the app picker) in.
 #[allow(unused)]
 pub const WALLPAPER_FILES: &[&str] = &[
-    "touchHLE_wallpaper.png",
-    "touchHLE_wallpaper.jpg",
-    "touchHLE_wallpaper.jpeg",
+    "HyperHLE_wallpaper.png",
+    "HyperHLE_wallpaper.jpg",
+    "HyperHLE_wallpaper.jpeg",
 ];
+
+/// Name of the bundled default wallpaper resource, copied into the user
+/// directory on first run. This is the file baked into the app bundle; it is
+/// intentionally not the same as [WALLPAPER_FILES].
+pub const BUNDLED_WALLPAPER_FILE: &str = "touchHLE_wallpaper.png";
 
 /// Name of the directory where touchHLE will store sandboxed app data, e.g.
 /// the `Documents` directory.
-pub const SANDBOX_DIR: &str = "touchHLE_sandbox";
+pub const SANDBOX_DIR: &str = "HyperHLE_sandbox";
 
 /// Name of the directory where redirected/exported SQLite databases live.
-pub const SQLITE_DIR: &str = "touchHLE_sqlite";
+pub const SQLITE_DIR: &str = "HyperHLE_sqlite";
 
 /// Name of the directory where touchHLE will store IMG_####.PNG files saved to
 /// the Photo Album.
@@ -283,6 +294,88 @@ pub fn url_for_opening_apps_dir() -> Result<String, String> {
     }
 }
 
+/// Legacy names for the user-facing artifacts that used to carry the
+/// `touchHLE_` prefix, kept here so existing user data is copied forward on
+/// the first run of the renamed build instead of being silently orphaned.
+const LEGACY_APPS_DIR: &str = "touchHLE_apps";
+const LEGACY_USER_OPTIONS_FILE: &str = "touchHLE_options.txt";
+const LEGACY_PICKER_SETTINGS_FILE: &str = "touchHLE_picker_settings.txt";
+const LEGACY_LAST_APP_FILE: &str = "touchHLE_last_app.txt";
+const LEGACY_SANDBOX_DIR: &str = "touchHLE_sandbox";
+const LEGACY_SQLITE_DIR: &str = "touchHLE_sqlite";
+const LEGACY_WALLPAPER_FILES: &[&str] = &[
+    "touchHLE_wallpaper.png",
+    "touchHLE_wallpaper.jpg",
+    "touchHLE_wallpaper.jpeg",
+];
+
+/// Recursively copy a file or directory tree. Returns an error if any part
+/// fails, leaving the caller responsible for deciding what to do with the
+/// incomplete copy.
+fn copy_tree(from: &Path, to: &Path) -> Result<(), std::io::Error> {
+    let meta = std::fs::metadata(from)?;
+    if meta.is_dir() {
+        std::fs::create_dir(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else {
+        std::fs::copy(from, to)?;
+    }
+    Ok(())
+}
+
+/// Copy one legacy path to its renamed equivalent under the user data
+/// directory, leaving the legacy path in place. This never deletes or
+/// overwrites anything: if the renamed path already exists, both are left
+/// untouched rather than merging.
+fn migrate_one(base: &Path, from: &str, to: &str) {
+    let old_path = base.join(from);
+    let new_path = base.join(to);
+    if !old_path.exists() {
+        return;
+    }
+    if new_path.exists() {
+        // Both exist: leave both untouched rather than merging or
+        // overwriting. The user can clean up the legacy path by hand.
+        return;
+    }
+    match copy_tree(&old_path, &new_path) {
+        Ok(()) => log!(
+            "Migrated legacy {} -> {}",
+            old_path.display(),
+            new_path.display()
+        ),
+        Err(e) => log!(
+            "Warning: couldn't migrate {} -> {}: {}; the legacy path is still in place",
+            old_path.display(),
+            new_path.display(),
+            e
+        ),
+    }
+}
+
+/// Copy user-facing `touchHLE_` artifacts to their `HyperHLE_` equivalents.
+/// Called on startup before any of the paths is used; safe to call on every
+/// launch. Existing renamed files are never created by this call, and the
+/// legacy paths are never deleted.
+pub fn migrate_legacy_user_data() {
+    let base = user_data_base_path();
+    // The log file is intentionally not migrated: it is truncated on every
+    // launch, so copying it would lose its content anyway. The legacy log is
+    // simply left in place.
+    migrate_one(&base, LEGACY_APPS_DIR, APPS_DIR);
+    migrate_one(&base, LEGACY_USER_OPTIONS_FILE, USER_OPTIONS_FILE);
+    migrate_one(&base, LEGACY_PICKER_SETTINGS_FILE, PICKER_SETTINGS_FILE);
+    migrate_one(&base, LEGACY_LAST_APP_FILE, LAST_APP_FILE);
+    migrate_one(&base, LEGACY_SANDBOX_DIR, SANDBOX_DIR);
+    migrate_one(&base, LEGACY_SQLITE_DIR, SQLITE_DIR);
+    for (legacy, new) in LEGACY_WALLPAPER_FILES.iter().zip(WALLPAPER_FILES.iter()) {
+        migrate_one(&base, legacy, new);
+    }
+}
+
 /// Remove the legacy on-disk PVRTC decode cache directory. The PVRTC decode
 /// cache was removed (both the in-memory tier and this on-disk tier) because
 /// decoded RGBA8 entries used a lot of host memory and disk space.
@@ -314,9 +407,10 @@ pub fn prepopulate_user_data_dir() {
 
     let has_user_wallpaper = WALLPAPER_FILES
         .iter()
+        .chain(LEGACY_WALLPAPER_FILES.iter())
         .any(|name| base_path.join(name).is_file());
     if !has_user_wallpaper {
-        match ResourceFile::open(WALLPAPER_FILES[0]) {
+        match ResourceFile::open(BUNDLED_WALLPAPER_FILE) {
             Ok(mut resource) => {
                 let mut image = Vec::new();
                 match resource.get().read_to_end(&mut image) {
@@ -370,14 +464,14 @@ pub fn prepopulate_user_data_dir() {
     if !apps_dir_readme.is_file() {
         let content = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/touchHLE_apps/README.txt"
+            "/HyperHLE_apps/README.txt"
         ));
         create_file(&apps_dir_readme, content);
     }
 
     let user_options = base_path.join(USER_OPTIONS_FILE);
     if !user_options.is_file() {
-        let content = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/touchHLE_options.txt"));
+        let content = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/HyperHLE_options.txt"));
         create_file(&user_options, content);
     }
 

@@ -36,7 +36,7 @@ const CLOUD_SHARE_URL =
 // Log files dragged into the form, or log lines pasted anywhere.
 const LOG_ATTACHMENT =
   /https:\/\/github\.com\/user-attachments\/files\/\d+\/[^\s)]*\.(txt|log)\b/i;
-const LOG_TEXT = /touchHLE(::|\s+UNOFFICIAL|\s+v\d)/;
+const LOG_TEXT = /(?:touchHLE|HyperHLE)(::|\s+UNOFFICIAL|\s+v\d)/;
 
 function sections(body) {
   const out = [];

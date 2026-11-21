@@ -229,7 +229,7 @@ pub fn start() -> bool {
     // counter advancing with silence at the real-time rate.
     THREAD_ALIVE.store(true, Ordering::SeqCst);
     match std::thread::Builder::new()
-        .name("touchHLE mic capture".to_string())
+        .name("HyperHLE mic capture".to_string())
         .spawn(mic_thread)
     {
         Ok(handle) => *lock(&THREAD) = Some(handle),

@@ -60,7 +60,7 @@ impl FpsCounter {
             #[cfg(target_os = "ios")]
             crate::report_host_fps(fps);
             if log_output {
-                echo!("touchHLE: {} FPS: {:.2}", label, fps);
+                echo!("HyperHLE: {} FPS: {:.2}", label, fps);
             }
         }
     }
