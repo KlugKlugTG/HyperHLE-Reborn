@@ -587,6 +587,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 mod autorotation_tests {
     use super::*;
     use crate::frameworks::core_graphics::CGSize;
+    use crate::window::DeviceFamily;
 
     fn rect(x: f32, y: f32, width: f32, height: f32) -> CGRect {
         CGRect {
@@ -598,12 +599,27 @@ mod autorotation_tests {
     #[test]
     fn fullscreen_windows_use_native_screen_space_for_every_preset() {
         for family in [
-            crate::window::DeviceFamily::iPhone3GS,
-            crate::window::DeviceFamily::iPhone4,
-            crate::window::DeviceFamily::iPhone5,
-            crate::window::DeviceFamily::iPhone6,
-            crate::window::DeviceFamily::iPad,
-            crate::window::DeviceFamily::iPad3,
+            DeviceFamily::iPhone,
+            DeviceFamily::iPhone3G,
+            DeviceFamily::iPhone3GS,
+            DeviceFamily::iPhone4,
+            DeviceFamily::iPhone4s,
+            DeviceFamily::iPhone5,
+            DeviceFamily::iPhone5c,
+            DeviceFamily::iPhone6,
+            DeviceFamily::iPad,
+            DeviceFamily::iPad2,
+            DeviceFamily::iPad3,
+            DeviceFamily::iPad4,
+            DeviceFamily::iPad5,
+            DeviceFamily::iPadMini,
+            DeviceFamily::iPadMini2,
+            DeviceFamily::iPadMini3,
+            DeviceFamily::iPodTouch,
+            DeviceFamily::iPodTouch2,
+            DeviceFamily::iPodTouch3,
+            DeviceFamily::iPodTouch4,
+            DeviceFamily::iPodTouch5,
         ] {
             let (width, height) = family.portrait_size();
             let screen = rect(0.0, 0.0, width as f32, height as f32);

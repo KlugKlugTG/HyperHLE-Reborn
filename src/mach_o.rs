@@ -1795,7 +1795,15 @@ mod segment_validation_tests {
         // than rejection of a malformed file.
         let slice = thin64(0x0100_000c, 3);
         let mut bytes = Vec::new();
-        for word in [0xcafebabeu32, 1, 0x0100_000cu32, 3, 28, slice.len() as u32, 0] {
+        for word in [
+            0xcafebabeu32,
+            1,
+            0x0100_000cu32,
+            3,
+            28,
+            slice.len() as u32,
+            0,
+        ] {
             bytes.extend_from_slice(&word.to_be_bytes());
         }
         bytes.extend_from_slice(&slice);
