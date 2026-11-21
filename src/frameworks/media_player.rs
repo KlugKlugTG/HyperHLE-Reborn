@@ -34,6 +34,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     ],
     constant_exports: &[
         movie_player::CONSTANTS,
+        media_entity::CONSTANTS,
         music_player::CONSTANTS,
         media_library::CONSTANTS,
         media_playlist::CONSTANTS,
