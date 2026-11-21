@@ -34,9 +34,6 @@ use crate::mem::ConstVoidPtr;
 /// `[error.domain isEqualToString:GKErrorDomain]` to filter
 /// GameKit-specific failures, so the literal must match Apple's.
 pub const CONSTANTS: ConstantExports = &[
-    ("_GKErrorDomain", HostConstant::NSString("GKErrorDomain")),
-    // GKTurnTimeoutNone is a documented sentinel NSTimeInterval meaning
-    // "this turn never times out"; the SDK exports it as -1.
     (
         "_GKTurnTimeoutNone",
         HostConstant::Custom(|env| env.mem.alloc_and_write(-1.0f64).cast().cast_const()),
@@ -70,6 +67,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     ],
     constant_exports: &[
         gk_local_player::CONSTANTS,
+        gk_session::CONSTANTS,
         ad_banner_view::CONSTANTS,
         CONSTANTS,
     ],
