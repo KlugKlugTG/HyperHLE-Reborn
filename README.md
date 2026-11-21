@@ -34,7 +34,7 @@ The titles below have been tested with HyperHLE-Reborn and are known to run. Com
 - Real Racing 3 (Playable)
 - Silent Ops (Playable)
 - Need For Speed: Most Wanted (Playable)
-- Minecraft 0.16.2 (Playable)
+- Minecraft 0.16.2+ (Playable-Ingame)
 - Oceanhorn (Playable)
 - Asphalt 8 1.0.0-1.7.2 (Playable)
 - GTA 3 (Ingame)
@@ -44,6 +44,8 @@ The titles below have been tested with HyperHLE-Reborn and are known to run. Com
 - My Talking Hank (Playable)
 - Subway Surfers 1.118.0 (Playable)
 - Minion Rush 6.3.0 (Playable)
+- Infinity Blade (Playable)
+- Earn To Die (Playable)
 - And more more games
 
 ## Build and documentation
