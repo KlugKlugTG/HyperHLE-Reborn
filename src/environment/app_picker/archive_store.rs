@@ -2108,7 +2108,7 @@ fn download_task_status(task: &DownloadTask) -> String {
             if task.already_present {
                 format!("Already installed • {name}")
             } else {
-                format!("Installed in touchHLE_apps • {name}")
+                format!("Installed in {} • {name}", crate::paths::APPS_DIR)
             }
         }
         TaskState::Failed => task

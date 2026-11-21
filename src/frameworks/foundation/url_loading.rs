@@ -433,7 +433,7 @@ pub fn send_async(request: Result<HttpRequest, HttpError>, network_access: bool)
 
     let worker_sender = sender.clone();
     let spawn_result = std::thread::Builder::new()
-        .name("touchHLE HTTP request".to_string())
+        .name("HyperHLE HTTP request".to_string())
         .spawn(move || {
             let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 perform_http_request(request)

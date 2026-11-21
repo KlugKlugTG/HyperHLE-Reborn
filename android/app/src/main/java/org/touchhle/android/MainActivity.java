@@ -510,9 +510,9 @@ public class MainActivity extends SDLActivity {
     }
 
     private void copyIpa(Uri uri, String name) {
-        // touchHLE lists apps from this directory (see APPS_DIR in paths.rs);
+        // HyperHLE lists apps from this directory (see APPS_DIR in paths.rs);
         // it matches SDL_AndroidGetExternalStoragePath() on Android.
-        File appsDir = new File(getExternalFilesDir(null), "touchHLE_apps");
+        File appsDir = new File(getExternalFilesDir(null), "HyperHLE_apps");
         if (!appsDir.exists() && !appsDir.mkdirs()) {
             Log.e(TAG, "Couldn't create " + appsDir);
             return;

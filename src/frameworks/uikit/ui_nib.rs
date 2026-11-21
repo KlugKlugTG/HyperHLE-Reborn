@@ -119,7 +119,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)instantiateWithOwner:(id)owner options:(id)options {
     if owner == nil {
-            log!("touchHLE Warning: UINib instantiateWithOwner:nil; continuing with nil File's Owner");
+            log!("HyperHLE Warning: UINib instantiateWithOwner:nil; continuing with nil File's Owner");
         }
 
     // Apple's UINib loading documentation: the only documented `options`
@@ -242,7 +242,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
         }
 
-        log!("touchHLE Warning: {} requested but file_owner is nil! Returning dummy.", id);
+        log!("HyperHLE Warning: {} requested but file_owner is nil! Returning dummy.", id);
         let ns_object_class = env.objc.get_known_class("NSObject", &mut env.mem);
         let dummy: id = msg![env; ns_object_class alloc];
         if delegate != nil {
@@ -435,7 +435,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         // заглушка NSObject
         if source_class == ns_object_class {
             let label_str = to_rust_string(env, label);
-            log!("touchHLE NIB: Skipping outlet '{}' connection because source is an unhandled NSObject", label_str);
+            log!("HyperHLE NIB: Skipping outlet '{}' connection because source is an unhandled NSObject", label_str);
             return;
         }
 

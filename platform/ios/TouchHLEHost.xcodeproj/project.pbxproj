@@ -12,9 +12,9 @@
 		A20000000000000000000009 /* EmulatorCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3000000000000000000000D /* EmulatorCore.swift */; };
 		A20000000000000000000002 /* touchHLE_fonts in Resources */ = {isa = PBXBuildFile; fileRef = A30000000000000000000004 /* touchHLE_fonts */; };
 		A20000000000000000000003 /* touchHLE_dylibs in Resources */ = {isa = PBXBuildFile; fileRef = A30000000000000000000005 /* touchHLE_dylibs */; };
-		A20000000000000000000004 /* touchHLE_apps in Resources */ = {isa = PBXBuildFile; fileRef = A30000000000000000000006 /* touchHLE_apps */; };
+		A20000000000000000000004 /* HyperHLE_apps in Resources */ = {isa = PBXBuildFile; fileRef = A30000000000000000000006 /* HyperHLE_apps */; };
 		A20000000000000000000005 /* touchHLE_default_options.txt in Resources */ = {isa = PBXBuildFile; fileRef = A30000000000000000000007 /* touchHLE_default_options.txt */; };
-		A20000000000000000000006 /* touchHLE_options.txt in Resources */ = {isa = PBXBuildFile; fileRef = A30000000000000000000008 /* touchHLE_options.txt */; };
+		A20000000000000000000006 /* HyperHLE_options.txt in Resources */ = {isa = PBXBuildFile; fileRef = A30000000000000000000008 /* HyperHLE_options.txt */; };
 		A20000000000000000000007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A3000000000000000000000A /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -24,9 +24,9 @@
 		A30000000000000000000003 /* Build.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Build.xcconfig; sourceTree = "<group>"; };
 		A30000000000000000000004 /* touchHLE_fonts */ = {isa = PBXFileReference; lastKnownFileType = folder; path = touchHLE_fonts; sourceTree = "<group>"; };
 		A30000000000000000000005 /* touchHLE_dylibs */ = {isa = PBXFileReference; lastKnownFileType = folder; path = touchHLE_dylibs; sourceTree = "<group>"; };
-		A30000000000000000000006 /* touchHLE_apps */ = {isa = PBXFileReference; lastKnownFileType = folder; path = touchHLE_apps; sourceTree = "<group>"; };
+		A30000000000000000000006 /* HyperHLE_apps */ = {isa = PBXFileReference; lastKnownFileType = folder; path = HyperHLE_apps; sourceTree = "<group>"; };
 		A30000000000000000000007 /* touchHLE_default_options.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = touchHLE_default_options.txt; sourceTree = "<group>"; };
-		A30000000000000000000008 /* touchHLE_options.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = touchHLE_options.txt; sourceTree = "<group>"; };
+		A30000000000000000000008 /* HyperHLE_options.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = HyperHLE_options.txt; sourceTree = "<group>"; };
 		A30000000000000000000009 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A3000000000000000000000A /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A3000000000000000000000B /* NativeHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeHost.swift; sourceTree = "<group>"; };
@@ -89,9 +89,9 @@
 			children = (
 				A30000000000000000000004 /* touchHLE_fonts */,
 				A30000000000000000000005 /* touchHLE_dylibs */,
-				A30000000000000000000006 /* touchHLE_apps */,
+				A30000000000000000000006 /* HyperHLE_apps */,
 				A30000000000000000000007 /* touchHLE_default_options.txt */,
-				A30000000000000000000008 /* touchHLE_options.txt */,
+				A30000000000000000000008 /* HyperHLE_options.txt */,
 			);
 			name = "touchHLE Resources";
 			path = ../..;
@@ -158,9 +158,9 @@
 				A20000000000000000000007 /* Assets.xcassets in Resources */,
 				A20000000000000000000002 /* touchHLE_fonts in Resources */,
 				A20000000000000000000003 /* touchHLE_dylibs in Resources */,
-				A20000000000000000000004 /* touchHLE_apps in Resources */,
+				A20000000000000000000004 /* HyperHLE_apps in Resources */,
 				A20000000000000000000005 /* touchHLE_default_options.txt in Resources */,
-				A20000000000000000000006 /* touchHLE_options.txt in Resources */,
+				A20000000000000000000006 /* HyperHLE_options.txt in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

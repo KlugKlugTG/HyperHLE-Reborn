@@ -216,7 +216,7 @@ private final class GameLibrary: ObservableObject {
 
     init() {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        appsDirectory = documents.appendingPathComponent("touchHLE_apps", isDirectory: true)
+        appsDirectory = documents.appendingPathComponent("HyperHLE_apps", isDirectory: true)
         migrateLegacyNetworkSetting(in: documents)
         reload()
     }
@@ -694,7 +694,7 @@ final class TouchHLENativeHost: NSObject {
 
         let controlsWindow = GameControlsWindow(windowScene: windowScene)
         controlsWindow.windowLevel = UIWindow.Level.normal + 3
-        controlsWindow.accessibilityIdentifier = "touchHLE.gameControls"
+        controlsWindow.accessibilityIdentifier = "HyperHLE.gameControls"
         controlsWindow.backgroundColor = .clear
 
         let viewController = GameControlsViewController()
@@ -760,7 +760,7 @@ final class TouchHLENativeHost: NSObject {
                 )
             }
             print(
-                "touchHLE game surface ready: orientation=\(windowScene.interfaceOrientation.rawValue) " +
+                "HyperHLE game surface ready: orientation=\(windowScene.interfaceOrientation.rawValue) " +
                 "bounds=\(Int(bounds.width))x\(Int(bounds.height))"
             )
             // `interfaceOrientation` flips as soon as the rotation is applied,

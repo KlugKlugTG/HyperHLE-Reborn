@@ -16,7 +16,7 @@ use std::sync::{LazyLock, Mutex};
 pub fn get_log_file() -> &'static Mutex<File> {
     static LOG_FILE: LazyLock<Mutex<File>> = LazyLock::new(|| {
         let file =
-            File::create(crate::paths::user_data_base_path().join("touchHLE_log.txt")).unwrap();
+            File::create(crate::paths::user_data_base_path().join(crate::paths::LOG_FILE)).unwrap();
         #[cfg(unix)]
         crate::crash_handler::set_log_fd(std::os::fd::AsRawFd::as_raw_fd(&file));
         Mutex::new(file)
@@ -25,13 +25,23 @@ pub fn get_log_file() -> &'static Mutex<File> {
     &LOG_FILE
 }
 
+/// The module prefix for log lines: the crate's historical `touchHLE` name
+/// (used by `module_path!()`) swapped for the project's current brand.
+macro_rules! display_module_path {
+    () => {
+        // The crate is still named touchHLE internally, but the project is
+        // HyperHLE; swap the prefix out in the log output.
+        module_path!().replacen("touchHLE", "HyperHLE", 1)
+    };
+}
+
 /// Prints a log message unconditionally. Use this for errors or warnings.
 ///
 /// The message is prefixed with the module path, so it is clear where it comes
 /// from.
 macro_rules! log {
     ($($arg:tt)+) => {
-        echo!("{}: {}", module_path!(), format_args!($($arg)+))
+        echo!("{}: {}", display_module_path!(), format_args!($($arg)+))
     }
 }
 
@@ -39,7 +49,7 @@ macro_rules! log {
 /// panicking.
 macro_rules! log_no_panic {
     ($($arg:tt)+) => {
-        echo_no_panic!("{}: {}", module_path!(), format_args!($($arg)+));
+        echo_no_panic!("{}: {}", display_module_path!(), format_args!($($arg)+));
     }
 }
 
@@ -67,7 +77,7 @@ macro_rules! log_once {
 }
 
 /// Print a message (with implicit newline). This should be used for all
-/// touchHLE output that isn't coming from the app itself.
+/// HyperHLE output that isn't coming from the app itself.
 ///
 /// Prefer use [log] or [log_dbg] for errors and warnings during emulation.
 macro_rules! echo {
@@ -129,7 +139,7 @@ macro_rules! echo_file_only {
 /// be used for per-call traces that can emit thousands of lines per second.
 macro_rules! log_file_only {
     ($($arg:tt)+) => {
-        echo_file_only!("{}: {}", module_path!(), format_args!($($arg)+))
+        echo_file_only!("{}: {}", display_module_path!(), format_args!($($arg)+))
     };
 }
 
@@ -152,7 +162,7 @@ macro_rules! echo_no_panic {
 pub const ENABLED_MODULES: &[&str] = &["touchHLE::frameworks::media_player::movie_player"];
 // NOTE: keep this EMPTY for builds that run on an iOS device. Every
 // `log_dbg!` does two blocking writes (stderr, which the iOS host redirects to
-// a file, and touchHLE_log.txt). On the main thread that starves UIKit of the
+// a file, and HyperHLE_log.txt). On the main thread that starves UIKit of the
 // run-loop time it needs to dispatch touches.
 #[cfg(target_os = "ios")]
 pub const ENABLED_MODULES: &[&str] = &[];

@@ -437,7 +437,15 @@ impl MachO {
                 let mut best_subslice: Option<&[u8]> = None;
                 let mut best_priority = None;
                 let mut had_invalid_slice = false;
+                let mut saw_64bit_slice = false;
                 for (arch, _) in files {
+                    // A slice with the ABI64 flag set in its cputype is 64-bit
+                    // (e.g. ARM64): unsupported, but remember the fact so the
+                    // error below can say "64-bit" instead of "no supported
+                    // architecture".
+                    if (arch.cputype as u32) & 0x0100_0000 != 0 {
+                        saw_64bit_slice = true;
+                    }
                     if arch.cputype != mach_object::CPU_TYPE_ARM {
                         continue;
                     }
@@ -506,6 +514,8 @@ impl MachO {
                 }
                 return if let Some(subslice) = best_subslice {
                     MachO::load_with_placement(subslice, into_mem, name, requested_slide)
+                } else if saw_64bit_slice && !had_invalid_slice {
+                    Err("Executable is 64-bit! HyperHLE supports 32-bit only")
                 } else if had_invalid_slice {
                     Err("FAT binary has no usable ARM slice: slices are truncated, malformed or unsupported (check the IPA)")
                 } else {
@@ -517,6 +527,17 @@ impl MachO {
             }
         };
 
+        // 64-bit executables are rejected before the CPU check, so the
+        // message can say what is actually wrong: "not for an ARM CPU" sends
+        // users hunting for the wrong IPA, when the file really is ARM but
+        // 64-bit, i.e. out of scope for this emulator. No 64-bit image ever
+        // reaches the rest of this function, so `is_64bit` is always false
+        // below and is only carried to the symbol iterators.
+        let is_64bit = header.is_64bit();
+        if is_64bit {
+            return Err("Executable is 64-bit! HyperHLE supports 32-bit only");
+        }
+
         if header.cputype != mach_object::CPU_TYPE_ARM {
             return Err("Executable is not for an ARM CPU!");
         }
@@ -524,10 +545,6 @@ impl MachO {
         let is_bigend = header.is_bigend();
         if is_bigend {
             return Err("Executable is not little-endian!");
-        }
-        let is_64bit = header.is_64bit();
-        if is_64bit {
-            return Err("Executable is not 32-bit!");
         }
         if arm_subtype_priority(header.cpusubtype).is_none() {
             log!(
@@ -1744,6 +1761,49 @@ mod segment_validation_tests {
             .map(|s| arm_subtype_priority(s).unwrap())
             .collect();
         assert!(priorities.windows(2).all(|p| p[0] < p[1]));
+    }
+
+    // Minimal 64-bit ARM Mach-O header with no load commands. The loader
+    // must reject it by word size, before the CPU checks.
+    fn thin64(cputype: u32, subtype: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for word in [0xfeedfacfu32, cputype, subtype, 2, 0, 0, 0, 0] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn thin_loader_rejects_64bit_with_word_size_message() {
+        // ARM64 (ABI64 | ARM): the message must name the word size, not
+        // "not for an ARM CPU".
+        for cputype in [0x0100_000cu32, 0x0100_0007u32] {
+            let bytes = thin64(cputype, 3);
+            let mut mem = Mem::new();
+            let result = MachO::load_from_bytes(&bytes, &mut mem, "64bit".into(), 0);
+            assert_eq!(
+                result.unwrap_err(),
+                "Executable is 64-bit! HyperHLE supports 32-bit only"
+            );
+        }
+    }
+
+    #[test]
+    fn fat_loader_rejects_64bit_only_with_word_size_message() {
+        // One slice, declared 64-bit (ABI64 flag in its cputype); the slice
+        // payload is never parsed, so any bytes do.
+        let slice = vec![0u8; 84];
+        let mut bytes = Vec::new();
+        for word in [0xcafebabeu32, 1, 0x0100_000cu32, 3, 28, 84, 0] {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        bytes.extend_from_slice(&slice);
+        let mut mem = Mem::new();
+        let result = MachO::load_from_bytes(&bytes, &mut mem, "fat-64bit".into(), 0);
+        assert_eq!(
+            result.unwrap_err(),
+            "Executable is 64-bit! HyperHLE supports 32-bit only"
+        );
     }
 
     #[test]

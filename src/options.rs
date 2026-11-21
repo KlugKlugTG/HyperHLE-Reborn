@@ -481,7 +481,7 @@ impl Default for Options {
             // case). Default the fix-up to ON so games work out of the
             // box on Android — users can still disable it via
             // `--fix-texture-min-filter=false` in
-            // `touchHLE_options.txt` if they hit a game that genuinely
+            // `HyperHLE_options.txt` if they hit a game that genuinely
             // depends on mipmap minification (rare among iOS 2.x/3.x
             // titles). On desktop hosts (where the user is likely
             // running Mesa / Apple PowerVR / NVIDIA / AMD, all

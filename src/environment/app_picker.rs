@@ -130,10 +130,8 @@ struct AppInfo {
     icon_ui_image: Option<id>,
 }
 
-const LAST_APP_FILE: &str = "touchHLE_last_app.txt";
-
 fn last_app_record_path() -> PathBuf {
-    paths::user_data_base_path().join(LAST_APP_FILE)
+    paths::user_data_base_path().join(paths::LAST_APP_FILE)
 }
 
 fn read_last_app_path() -> Option<PathBuf> {
@@ -151,7 +149,7 @@ pub fn app_picker(options: Options, show_lock_screen: bool) -> Result<(PathBuf, 
     let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
 
     let apps: Result<Vec<AppInfo>, String> = if !apps_dir.is_dir() {
-        Err(format!("The {} directory couldn't be found. Check you're running touchHLE from the right directory.", apps_dir.display()))
+        Err(format!("The {} directory couldn't be found. Check you're running HyperHLE from the right directory.", apps_dir.display()))
     } else {
         enumerate_apps(&apps_dir).map_err(|err| {
             format!(

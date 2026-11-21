@@ -1601,7 +1601,7 @@ fn request_gpu_sample() {
         return;
     }
     if std::thread::Builder::new()
-        .name("touchHLE-GPU-meter".to_string())
+        .name("HyperHLE-GPU-meter".to_string())
         .spawn(|| {
             let value = collect_gpu_sample().unwrap_or(f64::NAN);
             GPU_PERCENT_BITS.store(value.to_bits(), Ordering::Relaxed);
@@ -1622,7 +1622,7 @@ fn request_gpu_sample() {
         return;
     }
     if std::thread::Builder::new()
-        .name("touchHLE-GPU-meter".to_string())
+        .name("HyperHLE-GPU-meter".to_string())
         .spawn(|| {
             let value = collect_gpu_sample().unwrap_or(f64::NAN);
             GPU_PERCENT_BITS.store(value.to_bits(), Ordering::Relaxed);
