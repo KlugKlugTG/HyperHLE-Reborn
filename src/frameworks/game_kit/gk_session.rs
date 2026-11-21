@@ -66,6 +66,7 @@ pub const CONSTANTS: ConstantExports = &[(
 
 // MARK: - Host objects
 
+#[derive(Default)]
 struct GKSessionHostObject {
     /// `NSString *`, copied. May be nil.
     session_id: id,
