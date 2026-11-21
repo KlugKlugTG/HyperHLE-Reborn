@@ -263,6 +263,17 @@ Graphics driver options:
         the first one that works.
 
 Debugging options:
+    --preserve-dyld-stubs / --no-preserve-dyld-stubs
+        Resolve lazy imports through their data pointers at startup, preserving
+        the executable's original linker instructions. This supports engines
+        that checksum their own code. Disabled unless an app default enables it.
+
+    --dladdr / --no-dladdr
+        Enable the real dladdr() implementation instead of the default
+        failure stub. Some legacy games hang during startup when dladdr()
+        resolves their images and symbols; enable this only for apps that
+        need it (for example Earn to Die).
+
     --disable-direct-memory-access
         Force dynarmic to always access guest memory via the memory access
         callbacks, rather than using the fast direct access path (page tables).
@@ -648,3 +659,11 @@ Other options:
         Explicitly use the legacy iPad/non-portrait rotation heuristic, even if
         the fix was enabled by an app-specific options file. Turning the
         "Rotation fix" Settings switch off passes this flag.
+
+    --manual-ui-rotation
+        Keep the root view in portrait coordinates for engines that rotate
+        their OpenGL drawing and touch coordinates themselves. The emulated
+        device and display still use the requested orientation.
+
+    --no-manual-ui-rotation
+        Restore UIKit root-view autorotation (the default).

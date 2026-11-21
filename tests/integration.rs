@@ -430,7 +430,7 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         &tests_dir,
         "TestApp",
         &extra_compile_args,
-        &["--game-center-authenticated"],
+        &["--game-center-authenticated", "--dladdr"],
     )?;
     // ARM UDF and BKPT deliberately stop execution. Headless compatibility
     // recovery must never let these programs return success to the test runner.

@@ -400,3 +400,13 @@ com.gamevil.illusia: --landscape-left
 # not to autorotate the views, so the app's hit-testing stays in the same
 # 480x320 space it lays its controls out in.
 com.gameloft.asphaltmotorsports: --landscape-uiscreen-bounds --present-rotate=0
+
+# Exploration/Kiloblocks rotates its GL projection and framebuffer touch
+# coordinates itself. Keep its EAGL view in portrait space to avoid applying
+# the root-view rotation a second time.
+com.explorationbase.Exploration: --manual-ui-rotation --rotation-fix
+
+# Earn to Die's Marmalade loader hashes its code to decode its constructor
+# table. Keep linker stubs intact so HLE linking does not change that hash.
+# Readback presents its GL renderbuffer without the blank shared-texture path.
+com.notdoppler.EarntoDie: --preserve-dyld-stubs --present-mode=readback

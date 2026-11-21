@@ -5,16 +5,17 @@
  */
 //! `UITextField`.
 
+use super::{send_actions, UIControlEventEditingChanged};
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::{ns_string, NSInteger, NSRange, NSUInteger};
 use crate::frameworks::uikit::ui_font::{UITextAlignment, UITextAlignmentLeft};
+use crate::frameworks::uikit::ui_view::ui_alert_view;
 use crate::frameworks::uikit::ui_view::ui_window::{
     UIKeyboardDidHideNotification, UIKeyboardDidShowNotification, UIKeyboardWillHideNotification,
     UIKeyboardWillShowNotification,
 };
-use crate::frameworks::uikit::ui_view::ui_alert_view;
 use crate::impl_HostObject_with_superclass;
 use crate::objc::{
     id, msg, msg_class, msg_super, nil, objc_classes, release, retain, todo_objc_setter,
@@ -122,6 +123,17 @@ impl Default for UITextFieldHostObject {
     }
 }
 
+fn layout_text_label(env: &mut Environment, text_field: id) {
+    let label = env
+        .objc
+        .borrow::<UITextFieldHostObject>(text_field)
+        .text_label;
+    if label != nil {
+        let bounds: CGRect = msg![env; text_field bounds];
+        () = msg![env; label setFrame:bounds];
+    }
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -159,6 +171,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     env.objc.borrow_mut::<UITextFieldHostObject>(this).text_label = text_label;
     let _: () = msg![env; this addSubview:text_label];
+    layout_text_label(env, this);
 
     this
 }
@@ -207,6 +220,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         () = msg![env; this setTextAlignment:align];
     }
 
+    layout_text_label(env, this);
     this
 }
 
@@ -231,9 +245,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())layoutSubviews {
-    let text_label = env.objc.borrow::<UITextFieldHostObject>(this).text_label;
-    let bounds: CGRect = msg![env; this bounds];
-    let _: () = msg![env; text_label setFrame:bounds];
+    layout_text_label(env, this);
+}
+
+- (())setFrame:(CGRect)frame {
+    () = msg_super![env; this setFrame:frame];
+    layout_text_label(env, this);
+}
+
+- (())setBounds:(CGRect)bounds {
+    () = msg_super![env; this setBounds:bounds];
+    layout_text_label(env, this);
 }
 
 - (id)text {
@@ -410,6 +432,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     if text == nil { return false; }
     let len: NSUInteger = msg![env; text length];
     len > 0
+}
+
+// UIKeyInput methods use the same delegate checks and control events as the
+// host keyboard. Programmatic setText: does not send EditingChanged actions.
+// https://developer.apple.com/documentation/uikit/uikeyinput
+- (())insertText:(id)text {
+    let text = ns_string::to_rust_string(env, text).into_owned();
+    insert_text(env, this, text);
+}
+
+- (())deleteBackward {
+    handle_backspace(env, this);
 }
 
 - (())touchesBegan:(id)_touches withEvent:(id)_event { let _: bool = msg![env; this becomeFirstResponder]; }
@@ -616,6 +650,10 @@ fn insert_text(env: &mut Environment, text_field: id, text: String) {
         // appear to do nothing.
         let _: () = msg![env; text_field setText:new_text];
         let _: () = msg![env; text_field setNeedsDisplay];
+        // UIKit sends this after a user edit. IASK saves the field's value
+        // through its target-action handler, rather than a notification.
+        // https://developer.apple.com/documentation/uikit/uicontrol/event/editingchanged
+        send_actions(env, text_field, nil, UIControlEventEditingChanged);
         release(env, new_text);
     }
     release(env, txt);
@@ -662,6 +700,7 @@ pub fn handle_backspace(env: &mut Environment, text_field: id) {
         // `UITextFieldTextDidChangeNotification` observer is notified.
         let _: () = msg![env; text_field setText:new_text];
         let _: () = msg![env; text_field setNeedsDisplay];
+        send_actions(env, text_field, nil, UIControlEventEditingChanged);
     }
 }
 

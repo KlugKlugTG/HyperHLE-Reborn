@@ -1519,7 +1519,7 @@ fn try_recvfrom(
             let Some(udp_socket) = socket_host_object.udp_socket.as_ref() else {
                 return Err(EAGAIN);
             };
-            let buf = env.mem.bytes_at_mut(buffer.cast(), length);
+            let buf = env.mem.bytes_at_mut_for_io(buffer.cast(), length);
             let result = if peek {
                 udp_socket.peek_from(buf)
             } else {
@@ -1538,7 +1538,7 @@ fn try_recvfrom(
             let Some(mut tcp_stream) = socket_host_object.tcp_stream.as_ref() else {
                 return Err(ENOTCONN);
             };
-            let buf = env.mem.bytes_at_mut(buffer.cast(), length);
+            let buf = env.mem.bytes_at_mut_for_io(buffer.cast(), length);
             let read = match if peek {
                 tcp_stream.peek(buf)
             } else {
@@ -1703,7 +1703,7 @@ fn send(
                 set_errno(env, ENOTCONN);
                 return -1;
             };
-            let buf = env.mem.bytes_at(buffer.cast(), length);
+            let buf = env.mem.bytes_at_for_io(buffer.cast(), length);
             match stream.write(buf) {
                 Ok(n) => {
                     log_dbg!("send: wrote {} bytes to TCP socket {}", n, socket);
@@ -1741,7 +1741,7 @@ fn send(
                 set_errno(env, EBADF);
                 return -1;
             };
-            let buf = env.mem.bytes_at(buffer.cast(), length);
+            let buf = env.mem.bytes_at_for_io(buffer.cast(), length);
             match udp.send(buf) {
                 Ok(n) => {
                     log_dbg!("send: sent {} bytes on UDP socket {}", n, socket);
@@ -1903,7 +1903,7 @@ fn sendto(
                     }
                 }
             }
-            let buf = env.mem.bytes_at(buffer.cast(), length);
+            let buf = env.mem.bytes_at_for_io(buffer.cast(), length);
             match udp_socket.send_to(buf, socket_address) {
                 Ok(written) => written,
                 // FIX: was unimplemented!() — return EAGAIN so the app's

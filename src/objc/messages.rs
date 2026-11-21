@@ -215,12 +215,18 @@ pub(super) fn ensure_class_initialized(env: &mut Environment, class_to_init: Cla
 /// by the method implementation.
 /// We are relying on CallFromGuest not
 /// overwriting it.
+#[derive(Clone, Copy)]
+enum SuperCall {
+    CurrentClass(Class),
+    Superclass(Class),
+}
+
 #[allow(non_snake_case)]
 fn objc_msgSend_inner(
     env: &mut Environment,
     receiver: id,
     selector: SEL,
-    super2: Option<Class>,
+    super2: Option<SuperCall>,
     tolerate_type_mismatch: bool,
     skip_initialize: bool,
 ) {
@@ -392,7 +398,10 @@ fn objc_msgSend_inner(
         return;
     }
 
-    let orig_class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
+    let orig_class = match super2 {
+        Some(SuperCall::CurrentClass(class) | SuperCall::Superclass(class)) => class,
+        None => ObjC::read_isa(receiver, &env.mem),
+    };
     // Graceful exit if isa is nil — this typically means the object was
     // already deallocated (use-after-free in guest code) or was never
     // properly allocated. Per Apple's Objective-C runtime behavior,
@@ -742,7 +751,7 @@ fn objc_msgSend_inner(
         {
             // Skip method lookup on first iteration if this is the super-call
             // variant of objc_msgSend (look up the superclass first)
-            if super2.is_some() && class == orig_class {
+            if matches!(super2, Some(SuperCall::CurrentClass(current)) if class == current) {
                 class = superclass;
                 continue;
             }
@@ -2448,7 +2457,7 @@ pub(crate) fn _touchHLE_objc_msgSend_stret_tolerant(
 /// `objc_msgSendSuper2` and [msg_send_super2].
 pub struct objc_super {
     pub receiver: id,
-    /// If this is used with `objc_msgSendSuper` (not implemented here, TODO),
+    /// If this is used with `objc_msgSendSuper`,
     /// this is a pointer to the superclass to look up the method on.
     /// If this is used with `objc_msgSendSuper2`, this is a pointer to a class
     /// and the superclass will be looked up from it.
@@ -2477,7 +2486,7 @@ pub(super) fn objc_msgSendSuper2(
         env,
         receiver,
         selector,
-        /* super2: */ Some(class),
+        /* super2: */ Some(SuperCall::CurrentClass(class)),
         /* tolerate_type_mismatch: */ false,
         /* skip_initialize: */ false,
     )
@@ -2500,9 +2509,51 @@ pub(super) fn objc_msgSendSuper2_stret(
         env,
         receiver,
         selector,
-        /* super2: */ Some(class),
+        /* super2: */ Some(SuperCall::CurrentClass(class)),
         /* tolerate_type_mismatch: */ false,
         /* skip_initialize: */ false,
+    )
+}
+
+/// Unlike Super2, start the lookup at objc_super.class itself.
+/// Preserve all other argument registers and stack arguments for the IMP.
+/// https://developer.apple.com/documentation/objectivec/objc_msgsendsuper
+#[allow(non_snake_case)]
+pub(super) fn objc_msgSendSuper(
+    env: &mut Environment,
+    super_ptr: ConstPtr<objc_super>,
+    selector: SEL,
+) {
+    let objc_super { receiver, class } = env.mem.read(super_ptr);
+    crate::abi::write_next_arg(&mut 0, env.cpu.regs_mut(), &mut env.mem, receiver);
+    objc_msgSend_inner(
+        env,
+        receiver,
+        selector,
+        Some(SuperCall::Superclass(class)),
+        false,
+        false,
+    )
+}
+
+/// ARM struct-return dispatch keeps the result pointer in r0 and replaces r1.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-532.2/runtime/Messengers.subproj/objc-msg-arm.s
+#[allow(non_snake_case)]
+pub(super) fn objc_msgSendSuper_stret(
+    env: &mut Environment,
+    _stret: MutVoidPtr,
+    super_ptr: ConstPtr<objc_super>,
+    selector: SEL,
+) {
+    let objc_super { receiver, class } = env.mem.read(super_ptr);
+    crate::abi::write_next_arg(&mut 1, env.cpu.regs_mut(), &mut env.mem, receiver);
+    objc_msgSend_inner(
+        env,
+        receiver,
+        selector,
+        Some(SuperCall::Superclass(class)),
+        false,
+        false,
     )
 }
 

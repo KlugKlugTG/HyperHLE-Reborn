@@ -1124,6 +1124,34 @@ fn path_for_resource_helper(
         let exec_path_str = env.bundle.executable_path().as_str().to_string();
         return ns_string::from_rust_string(env, exec_path_str);
     }
+    // Device-specific resources take precedence over the universal version.
+    // Let UIKit use this same lookup for nibs rather than trying both devices.
+    // https://developer.apple.com/library/archive/documentation/CoreFoundation/Conceptual/CFBundles/AccessingaBundlesContents/AccessingaBundlesContents.html
+    let name_str = name_str.into_owned();
+    if !name_str.ends_with("~iphone") && !name_str.ends_with("~ipad") {
+        let device = if env
+            .options
+            .device_family
+            .is_some_and(|family| family.is_ipad())
+        {
+            "ipad"
+        } else {
+            "iphone"
+        };
+        let variant_name = ns_string::from_rust_string(env, format!("{name_str}~{device}"));
+        let variant_path: id = msg![env; path stringByAppendingPathComponent:variant_name];
+        let variant_path: id =
+            if extension != nil && !ns_string::to_rust_string(env, extension).is_empty() {
+                msg![env; variant_path stringByAppendingPathExtension:extension]
+            } else {
+                variant_path
+            };
+        release(env, variant_name);
+        let variant_str = ns_string::to_rust_string(env, variant_path);
+        if env.fs.exists(crate::fs::GuestPath::new(&variant_str)) {
+            return variant_path;
+        }
+    }
     path = msg![env; path stringByAppendingPathComponent:name];
 
     if extension != nil {

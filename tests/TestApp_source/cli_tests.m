@@ -17,6 +17,7 @@
 #include <CoreFoundation/CFURLAccess.h>
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <fenv.h>
@@ -46,6 +47,8 @@
 
 #import "SyncTester.h"
 
+int test_UITableViewCell_nib_controls(void);
+
 @interface NSObject (PerformSelectorOnMainThreadTest)
 - (void)performSelectorOnMainThread:(SEL)selector
                          withObject:(id)object
@@ -62,6 +65,490 @@
 @end
 
 extern NSString *const NSDefaultRunLoopMode;
+
+@interface NibTopLevelProbe : NSObject
+- (id)initWithCoder:(id)coder;
+@end
+static int nibProbeAwakes;
+static int nibOwnerAwakes;
+@implementation NibTopLevelProbe
+- (id)initWithCoder:(id)coder { return self; }
+- (void)awakeFromNib { nibProbeAwakes++; }
+@end
+
+@interface NibOwnerProbe : NSObject
+@end
+@implementation NibOwnerProbe
+- (void)awakeFromNib { nibOwnerAwakes++; }
+@end
+
+// A compiled nib's top-level array includes placeholder entries, but UIKit's
+// returned array contains only the objects it instantiated. InAppSettingsKit
+// expects the first returned object to be its cell, not File's Owner.
+// https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/LoadingResources/CocoaNibs/CocoaNibs.html
+int test_UINib_top_level_objects_exclude_proxies(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  NSObject *owner = [NibOwnerProbe new];
+  nibProbeAwakes = nibOwnerAwakes = 0;
+  NSArray *objects = [[NSBundle mainBundle] loadNibNamed:@"ProxyTopLevel" owner:owner options:nil];
+  int result = 0;
+  if ([objects count] != 1)
+    result = -1;
+  else if ([[objects objectAtIndex:0] class] != [NibTopLevelProbe class])
+    result = -2;
+  else if (nibProbeAwakes != 1 || nibOwnerAwakes != 0)
+    result = -3;
+  [owner release];
+  [pool drain];
+  return result;
+}
+
+@interface UIViewController : NSObject
+- (instancetype)initWithNibName:(id)name bundle:(id)bundle;
+- (id)nibName;
+- (UIView *)view;
+- (void)setView:(UIView *)view;
+- (void)setTitle:(NSString *)title;
+- (NSString *)title;
+- (id)navigationItem;
+- (UIViewController *)parentViewController;
+- (BOOL)wantsFullScreenLayout;
+- (void)setWantsFullScreenLayout:(BOOL)wants;
+- (void)presentModalViewController:(UIViewController *)controller animated:(BOOL)animated;
+- (void)dismissModalViewControllerAnimated:(BOOL)animated;
+@end
+
+@interface UINavigationController : UIViewController
+- (instancetype)initWithRootViewController:(UIViewController *)controller;
+- (UIViewController *)topViewController;
+- (void)pushViewController:(UIViewController *)controller animated:(BOOL)animated;
+- (UIViewController *)popViewControllerAnimated:(BOOL)animated;
+- (id)navigationBar;
+- (void)setNavigationBarHidden:(BOOL)hidden animated:(BOOL)animated;
+@end
+
+@interface UINavigationItem : NSObject
+- (void)setRightBarButtonItem:(id)item;
+@end
+
+@interface UINavigationBar : UIView
+- (id)topItem;
+- (id)popNavigationItemAnimated:(BOOL)animated;
+@end
+
+@interface UIBarButtonItem : NSObject
+- (instancetype)initWithBarButtonSystemItem:(NSInteger)item target:(id)target action:(SEL)action;
+@end
+
+@interface UIView (NavigationLayoutTest)
+- (UIView *)superview;
+@end
+
+// Match the legacy navigation container contract, including presenting a
+// controller after its nib-sized child was already loaded. This catches the
+// clipped settings panel and missing Done button in early Minecraft PE.
+// https://developer.apple.com/library/archive/documentation/WindowsViews/Conceptual/ViewControllerPGforiOSLegacy/NavigationControllers/NavigationControllers.html
+// https://developer.apple.com/library/archive/featuredarticles/ViewControllerPGforiPhoneOS/PresentingaViewController.html
+int test_UINavigationController_modal_layout(void) {
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  UIWindow *window = [[UIWindow alloc] initWithFrame:CGRectMake(0, 0, 480, 320)];
+  UIViewController *presenter = [[UIViewController alloc] initWithNibName:nil bundle:nil];
+  UIView *presenterView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 480, 320)];
+  [presenter setView:presenterView];
+  [presenterView release];
+  [window addSubview:[presenter view]];
+  UIViewController *root = [[UIViewController alloc] initWithNibName:nil bundle:nil];
+  [root setTitle:@"Preferences"];
+  UINavigationController *navigation = [[UINavigationController alloc] initWithRootViewController:root];
+  UIBarButtonItem *done = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:0
+                                                                    target:presenter
+                                                                    action:@selector(dismissModalViewControllerAnimated:)];
+  [[root navigationItem] setRightBarButtonItem:done];
+  [presenter presentModalViewController:navigation animated:NO];
+  UINavigationBar *bar = [navigation navigationBar];
+  UIView *doneView = (UIView *)done;
+  CGRect navigationFrame = [[navigation view] frame];
+  CGRect childFrame = [[root view] frame];
+  CGRect buttonFrame = [doneView frame];
+  int result = 0;
+  if (navigationFrame.size.width != 480 || navigationFrame.size.height != 320)
+    result = -1;
+  else if ([root wantsFullScreenLayout] || childFrame.origin.y != 32 ||
+           childFrame.size.width != 480 || childFrame.size.height != 288)
+    result = -2;
+  else if ([bar superview] != [navigation view] || [bar topItem] != [root navigationItem] ||
+           [root parentViewController] != navigation)
+    result = -3;
+  else if ([doneView superview] != bar || buttonFrame.size.width <= 0)
+    result = -4;
+  else if ([bar hitTest:CGPointMake(buttonFrame.origin.x + buttonFrame.size.width / 2,
+                                  buttonFrame.origin.y + buttonFrame.size.height / 2)
+              withEvent:nil] != doneView)
+    result = -5;
+
+  UIViewController *second = [[UIViewController alloc] initWithNibName:nil bundle:nil];
+  [second setTitle:@"Second"];
+  [navigation pushViewController:second animated:NO];
+  if (!result && ([[root view] superview] != nil || [bar topItem] != [second navigationItem]))
+    result = -6;
+  // The navigation bar's Back action must restore both the controller and
+  // its buttons; it must not pop the bar's newly restored root item again.
+  [bar popNavigationItemAnimated:NO];
+  if (!result && ([navigation topViewController] != root || [doneView superview] != bar))
+    result = -7;
+  [navigation setNavigationBarHidden:YES animated:NO];
+  childFrame = [[root view] frame];
+  if (!result && (childFrame.origin.y != 0 || childFrame.size.height != 320))
+    result = -8;
+  [navigation setNavigationBarHidden:NO animated:NO];
+  [[navigation view] setFrame:CGRectMake(0, 0, 320, 480)];
+  childFrame = [[root view] frame];
+  if (!result && (childFrame.origin.y != 44 || childFrame.size.width != 320 ||
+                  childFrame.size.height != 436))
+    result = -9;
+  [presenter dismissModalViewControllerAnimated:NO];
+  if (!result && [[navigation view] superview] != nil)
+    result = -10;
+  [second release];
+  [done release];
+  [navigation release];
+  [root release];
+  [presenter release];
+  [window release];
+  [pool drain];
+  return result;
+}
+
+@interface NibSearchViewController : UIViewController
+@end
+@implementation NibSearchViewController
+@end
+
+@interface NibSearchFullController : UIViewController
+@end
+@implementation NibSearchFullController
+@end
+
+@interface NibSearchPadViewController : UIViewController
+@end
+@implementation NibSearchPadViewController
+@end
+
+// These fixtures are only queried for their names; they are never unarchived.
+// https://developer.apple.com/documentation/uikit/uiviewcontroller/nibname
+int test_UIViewController_nib_name_selection(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  NSString *path = [[NSBundle mainBundle] pathForResource:@"TestResources" ofType:@"bundle"];
+  NSBundle *bundle = [NSBundle bundleWithPath:path];
+  UIViewController *shortName = [[NibSearchViewController alloc] initWithNibName:nil bundle:bundle];
+  UIViewController *fullName = [[NibSearchFullController alloc] initWithNibName:nil bundle:bundle];
+  UIViewController *padOnly = [[NibSearchPadViewController alloc] initWithNibName:nil bundle:bundle];
+  UIViewController *explicitName = [[NibSearchViewController alloc] initWithNibName:@"ExplicitMissingNib" bundle:bundle];
+  int result = 0;
+  if (![[shortName nibName] isEqualToString:@"NibSearchView"])
+    result = -1;
+  else if (![[fullName nibName] isEqualToString:@"NibSearchFullController"])
+    result = -2;
+  else if ([padOnly nibName] != nil)
+    result = -3;
+  else if (![[explicitName nibName] isEqualToString:@"ExplicitMissingNib"])
+    result = -4;
+  else if ([shortName title] != nil)
+    result = -5;
+  [shortName release];
+  [fullName release];
+  [padOnly release];
+  [explicitName release];
+  [pool drain];
+  return result;
+}
+
+// dlsym must find native P/Invoke entry points in the executable, including
+// Thumb functions, as well as exported data. These symbols are deliberately
+// non-static, just like MonoTouch's monotouch_register_delegates.
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dlsym.3.html
+int hyperhle_dlsym_exported_value = 41;
+int hyperhle_dlsym_exported_function(int value) { return value + 1; }
+// Adjacent data symbols must remain distinct even when the second is odd.
+extern char hyperhle_dladdr_even_data, hyperhle_dladdr_odd_data;
+__asm__(".data\n.p2align 2\n.globl _hyperhle_dladdr_even_data\n"
+        "_hyperhle_dladdr_even_data:\n.byte 0\n"
+        ".globl _hyperhle_dladdr_odd_data\n"
+        "_hyperhle_dladdr_odd_data:\n.byte 0\n.text\n");
+
+int test_dlsym_executable_exports(void) {
+  void *handle = dlopen(NULL, RTLD_LAZY);
+  if (handle == NULL)
+    return -1;
+  int (*function)(int) = dlsym(handle, "hyperhle_dlsym_exported_function");
+  int *value = dlsym(handle, "hyperhle_dlsym_exported_value");
+  if (function != hyperhle_dlsym_exported_function ||
+      value != &hyperhle_dlsym_exported_value)
+    return -2;
+  if (function(*value) != 42)
+    return -3;
+  if (dlsym(RTLD_DEFAULT, "hyperhle_dlsym_exported_function") != function)
+    return -4;
+  if (dlsym(handle, "hyperhle_nonexistent_export") != NULL)
+    return -5;
+  // A successful dlsym clears an earlier lookup error on Apple dyld.
+  if (dlsym(handle, "hyperhle_dlsym_exported_function") != function ||
+      dlerror() != NULL)
+    return -6;
+  return dlclose(handle);
+}
+
+// Marmalade uses dladdr's Mach-O header to locate and hash its embedded code.
+// A failure here gives it the wrong key for decoding its constructor table.
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dladdr.3.html
+// https://github.com/apple-oss-distributions/dyld/blob/dyld-210.2.3/src/ImageLoaderMachOClassic.cpp
+int test_dladdr_image_and_symbols(void) {
+  Dl_info function, data, interior, header;
+  if (!dladdr(hyperhle_dlsym_exported_function, &function) ||
+      !dladdr(&hyperhle_dlsym_exported_value, &data))
+    return -1;
+  if (function.dli_fbase == NULL ||
+      *(const uint32_t *)function.dli_fbase != 0xfeedface ||
+      data.dli_fbase != function.dli_fbase)
+    return -2;
+  if (strcmp(function.dli_sname, "hyperhle_dlsym_exported_function") ||
+      function.dli_saddr != hyperhle_dlsym_exported_function ||
+      strcmp(data.dli_sname, "hyperhle_dlsym_exported_value") ||
+      data.dli_saddr != &hyperhle_dlsym_exported_value)
+    return -3;
+  uintptr_t instruction = (uintptr_t)hyperhle_dlsym_exported_function & ~1u;
+  if (!dladdr((const void *)(instruction + 2), &interior) ||
+      interior.dli_saddr != function.dli_saddr ||
+      interior.dli_sname != function.dli_sname)
+    return -4;
+  if (!dladdr(function.dli_fbase, &header) ||
+      header.dli_saddr != function.dli_fbase ||
+      strcmp(header.dli_sname, "__dso_handle") ||
+      header.dli_fname != function.dli_fname)
+    return -5;
+  void *heap = malloc(16);
+  int found = dladdr(heap, &interior);
+  free(heap);
+  if (found || dladdr(NULL, &interior))
+    return -6;
+  Dl_info even, odd;
+  if (&hyperhle_dladdr_odd_data != &hyperhle_dladdr_even_data + 1 ||
+      !dladdr(&hyperhle_dladdr_even_data, &even) ||
+      !dladdr(&hyperhle_dladdr_odd_data, &odd) ||
+      even.dli_saddr != &hyperhle_dladdr_even_data ||
+      odd.dli_saddr != &hyperhle_dladdr_odd_data ||
+      strcmp(even.dli_sname, "hyperhle_dladdr_even_data") ||
+      strcmp(odd.dli_sname, "hyperhle_dladdr_odd_data"))
+    return -8;
+  // The earlier symbol strings survive later calls.
+  return strcmp(function.dli_sname, "hyperhle_dlsym_exported_function") ? -7 : 0;
+}
+
+// dlopen owns its opaque handle; freeing the argument cannot invalidate it.
+// Data lookups must return the same symbol storage as ordinary imports.
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dlopen.3.html
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dlsym.3.html
+int test_dlopen_handle_lifetime_and_constants(void) {
+  const char *foundation =
+      "/System/Library/Frameworks/Foundation.framework/Foundation";
+  char *path = strdup(foundation);
+  void *handle = dlopen(path, RTLD_LAZY);
+  memset(path, 0, strlen(path));
+  free(path);
+  if (handle == NULL)
+    return -1;
+  void *second = dlopen(foundation, RTLD_LAZY);
+  if (second != handle || dlclose(second) != 0)
+    return -2;
+  NSString *const *mode = dlsym(handle, "NSDefaultRunLoopMode");
+  if (mode != &NSDefaultRunLoopMode || *mode == nil)
+    return -3;
+  if (dlsym(RTLD_DEFAULT, "NSDefaultRunLoopMode") != mode)
+    return -4;
+  if (dlsym(handle, "hyperhle_dlsym_exported_function") != NULL)
+    return -5;
+  if (dlerror() == NULL || dlerror() != NULL)
+    return -6;
+  void *mainOnly = dlopen(NULL, RTLD_LAZY | RTLD_FIRST);
+  if (dlsym(mainOnly, "hyperhle_dlsym_exported_function") !=
+      hyperhle_dlsym_exported_function)
+    return -7;
+  if (dlsym(mainOnly, "malloc") != NULL)
+    return -8;
+  if (dlclose(handle) != 0 || dlsym(handle, "NSDefaultRunLoopMode") != NULL)
+    return -9;
+  if (dlerror() == NULL || dlerror() != NULL)
+    return -10;
+  return dlclose(mainOnly);
+}
+
+static id dynamic_runtime_echo(id self, SEL cmd, id value) {
+  (void)self;
+  (void)cmd;
+  return value;
+}
+
+static id dynamic_runtime_echo_self(id self, SEL cmd, id value) {
+  (void)cmd;
+  (void)value;
+  return self;
+}
+
+typedef struct {
+  uint32_t a, b, c, marker;
+} HyperHLESuperValues;
+
+static HyperHLESuperValues dynamic_runtime_values(id self, SEL cmd, int a,
+                                                 int b, int c) {
+  (void)self;
+  (void)cmd;
+  HyperHLESuperValues values = {a, b, c, 0x12345678};
+  return values;
+}
+
+struct HyperHLESuperContext {
+  id receiver;
+  Class superclass;
+};
+
+extern id objc_msgSendSuper(struct HyperHLESuperContext *, SEL, id);
+extern HyperHLESuperValues objc_msgSendSuper_stret(struct HyperHLESuperContext *,
+                                                  SEL, int, int, int);
+static id (*const relocatedSuper)(struct HyperHLESuperContext *, SEL, id) =
+    objc_msgSendSuper;
+static HyperHLESuperValues (*const relocatedSuperStret)(
+    struct HyperHLESuperContext *, SEL, int, int, int) = objc_msgSendSuper_stret;
+
+// MonoTouch builds its AppDelegate through this public runtime sequence.
+// Check the class/metaclass graph, publication, inherited dispatch and ivars.
+// https://github.com/apple-oss-distributions/objc4/blob/objc4-532.2/runtime/objc-runtime-new.mm
+// https://developer.apple.com/documentation/objectivec/class_addivar(_:_:_:_:_:)
+int test_objc_dynamic_class_pair(void) {
+  const char *name = "HyperHLEDynamicRuntimeProbe";
+  Class parent = [NSObject class];
+  Class cls = objc_allocateClassPair(parent, name, 16);
+  if (cls == nil || objc_getClass(name) != nil)
+    return -1;
+  Class meta = object_getClass(cls);
+  Class parentMeta = object_getClass(parent);
+  if (!class_isMetaClass(meta) || class_isMetaClass(cls) ||
+      class_getSuperclass(cls) != parent ||
+      class_getSuperclass(meta) != parentMeta ||
+      object_getClass(meta) != object_getClass(parentMeta))
+    return -2;
+  if (objc_allocateClassPair(cls, "HyperHLEPrematureSubclass", 0) != nil)
+    return -3;
+  if (class_addIvar(meta, "invalid", 4, 2, "@"))
+    return -4;
+  if (!class_addIvar(cls, "byte", 1, 0, "c"))
+    return -5;
+  char *ivarName = strdup("value");
+  char *ivarType = strdup("@");
+  BOOL added = class_addIvar(cls, ivarName, sizeof(id), 3, ivarType);
+  memset(ivarName, 0, 5);
+  memset(ivarType, 0, 1);
+  free(ivarName);
+  free(ivarType);
+  if (!added || class_addIvar(cls, "value", sizeof(id), 2, "@"))
+    return -6;
+  SEL echo = sel_registerName("hyperhleEcho:");
+  if (!class_addMethod(cls, echo, (IMP)dynamic_runtime_echo, "@@:@") ||
+      !class_addMethod(meta, echo, (IMP)dynamic_runtime_echo, "@@:@"))
+    return -7;
+  uint32_t *classExtra = object_getIndexedIvars(cls);
+  uint32_t *metaExtra = object_getIndexedIvars(meta);
+  for (int i = 0; i < 4; i++) {
+    classExtra[i] = 0x12345678;
+    metaExtra[i] = 0x87654321;
+  }
+  if (object_getClass(cls) != meta ||
+      object_getClass(meta) != object_getClass(parentMeta))
+    return -8;
+  objc_registerClassPair(cls);
+  if (objc_getClass(name) != cls || objc_allocateClassPair(parent, name, 0) != nil)
+    return -9;
+  if (class_addIvar(cls, "late", 1, 0, "c"))
+    return -10;
+  Ivar byte = class_getInstanceVariable(cls, "byte");
+  Ivar value = class_getInstanceVariable(cls, "value");
+  size_t parentSize = class_getInstanceSize(parent);
+  size_t valueOffset = (parentSize + 1 + 7) & ~(size_t)7;
+  if (byte == NULL || value == NULL || ivar_getOffset(byte) != parentSize ||
+      ivar_getOffset(value) != valueOffset ||
+      class_getInstanceSize(cls) != valueOffset + sizeof(id))
+    return -11;
+  id object = [cls new];
+  id sentinel = [NSObject new];
+  if (object == nil || object_getClass(object) != cls ||
+      ![object respondsToSelector:@selector(retain)])
+    return -12;
+  object_setIvar(object, value, sentinel);
+  if (object_setInstanceVariable(object, "value", NULL) != value ||
+      object_getIvar(object, value) != nil ||
+      object_setInstanceVariable(object, "value", sentinel) != value ||
+      object_setInstanceVariable(object, "missing", sentinel) != NULL)
+    return -23;
+  void *peer = NULL;
+  if (object_getInstanceVariable(object, "value", &peer) != value || peer != sentinel)
+    return -24;
+  if (object_getIvar(object, value) != sentinel ||
+      [object performSelector:echo withObject:sentinel] != sentinel ||
+      [(id)cls performSelector:echo withObject:sentinel] != sentinel)
+    return -13;
+  Class child = objc_allocateClassPair(cls, "HyperHLEDynamicRuntimeChild", 0);
+  if (child == nil || !class_addIvar(child, "tail", 2, 1, "s"))
+    return -14;
+  objc_registerClassPair(child);
+  Ivar tail = class_getInstanceVariable(child, "tail");
+  if (class_getInstanceVariable(child, "value") != value ||
+      ivar_getOffset(tail) != class_getInstanceSize(cls))
+    return -15;
+  id childObject = [child new];
+  if ([childObject performSelector:echo withObject:sentinel] != sentinel ||
+      !class_addMethod(child, echo, (IMP)dynamic_runtime_echo_self, "@@:@") ||
+      [childObject performSelector:echo withObject:sentinel] != childObject)
+    return -16;
+  // objc_msgSendSuper uses the supplied superclass directly; Super2 would
+  // skip it. Check the original receiver and ordinary argument forwarding.
+  // https://developer.apple.com/documentation/objectivec/objc_msgsendsuper
+  id (*sendSuper)(struct HyperHLESuperContext *, SEL, id) =
+      dlsym(RTLD_DEFAULT, "objc_msgSendSuper");
+  struct HyperHLESuperContext context = {childObject, cls};
+  if (sendSuper == NULL || sendSuper(&context, echo, sentinel) != sentinel ||
+      relocatedSuper(&context, echo, sentinel) != sentinel)
+    return -19;
+  SEL valuesSelector = sel_registerName("hyperhleValues:second:third:");
+  if (!class_addMethod(cls, valuesSelector, (IMP)dynamic_runtime_values,
+                       "{HyperHLESuperValues=IIII}@:iii"))
+    return -20;
+  HyperHLESuperValues (*sendSuperStret)(struct HyperHLESuperContext *, SEL,
+                                      int, int, int) =
+      dlsym(RTLD_DEFAULT, "objc_msgSendSuper_stret");
+  if (sendSuperStret == NULL)
+    return -21;
+  HyperHLESuperValues values = sendSuperStret(&context, valuesSelector, 11, 22, 33);
+  if (values.a != 11 || values.b != 22 || values.c != 33 ||
+      values.marker != 0x12345678)
+    return -22;
+  values = relocatedSuperStret(&context, valuesSelector, 44, 55, 66);
+  if (values.a != 44 || values.b != 55 || values.c != 66 ||
+      values.marker != 0x12345678)
+    return -25;
+  [childObject release];
+  [object release];
+  [sentinel release];
+  objc_disposeClassPair(child);
+  objc_disposeClassPair(cls);
+  if (objc_getClass(name) != nil)
+    return -17;
+  Class root = objc_allocateClassPair(nil, "HyperHLEDynamicRuntimeRoot", 0);
+  Class rootMeta = object_getClass(root);
+  if (class_getSuperclass(root) != nil ||
+      class_getSuperclass(rootMeta) != root || object_getClass(rootMeta) != rootMeta)
+    return -18;
+  objc_disposeClassPair(root);
+  return 0;
+}
 
 static int perform_selector_on_main_thread_calls;
 
@@ -6510,6 +6997,8 @@ int test_access_mode_bits_and_TMPDIR(void);
 int test_NSPredicate_predicateWithBlock(void);
 int test_NSString_longLongValue(void);
 int test_munmap_partial_mapping(void);
+int test_sys_icache_invalidate(void);
+int test_vm_remap_fixed_code_page(void);
 int test_NSUserDefaults_persistentDomain(void);
 int test_NSData_base64EncodedStringWithOptions(void);
 int test_pthread_static_tls(void);
@@ -6709,6 +7198,14 @@ struct {
     FUNC_DEF(test_dispatch_queue_thread_identity),
     FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
+    FUNC_DEF(test_dlsym_executable_exports),
+    FUNC_DEF(test_dladdr_image_and_symbols),
+    FUNC_DEF(test_dlopen_handle_lifetime_and_constants),
+    FUNC_DEF(test_objc_dynamic_class_pair),
+    FUNC_DEF(test_UIViewController_nib_name_selection),
+    FUNC_DEF(test_UINavigationController_modal_layout),
+    FUNC_DEF(test_UINib_top_level_objects_exclude_proxies),
+    FUNC_DEF(test_UITableViewCell_nib_controls),
     XFUNC_DEF(test_CFRunLoopTimerCreate_callout),
     XFUNC_DEF(test_CFRunLoopTimerSetNextFireDate_NSTimer),
     FUNC_DEF(test_CFRunLoopContainsTimer),
@@ -6719,6 +7216,8 @@ struct {
     FUNC_DEF(test_NSString_longLongValue),
     FUNC_DEF(test_NSData_base64EncodedStringWithOptions),
     FUNC_DEF(test_munmap_partial_mapping),
+    FUNC_DEF(test_sys_icache_invalidate),
+    FUNC_DEF(test_vm_remap_fixed_code_page),
     FUNC_DEF(test_NSUserDefaults_persistentDomain),
     FUNC_DEF(test_libxml_xpath_public_structs),
     FUNC_DEF(test_libxml_xpath_scalar_layouts),

@@ -48,14 +48,24 @@ unsafe impl SafeRead for ivar_list_t {}
 ///
 /// The name, field names and field layout are based on what Ghidra outputs.
 #[repr(C, packed)]
-struct ivar_t {
-    offset: ConstPtr<GuestUSize>,
-    name: ConstPtr<u8>,
-    type_: ConstPtr<u8>,
-    alignment: u32,
-    size: u32,
+pub(super) struct ivar_t {
+    pub(super) offset: ConstPtr<GuestUSize>,
+    pub(super) name: ConstPtr<u8>,
+    pub(super) type_: ConstPtr<u8>,
+    pub(super) alignment: u32,
+    pub(super) size: u32,
 }
 unsafe impl SafeRead for ivar_t {}
+
+/// Return the byte offset recorded in an ivar's runtime metadata.
+/// https://developer.apple.com/documentation/objectivec/ivar_getoffset(_:)
+pub fn ivar_getOffset(env: &mut Environment, ivar: MutVoidPtr) -> GuestISize {
+    if ivar.is_null() {
+        return 0;
+    }
+    let metadata: ivar_t = env.mem.read(ivar.cast());
+    env.mem.read(metadata.offset) as GuestISize
+}
 
 /// The layout of an Objective-C property list in an app binary.
 /// Matches `objc_property_list` from Apple's objc4 runtime source.
@@ -531,6 +541,25 @@ pub fn object_getInstanceVariable(
     let value = object_ivar_value(&env.objc, &env.mem, object, ivar.cast_const()).unwrap_or(nil);
     if !out_value.is_null() {
         env.mem.write(out_value, value.cast());
+    }
+    ivar
+}
+
+/// The named form of object_setIvar, also used for MonoTouch's peer handle.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-532.2/runtime/objc-class.mm
+pub fn object_setInstanceVariable(
+    env: &mut Environment,
+    object: id,
+    name: ConstPtr<u8>,
+    value: MutVoidPtr,
+) -> MutVoidPtr {
+    if object == nil || name.is_null() {
+        return Ptr::null();
+    }
+    let class = ObjC::read_isa(object, &env.mem);
+    let ivar = class_getInstanceVariable(env, class, name);
+    if !ivar.is_null() {
+        object_setIvar(env, object, ivar, value.cast());
     }
     ivar
 }

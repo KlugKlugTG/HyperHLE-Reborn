@@ -1074,6 +1074,20 @@ impl Mem {
         unsafe { std::slice::from_raw_parts_mut(self.bytes.cast::<u8>().add(addr), count as usize) }
     }
 
+    /// A guest buffer readable by host kernel I/O, including untouched pages.
+    pub fn bytes_at_for_io<const MUT: bool>(&self, ptr: Ptr<u8, MUT>, count: GuestUSize) -> &[u8] {
+        let bytes = self.bytes_at(ptr, count);
+        host::prepare_for_host_io(bytes);
+        bytes
+    }
+
+    /// A guest buffer writable by host kernel I/O, including untouched pages.
+    pub fn bytes_at_mut_for_io(&mut self, ptr: MutPtr<u8>, count: GuestUSize) -> &mut [u8] {
+        let bytes = self.bytes_at_mut(ptr, count);
+        host::prepare_for_host_io(bytes);
+        bytes
+    }
+
     /// Get a pointer for reading an array of `count` elements of type `T`.
     /// Only use this for interfacing with unsafe C-like APIs.
     ///
@@ -1405,6 +1419,28 @@ impl Mem {
         ptr
     }
 
+    /// Claim an exact, page-aligned range for Mach fixed mappings. Unlike
+    /// permanent reservations, this counts toward the guest heap limit.
+    pub fn alloc_fixed(&mut self, base: VAddr, size: GuestUSize) -> bool {
+        if !self.allocator.alloc_fixed(base, size) {
+            return false;
+        }
+        if !self.zero_memory_on_free {
+            self.bytes_at_mut(Ptr::from_bits(base), size).fill(0);
+        }
+        true
+    }
+
+    /// Allocate pages satisfying an alignment mask and minimum address.
+    pub fn alloc_aligned(&mut self, size: GuestUSize, mask: VAddr, minimum: VAddr) -> MutVoidPtr {
+        let minimum = minimum.max(self.null_segment_size());
+        let ptr = Ptr::from_bits(self.allocator.alloc_aligned(size, mask, minimum));
+        if !self.zero_memory_on_free && !ptr.is_null() {
+            self.bytes_at_mut(ptr.cast(), size).fill(0);
+        }
+        ptr
+    }
+
     /// Allocate `size` bytes initialized to 0.
     pub fn calloc(&mut self, size: GuestUSize) -> MutVoidPtr {
         let ptr = self.alloc(size);
@@ -1668,6 +1704,42 @@ impl Mem {
 #[cfg(test)]
 mod mem_tests {
     use super::{Mem, MutPtr, Ptr};
+
+    // Host file I/O must work before any guest instruction has touched these
+    // pages. On Windows ReadFile/WriteFile probe buffers in kernel mode and
+    // cannot enter the guest mapping's user-mode commit handler.
+    // https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/read.2.html
+    #[test]
+    fn kernel_io_accesses_untouched_guest_pages() {
+        use std::io::{Read, Write};
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(super::PAGE_SIZE);
+        let base = 0x7000_0000;
+        mem.reserve(base, 6 * super::PAGE_SIZE);
+        let buffer: MutPtr<u8> = Ptr::from_bits(base + super::PAGE_SIZE - 3);
+        let expected = vec![0x5a; super::PAGE_SIZE as usize + 32];
+        let path =
+            std::env::temp_dir().join(format!("hyperhle-guest-io-{}.bin", std::process::id()));
+        let result = (|| -> std::io::Result<()> {
+            std::fs::write(&path, &expected)?;
+            let mut file = std::fs::File::open(&path)?;
+            let actual = mem.bytes_at_mut_for_io(buffer, expected.len() as u32);
+            assert_eq!(file.read(actual)?, expected.len());
+            assert_eq!(actual, expected);
+            // Writing untouched pages must transfer their zero contents,
+            // including a last partial page, without altering those pages.
+            let zeros: MutPtr<u8> = Ptr::from_bits(base + 4 * super::PAGE_SIZE + 3);
+            let bytes = mem.bytes_at_for_io(zeros, super::PAGE_SIZE + 16);
+            let mut output = std::fs::File::create(&path)?;
+            assert_eq!(output.write(bytes)?, bytes.len());
+            drop(output);
+            assert_eq!(std::fs::read(&path)?, vec![0; bytes.len()]);
+            Ok(())
+        })();
+        let cleanup = std::fs::remove_file(path);
+        result.unwrap();
+        cleanup.unwrap();
+    }
 
     #[test]
     fn lazy_commit_far_addresses() {

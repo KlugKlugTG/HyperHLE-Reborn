@@ -16,6 +16,7 @@
 #include <CoreFoundation/CFURL.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 // Objective-C runtime
 
@@ -40,6 +41,34 @@ static inline NSRange NSMakeRange(NSUInteger loc, NSUInteger len) {
 
 #define nil ((id)0)
 
+typedef void *Ivar;
+typedef id (*IMP)(id, SEL, ...);
+#ifdef __cplusplus
+extern "C" {
+#endif
+Class objc_getClass(const char *name);
+Class object_getClass(id object);
+Class class_getSuperclass(Class cls);
+size_t class_getInstanceSize(Class cls);
+BOOL class_isMetaClass(Class cls);
+Class objc_allocateClassPair(Class superclass, const char *name, size_t extraBytes);
+void objc_registerClassPair(Class cls);
+void objc_disposeClassPair(Class cls);
+BOOL class_addIvar(Class cls, const char *name, size_t size, uint8_t alignment,
+                   const char *types);
+BOOL class_addMethod(Class cls, SEL name, IMP imp, const char *types);
+Ivar class_getInstanceVariable(Class cls, const char *name);
+ptrdiff_t ivar_getOffset(Ivar ivar);
+id object_getIvar(id object, Ivar ivar);
+void object_setIvar(id object, Ivar ivar, id value);
+Ivar object_getInstanceVariable(id object, const char *name, void **value);
+Ivar object_setInstanceVariable(id object, const char *name, void *value);
+void *object_getIndexedIvars(id object);
+SEL sel_registerName(const char *name);
+#ifdef __cplusplus
+}
+#endif
+
 // id objc_msgSend(id, SEL, ...);
 
 // Foundation
@@ -58,8 +87,10 @@ static inline NSRange NSMakeRange(NSUInteger loc, NSUInteger len) {
 - (void)dealloc;
 - (NSUInteger)retainCount;
 - (id)performSelector:(SEL)selector;
+- (id)performSelector:(SEL)selector withObject:(id)object;
 - (BOOL)respondsToSelector:(SEL)selector;
 @end
+
 
 @interface NSBundle : NSObject
 + (NSBundle *)mainBundle;
@@ -68,6 +99,7 @@ static inline NSRange NSMakeRange(NSUInteger loc, NSUInteger len) {
 + (instancetype)bundleWithIdentifier:(id)identifier;
 - (id)bundleIdentifier;
 - (id)pathForResource:(id)name ofType:(id)extension;
+- (id)loadNibNamed:(id)name owner:(id)owner options:(id)options;
 @end
 
 @interface NSUserDefaults : NSObject

@@ -180,6 +180,10 @@ pub fn set_view_controller(env: &mut Environment, view: id, controller: id) {
     host_obj.view_controller = controller;
 }
 
+pub(crate) fn view_controller(env: &Environment, view: id) -> id {
+    env.objc.borrow::<UIViewHostObject>(view).view_controller
+}
+
 /// Distribute a change of the superview's size along one axis over the
 /// flexible parts of a subview (leading margin, size, trailing margin), in
 /// proportion to their current lengths, or evenly if they are all zero. This

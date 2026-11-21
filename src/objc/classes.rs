@@ -70,6 +70,11 @@ pub(super) struct ClassHostObject {
     /// Size of the allocated memory for instances of this class or metaclass.
     /// This is always >= the value in the superclass.
     pub(super) instance_size: GuestUSize,
+    /// Dynamic pairs are unpublished while their ivars are being constructed.
+    pub(super) is_constructing: bool,
+    pub(super) is_dynamic: bool,
+    /// Runtime-owned ivar metadata and strings, freed with a dynamic class.
+    pub(super) dynamic_allocations: Vec<MutVoidPtr>,
 }
 impl HostObject for ClassHostObject {}
 
@@ -348,6 +353,9 @@ impl ClassHostObject {
             properties: HashMap::default(),
             protocols: Vec::new(),
             is_from_bin: false,
+            is_constructing: false,
+            is_dynamic: false,
+            dynamic_allocations: Vec::new(),
         }
     }
 
@@ -399,6 +407,9 @@ impl ClassHostObject {
             properties: HashMap::new(),
             protocols: protocol_list_entries(mem, base_protocols),
             is_from_bin: true,
+            is_constructing: false,
+            is_dynamic: false,
+            dynamic_allocations: Vec::new(),
         };
         if !base_methods.is_null() {
             host_object.add_methods_from_bin(base_methods, mem, objc);
@@ -1233,6 +1244,9 @@ impl ObjC {
                         properties: Default::default(),
                         protocols: Default::default(),
                         is_from_bin: Default::default(),
+                        is_constructing: false,
+                        is_dynamic: false,
+                        dynamic_allocations: Vec::new(),
                     },
                 );
                 log_dbg!(
@@ -2620,30 +2634,203 @@ pub fn objc_getRequiredClass(env: &mut crate::Environment, name: ConstPtr<u8>) -
     class
 }
 
-/// `Class objc_allocateClassPair(Class superclass, const char *name,
-/// size_t extraBytes)` — used to dynamically create a new class.
-/// Implementing this properly requires wiring into our `ClassHostObject`
-/// machinery; until that's done, we install a placeholder
-/// (UnimplementedClass) so the symbol resolves and the guest can decide
-/// to fall back. Calls to `+[NewClass alloc]` etc. will go through the
-/// usual UnimplementedClass path.
+/// Create an unpublished class/metaclass pair with the given superclass.
+/// Apple's objc4-532.2 creates real pairs before registering their names.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-532.2/runtime/objc-runtime-new.mm
 pub fn objc_allocateClassPair(
     env: &mut crate::Environment,
-    _superclass: Class,
+    superclass: Class,
     name: ConstPtr<u8>,
-    _extra_bytes: u32,
+    extra_bytes: GuestUSize,
 ) -> Class {
-    let Ok(s) = env.mem.cstr_at_utf8(name) else {
+    if name.is_null() {
+        return nil;
+    }
+    let Ok(name) = env.mem.cstr_at_utf8(name) else {
         return nil;
     };
-    let name_str = s.to_string();
-    log!(
-        "Warning: objc_allocateClassPair({:?}, …): dynamic class registration is \
-         not fully supported; installing an UnimplementedClass placeholder.",
-        name_str
+    let name = name.to_owned();
+    if env.objc.get_class(&name, false, &env.mem).is_some() || ObjC::find_template(&name).is_some()
+    {
+        return nil;
+    }
+    let (instance_start, instance_size, meta_superclass, meta_isa, meta_size) = if superclass == nil
+    {
+        (
+            0,
+            guest_size_of::<objc_object>(),
+            nil,
+            nil,
+            guest_size_of::<class_t>(),
+        )
+    } else {
+        let Some(parent) = env
+            .objc
+            .get_host_object(superclass)
+            .and_then(|object| object.as_any().downcast_ref::<ClassHostObject>())
+        else {
+            return nil;
+        };
+        if parent.is_constructing || parent.is_metaclass {
+            return nil;
+        }
+        let size = parent.instance_size;
+        let parent_meta = ObjC::read_isa(superclass, &env.mem);
+        let meta_size = env
+            .objc
+            .class_instance_size(parent_meta)
+            .max(guest_size_of::<class_t>());
+        (
+            size,
+            size,
+            parent_meta,
+            ObjC::read_isa(parent_meta, &env.mem),
+            meta_size,
+        )
+    };
+    let Some(class_size) = meta_size.checked_add(extra_bytes) else {
+        return nil;
+    };
+    let Some(metaclass_size) = guest_size_of::<class_t>().checked_add(extra_bytes) else {
+        return nil;
+    };
+    let class: Class = env.mem.calloc(class_size).cast();
+    if class == nil {
+        return nil;
+    }
+    let metaclass: Class = env.mem.calloc(metaclass_size).cast();
+    if metaclass == nil {
+        env.mem.free(class.cast());
+        return nil;
+    }
+    env.mem.write(class, objc_object { isa: metaclass });
+    env.mem.write(class.cast::<Class>() + 1, superclass);
+    env.mem.write(
+        metaclass,
+        objc_object {
+            isa: if superclass == nil {
+                metaclass
+            } else {
+                meta_isa
+            },
+        },
     );
-    env.objc
-        .link_class(&name_str, /* is_metaclass: */ false, &mut env.mem)
+    let meta_superclass = if superclass == nil {
+        class
+    } else {
+        meta_superclass
+    };
+    env.mem
+        .write(metaclass.cast::<Class>() + 1, meta_superclass);
+    env.objc.register_static_object(
+        class,
+        Box::new(ClassHostObject {
+            name: name.clone(),
+            superclass,
+            instance_start,
+            instance_size,
+            is_from_bin: true,
+            is_constructing: true,
+            is_dynamic: true,
+            ..Default::default()
+        }),
+    );
+    env.objc.register_static_object(
+        metaclass,
+        Box::new(ClassHostObject {
+            name,
+            is_metaclass: true,
+            superclass: meta_superclass,
+            instance_start: meta_size,
+            instance_size: meta_size,
+            is_from_bin: true,
+            is_constructing: true,
+            is_dynamic: true,
+            ..Default::default()
+        }),
+    );
+    class
+}
+
+/// Add an ivar only while a non-metaclass is under construction.
+/// Alignment is log2(bytes); offsets follow the superclass's unaligned size.
+/// https://developer.apple.com/documentation/objectivec/class_addivar(_:_:_:_:_:)
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-532.2/runtime/objc-runtime-new.mm
+pub fn class_addIvar(
+    env: &mut crate::Environment,
+    class: Class,
+    name: ConstPtr<u8>,
+    size: GuestUSize,
+    alignment: u8,
+    types: ConstPtr<u8>,
+) -> bool {
+    let Some(host) = env
+        .objc
+        .get_host_object(class)
+        .and_then(|object| object.as_any().downcast_ref::<ClassHostObject>())
+    else {
+        return false;
+    };
+    if host.is_metaclass || !host.is_constructing {
+        return false;
+    }
+    let current_size = host.instance_size;
+    let name = if name.is_null() {
+        String::new()
+    } else {
+        let Ok(name) = env.mem.cstr_at_utf8(name) else {
+            return false;
+        };
+        name.to_owned()
+    };
+    if !name.is_empty() && env.objc.class_lookup_ivar(class, &name).is_some() {
+        return false;
+    }
+    let Some(alignment_bytes) = 1u32.checked_shl(alignment.into()) else {
+        return false;
+    };
+    let mask = alignment_bytes - 1;
+    let Some(offset) = current_size.checked_add(mask).map(|size| size & !mask) else {
+        return false;
+    };
+    let Some(instance_size) = offset.checked_add(size) else {
+        return false;
+    };
+    let types = if types.is_null() {
+        Vec::new()
+    } else {
+        env.mem.cstr_at(types).to_vec()
+    };
+    let name_ptr = if name.is_empty() {
+        Ptr::null()
+    } else {
+        env.mem.alloc_and_write_cstr(name.as_bytes())
+    };
+    let type_ptr = env.mem.alloc_and_write_cstr(&types);
+    let offset_ptr = env.mem.alloc_and_write(offset);
+    let metadata = env.mem.alloc_and_write(super::properties::ivar_t {
+        name: name_ptr.cast_const(),
+        type_: type_ptr.cast_const(),
+        offset: offset_ptr.cast_const(),
+        alignment: alignment.into(),
+        size,
+    });
+    let host = env.objc.borrow_mut::<ClassHostObject>(class);
+    host.instance_size = instance_size;
+    if !name_ptr.is_null() {
+        host.dynamic_allocations.push(name_ptr.cast());
+        host.ivars.insert(
+            name,
+            IvarInfo {
+                offset: offset_ptr.cast_const(),
+                alignment: alignment.into(),
+                metadata: metadata.cast().cast_const(),
+            },
+        );
+    }
+    host.dynamic_allocations
+        .extend([type_ptr.cast(), offset_ptr.cast(), metadata.cast()]);
+    true
 }
 
 /// `Class objc_readClassPair(Class cls, const struct objc_image_info *info)` —
@@ -2679,20 +2866,73 @@ pub fn objc_allocWithZone(
     crate::objc::msg![env; cls allocWithZone:zone]
 }
 
-/// `void objc_registerClassPair(Class cls)` — finalise the registration
-/// of a dynamically created class. touchHLE's [`objc_allocateClassPair`]
-/// already inserts the class into the runtime tables; the matching
-/// `register` call is therefore a no-op that just publishes the class.
-/// <https://developer.apple.com/documentation/objectivec/1418414-objc_registerclasspair>
-pub fn objc_registerClassPair(_env: &mut crate::Environment, _cls: Class) {}
+/// Publish a dynamically allocated class after its methods and ivars are set.
+/// https://developer.apple.com/documentation/objectivec/objc_registerclasspair(_:)
+pub fn objc_registerClassPair(env: &mut crate::Environment, class: Class) {
+    let Some(host) = env
+        .objc
+        .get_host_object(class)
+        .and_then(|object| object.as_any().downcast_ref::<ClassHostObject>())
+    else {
+        return;
+    };
+    if !host.is_dynamic || !host.is_constructing || host.is_metaclass {
+        return;
+    }
+    let name = host.name.clone();
+    let metaclass = ObjC::read_isa(class, &env.mem);
+    env.objc
+        .borrow_mut::<ClassHostObject>(class)
+        .is_constructing = false;
+    env.objc
+        .borrow_mut::<ClassHostObject>(metaclass)
+        .is_constructing = false;
+    env.objc.classes.insert(name, class);
+}
 
-/// `void objc_disposeClassPair(Class cls)` — destroys a class created
-/// with [`objc_allocateClassPair`] that has not yet been registered.
-/// touchHLE doesn't reclaim class storage, so we just drop the reference
-/// on the floor (Apple's runtime is also lazy about this for very small
-/// allocations).
-/// <https://developer.apple.com/documentation/objectivec/1418912-objc_disposeclasspair>
-pub fn objc_disposeClassPair(_env: &mut crate::Environment, _cls: Class) {}
+/// Dispose a dynamic class after all its instances and subclasses are gone.
+/// https://developer.apple.com/documentation/objectivec/objc_disposeclasspair(_:)
+pub fn objc_disposeClassPair(env: &mut crate::Environment, class: Class) {
+    let Some(host) = env
+        .objc
+        .get_host_object(class)
+        .and_then(|object| object.as_any().downcast_ref::<ClassHostObject>())
+    else {
+        return;
+    };
+    if !host.is_dynamic || host.is_metaclass {
+        return;
+    }
+    let name = host.name.clone();
+    let metaclass = ObjC::read_isa(class, &env.mem);
+    if env.objc.classes.get(&name) == Some(&class) {
+        env.objc.classes.remove(&name);
+    }
+    for object in [class, metaclass] {
+        env.objc.initialized_classes.remove(&object);
+        let metadata = std::mem::take(
+            &mut env
+                .objc
+                .borrow_mut::<ClassHostObject>(object)
+                .dynamic_allocations,
+        );
+        for allocation in metadata {
+            env.mem.free(allocation);
+        }
+        let method_handles: Vec<_> = env
+            .objc
+            .method_handles
+            .iter()
+            .filter(|((owner, _), _)| *owner == object)
+            .map(|(key, pointer)| (*key, *pointer))
+            .collect();
+        for (key, pointer) in method_handles {
+            env.objc.method_handles.remove(&key);
+            env.mem.free(pointer);
+        }
+        env.objc.dealloc_object(object, &mut env.mem);
+    }
+}
 
 /// `Class class_setSuperclass(Class cls, Class newSuper)` — deprecated
 /// since OS X 10.5 but still exported by libobjc and used by older
@@ -3018,14 +3258,29 @@ pub fn objc_copyImageNames(
     array
 }
 
-/// `void *object_getIndexedIvars(id obj)` — returns a pointer to the
-/// extra bytes allocated for a class created with
-/// `objc_allocateClassPair(super, name, extraBytes)`. We don't allocate
-/// extra bytes (see [objc_allocateClassPair]), so just return the
-/// object pointer itself; callers that try to use it as scratch space
-/// will get a no-op buffer rather than crashing on NULL.
-pub fn object_getIndexedIvars(_env: &mut crate::Environment, obj: id) -> ConstVoidPtr {
-    obj.cast().cast_const()
+/// Return the extra storage following the object's ordinary instance bytes.
+/// For dynamic class objects this follows the class header, preserving isa.
+/// https://github.com/apple-oss-distributions/objc4/blob/objc4-532.2/runtime/objc-runtime-new.mm
+pub fn object_getIndexedIvars(env: &mut crate::Environment, object: id) -> ConstVoidPtr {
+    if object == nil {
+        return Ptr::null();
+    }
+    let class = ObjC::read_isa(object, &env.mem);
+    let mut size = class_getInstanceSize(env, class);
+    if env
+        .objc
+        .get_host_object(object)
+        .and_then(|host| host.as_any().downcast_ref::<ClassHostObject>())
+        .is_some_and(|class| class.is_dynamic)
+    {
+        size = size.max(guest_size_of::<class_t>());
+    }
+    Ptr::from_bits(
+        object
+            .to_bits()
+            .checked_add(size)
+            .expect("Indexed ivar offset overflows"),
+    )
 }
 
 /// `void method_exchangeImplementations(Method m1, Method m2)`
