@@ -2908,6 +2908,9 @@ impl Window {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             let drawable_size = self.window.drawable_size();
+            if self.fullscreen {
+                return geometry::fit_viewport((app_width, app_height), drawable_size);
+            }
             let native_ratio_matches = {
                 let lhs = drawable_size.0 as u64 * app_height as u64;
                 let rhs = drawable_size.1 as u64 * app_width as u64;

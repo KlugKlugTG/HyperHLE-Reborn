@@ -123,6 +123,47 @@ mod tests {
     }
 
     #[test]
+    fn iphone_3gs_fills_ultrawide_screen_height_and_centers_touches() {
+        let viewport = fit_viewport((480, 320), (2340, 1080));
+        assert_eq!(viewport, (360, 0, 1620, 1080));
+        for scale in [2, 4] {
+            assert_eq!(
+                fit_viewport((480 * scale, 320 * scale), (2340, 1080)),
+                viewport
+            );
+        }
+        assert_eq!(
+            normalize_viewport_coords((1170.0, 540.0), viewport),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            normalize_viewport_coords((360.0, 0.0), viewport),
+            (-0.5, -0.5)
+        );
+        assert_eq!(
+            normalize_viewport_coords((1980.0, 1080.0), viewport),
+            (0.5, 0.5)
+        );
+        assert_eq!(
+            normalize_viewport_coords((0.0, 540.0), viewport),
+            (-0.5, 0.0)
+        );
+        assert_eq!(
+            normalize_viewport_coords((2340.0, 540.0), viewport),
+            (0.5, 0.0)
+        );
+    }
+
+    #[test]
+    fn tablet_framebuffer_keeps_its_own_aspect_ratio_and_touch_center() {
+        let viewport = fit_viewport((1024, 768), (2340, 1080));
+        assert_eq!(viewport, (450, 0, 1440, 1080));
+        assert_eq!(fit_viewport((2048, 1536), (2340, 1080)), viewport);
+        let mouse = window_to_drawable((585.0, 270.0), (1170, 540), (2340, 1080));
+        assert_eq!(normalize_viewport_coords(mouse, viewport), (0.0, 0.0));
+    }
+
+    #[test]
     fn landscape_in_portrait_window_is_centered() {
         let viewport = fit_viewport((480, 320), (960, 1280));
         assert_eq!(viewport, (0, 320, 960, 640));

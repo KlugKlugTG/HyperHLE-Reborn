@@ -525,6 +525,14 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) % 600 == 0 {
+            log!(
+                "COMPOSITE-GEOM screen={:?} framebuffer={}x{} viewport={:?} orientation={:?}",
+                screen_bounds,
+                fb_width,
+                fb_height,
+                env.window().viewport(),
+                env.window().current_rotation()
+            );
             fn dump(env: &Environment, layer: id, depth: usize) {
                 let h = env.objc.borrow::<CALayerHostObject>(layer);
                 let delegate: id = h.delegate_for_debug();
@@ -537,13 +545,14 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                     }
                 };
                 log!(
-                    "LAYER {:indent$}{} ({:?}) delegate={} bounds={:?} pos={:?} hidden={} opaque={} opacity={} bg={:?} contents={} pixels={} ctx={}",
+                    "LAYER {:indent$}{} ({:?}) delegate={} bounds={:?} pos={:?} transform={:?} hidden={} opaque={} opacity={} bg={:?} contents={} pixels={} ctx={}",
                     "",
                     cls(layer),
                     layer,
                     cls(delegate),
                     h.bounds,
                     h.position,
+                    h.affine_transform,
                     h.hidden,
                     h.opaque,
                     h.opacity,

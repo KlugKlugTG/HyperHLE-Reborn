@@ -1,15 +1,15 @@
-name: Minecraft startup diagnostics
+name: Emulator diagnostics
 
 on:
   push:
-    branches: ["fix/minecraft-story-mode-startup"]
+    branches: ["fix/minecraft-story-mode-startup", "fix/infinity-blade-display"]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: minecraft-diagnostic-${{ github.ref }}
+  group: emulator-diagnostic-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
