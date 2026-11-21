@@ -123,6 +123,32 @@ mod tests {
     }
 
     #[test]
+    fn iphone_3gs_fills_ultrawide_screen_height_and_centers_touches() {
+        let viewport = fit_viewport((480, 320), (2340, 1080));
+        assert_eq!(viewport, (360, 0, 1620, 1080));
+        assert_eq!(
+            normalize_viewport_coords((1170.0, 540.0), viewport),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            normalize_viewport_coords((360.0, 0.0), viewport),
+            (-0.5, -0.5)
+        );
+        assert_eq!(
+            normalize_viewport_coords((1980.0, 1080.0), viewport),
+            (0.5, 0.5)
+        );
+        assert_eq!(
+            normalize_viewport_coords((0.0, 540.0), viewport),
+            (-0.5, 0.0)
+        );
+        assert_eq!(
+            normalize_viewport_coords((2340.0, 540.0), viewport),
+            (0.5, 0.0)
+        );
+    }
+
+    #[test]
     fn landscape_in_portrait_window_is_centered() {
         let viewport = fit_viewport((480, 320), (960, 1280));
         assert_eq!(viewport, (0, 320, 960, 640));
