@@ -5,55 +5,54 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 #![allow(dead_code)]
-//! `GKLeaderboardViewController` and `GKAchievementViewController`.
+//! `GKLeaderboardViewController`, `GKFriendRequestComposeViewController` and
+//! `GKAchievementViewController`.
+//!
+//! None of these show any UI. Each reports "finished" to its delegate as soon
+//! as it would appear, so the app doesn't wait for user interaction.
 
+use super::gk_leaderboard::{GKLeaderboardTimeScope, GKLeaderboardTimeScopeAllTime};
 use crate::frameworks::foundation::NSInteger;
 use crate::frameworks::uikit::ui_view_controller::UIViewControllerHostObject;
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg, nil, objc_classes, release, retain, ClassExports,
+    id, impl_HostObject_with_superclass, msg, msg_super, nil, objc_classes, release, ClassExports,
     NSZonePtr,
 };
+use crate::Environment;
 
-type GKLeaderboardTimeScope = NSInteger;
-type GKLeaderboardPlayerScope = NSInteger;
+fn responds_to(env: &mut Environment, obj: id, selector: &str) -> bool {
+    match env.objc.lookup_selector(selector) {
+        Some(sel) => {
+            let responds: bool = msg![env; obj respondsToSelector:sel];
+            responds
+        }
+        None => false,
+    }
+}
 
-// GKLeaderboardTimeScope values
-const GKLeaderboardTimeScopeToday: GKLeaderboardTimeScope = 0;
-const GKLeaderboardTimeScopeWeek: GKLeaderboardTimeScope = 1;
-const GKLeaderboardTimeScopeAllTime: GKLeaderboardTimeScope = 2;
-
-// GKLeaderboardPlayerScope values
-const GKLeaderboardPlayerScopeGlobal: GKLeaderboardPlayerScope = 0;
-const GKLeaderboardPlayerScopeFriendsOnly: GKLeaderboardPlayerScope = 1;
-
-// MARK: - GKLeaderboardViewController
+// MARK: - Host objects
 
 #[derive(Default)]
 struct GKLeaderboardViewControllerHostObject {
     superclass: UIViewControllerHostObject,
     /// GKLeaderboardViewControllerDelegate — weak reference
     leaderboard_delegate: id,
-    /// NSString* — category filter
+    /// NSString*, copied. Also what `leaderboardIdentifier` reads and writes.
     category: id,
     time_scope: GKLeaderboardTimeScope,
 }
 impl_HostObject_with_superclass!(GKLeaderboardViewControllerHostObject);
-
-// MARK: - GKFriendRequestComposeViewController
 
 #[derive(Default)]
 struct GKFriendRequestComposeViewControllerHostObject {
     superclass: UIViewControllerHostObject,
     /// GKFriendRequestComposeViewControllerDelegate — weak reference
     compose_view_delegate: id,
-    /// NSString*
+    /// NSString*, copied.
     message: id,
-    /// NSInteger
     max_recipients: NSInteger,
 }
 impl_HostObject_with_superclass!(GKFriendRequestComposeViewControllerHostObject);
-
-// MARK: - GKAchievementViewController
 
 #[derive(Default)]
 struct GKAchievementViewControllerHostObject {
@@ -86,12 +85,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    let host = env.objc.borrow::<GKLeaderboardViewControllerHostObject>(this);
-    let (delegate, category) = (host.leaderboard_delegate, host.category);
+    // The delegate is weak, so only the category is released.
+    let category = env.objc.borrow::<GKLeaderboardViewControllerHostObject>(this).category;
     release(env, category);
-    // delegate is weak — no release
-    let _ = delegate;
-    env.objc.dealloc_object(this, &mut env.mem)
+    msg_super![env; this dealloc]
 }
 
 // MARK: Delegate
@@ -113,10 +110,28 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setCategory:(id)category {
-    let old = env.objc.borrow::<GKLeaderboardViewControllerHostObject>(this).category;
+    // `copy` returns +1, which the host object keeps. nil stays nil. The new
+    // value exists before the old one is released.
+    let copied: id = if category == nil { nil } else { msg![env; category copy] };
+    let old = std::mem::replace(
+        &mut env.objc.borrow_mut::<GKLeaderboardViewControllerHostObject>(this).category,
+        copied,
+    );
     release(env, old);
-    retain(env, category);
-    env.objc.borrow_mut::<GKLeaderboardViewControllerHostObject>(this).category = category;
+}
+
+// iOS 7 name for the same property.
+- (id)leaderboardIdentifier {
+    env.objc.borrow::<GKLeaderboardViewControllerHostObject>(this).category
+}
+
+- (())setLeaderboardIdentifier:(id)identifier {
+    let copied: id = if identifier == nil { nil } else { msg![env; identifier copy] };
+    let old = std::mem::replace(
+        &mut env.objc.borrow_mut::<GKLeaderboardViewControllerHostObject>(this).category,
+        copied,
+    );
+    release(env, old);
 }
 
 // MARK: Time scope
@@ -142,15 +157,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         .borrow::<GKLeaderboardViewControllerHostObject>(this)
         .leaderboard_delegate;
 
-    if delegate != nil {
-        let sel = env.objc.register_host_selector(
-            "leaderboardViewControllerDidFinish:".to_string(),
-            &mut env.mem,
-        );
-        let responds: bool = msg![env; delegate respondsToSelector:sel];
-        if responds {
-            () = msg![env; delegate leaderboardViewControllerDidFinish:this];
-        }
+    if delegate != nil && responds_to(env, delegate, "leaderboardViewControllerDidFinish:") {
+        () = msg![env; delegate leaderboardViewControllerDidFinish:this];
     }
 }
 
@@ -184,11 +192,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    let host = env.objc.borrow::<GKFriendRequestComposeViewControllerHostObject>(this);
-    let message = host.message;
+    // The delegate is weak, so only the message is released.
+    let message = env.objc
+        .borrow::<GKFriendRequestComposeViewControllerHostObject>(this)
+        .message;
     release(env, message);
-    // delegate is weak — no release
-    env.objc.dealloc_object(this, &mut env.mem)
+    msg_super![env; this dealloc]
 }
 
 // MARK: Delegate
@@ -210,10 +219,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setMessage:(id)message {
-    let old = env.objc.borrow::<GKFriendRequestComposeViewControllerHostObject>(this).message;
+    let copied: id = if message == nil { nil } else { msg![env; message copy] };
+    let old = std::mem::replace(
+        &mut env.objc.borrow_mut::<GKFriendRequestComposeViewControllerHostObject>(this).message,
+        copied,
+    );
     release(env, old);
-    retain(env, message);
-    env.objc.borrow_mut::<GKFriendRequestComposeViewControllerHostObject>(this).message = message;
 }
 
 - (NSInteger)maxRecipients {
@@ -227,8 +238,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: Add Recipients
 
 - (())addRecipientsWithPlayerIDs:(id)_playerIDs {
-    // В эмуляторе реальная отправка не происходит, поэтому мы просто принимаем
-    // данные
+    // Nothing is ever sent in the emulator, so the data is just accepted.
 }
 
 - (())addRecipientsWithEmailAddresses:(id)_emailAddresses {
@@ -246,25 +256,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())viewWillAppear:(bool)_animated {
     log!("GKFriendRequestComposeViewController viewWillAppear: stubbed");
 
-    // Эмуляция закрытия окна сразу после "открытия", чтобы игра не висела
+    // "Close" right after "opening" so the game doesn't hang.
     let delegate = env.objc
         .borrow::<GKFriendRequestComposeViewControllerHostObject>(this)
         .compose_view_delegate;
 
-    if delegate != nil {
-        let sel = env.objc.register_host_selector(
-            "friendRequestComposeViewControllerDidFinish:".to_string(),
-            &mut env.mem,
-        );
-        let responds: bool = msg![env; delegate respondsToSelector:sel];
-        if responds {
-            () = msg![env; delegate friendRequestComposeViewControllerDidFinish:this];
-        }
+    if delegate != nil
+        && responds_to(env, delegate, "friendRequestComposeViewControllerDidFinish:")
+    {
+        () = msg![env; delegate friendRequestComposeViewControllerDidFinish:this];
     }
 }
 
 - (())viewDidAppear:(bool)_animated {
-    // Уже "закрыто" в viewWillAppear — ничего не делаем.
+    // Already "closed" in viewWillAppear — nothing to do.
 }
 
 - (())presentModalViewController:(id)_vc animated:(bool)_animated {
@@ -293,8 +298,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    // delegate is weak — no release
-    env.objc.dealloc_object(this, &mut env.mem)
+    // The delegate is weak, so there is nothing of our own to release.
+    msg_super![env; this dealloc]
 }
 
 // MARK: Delegate
@@ -322,15 +327,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         .borrow::<GKAchievementViewControllerHostObject>(this)
         .achievement_delegate;
 
-    if delegate != nil {
-        let sel = env.objc.register_host_selector(
-            "achievementViewControllerDidFinish:".to_string(),
-            &mut env.mem,
-        );
-        let responds: bool = msg![env; delegate respondsToSelector:sel];
-        if responds {
-            () = msg![env; delegate achievementViewControllerDidFinish:this];
-        }
+    if delegate != nil && responds_to(env, delegate, "achievementViewControllerDidFinish:") {
+        () = msg![env; delegate achievementViewControllerDidFinish:this];
     }
 }
 
