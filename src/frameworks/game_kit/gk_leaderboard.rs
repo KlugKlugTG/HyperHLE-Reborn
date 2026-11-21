@@ -135,6 +135,24 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.alloc_object(this, host, &mut env.mem)
 }
 
++ (())loadLeaderboardsWithCompletionHandler:(id)handler {
+    log!("GKLeaderboard loadLeaderboards: Game Center not available, failing");
+    let error = not_authenticated_error(env);
+    call_block_2(env, handler, nil, error);
+}
+
+// iOS 10+
++ (())loadLeaderboardsWithIDs:(id)_ids completionHandler:(id)handler {
+    let error = not_authenticated_error(env);
+    call_block_2(env, handler, nil, error);
+}
+
+// iOS 4-6: (categories, titles, error)
++ (())loadCategoriesWithCompletionHandler:(id)handler {
+    let error = not_authenticated_error(env);
+    call_block_3(env, handler, nil, nil, error);
+}
+    
 // MARK: - Initialisers
 
 - (id)init {
@@ -269,28 +287,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     let error = not_authenticated_error(env);
     call_block_2(env, handler, nil, error);
 }
-
-// MARK: - Loading leaderboard lists
-
-+ (())loadLeaderboardsWithCompletionHandler:(id)handler {
-    log!("GKLeaderboard loadLeaderboards: Game Center not available, failing");
-    let error = not_authenticated_error(env);
-    call_block_2(env, handler, nil, error);
-}
-
-// iOS 10+
-+ (())loadLeaderboardsWithIDs:(id)_ids completionHandler:(id)handler {
-    let error = not_authenticated_error(env);
-    call_block_2(env, handler, nil, error);
-}
-
-// iOS 4-6: (categories, titles, error)
-+ (())loadCategoriesWithCompletionHandler:(id)handler {
-    let error = not_authenticated_error(env);
-    call_block_3(env, handler, nil, nil, error);
-}
-
-// MARK: - Description
 
 - (id)description {
     let (identifier, player_scope, time_scope) = {
