@@ -35,6 +35,7 @@ pub const GKLeaderboardTimeScopeAllTime: GKLeaderboardTimeScope = 2;
 /// `GKErrorNotAuthenticated` in `GKErrorDomain`.
 const GK_ERROR_NOT_AUTHENTICATED: NSInteger = 6;
 
+#[derive(Default)]
 struct GKLeaderboardHostObject {
     player_scope: GKLeaderboardPlayerScope,
     time_scope: GKLeaderboardTimeScope,
