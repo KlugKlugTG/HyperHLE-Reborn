@@ -5173,6 +5173,435 @@ fn hoist_shader_extension_directives(source: &str) -> String {
     out
 }
 
+/// Replace the contents of comments and preprocessor directives with spaces
+/// while preserving every newline, so the result has exactly the same byte
+/// length as the input. Structure-sensitive scans for the global-initializer
+/// rewrite can then run on the masked text while edits are spliced into the
+/// original source using the same indices.
+fn mask_glsl_for_analysis(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut i = 0usize;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_line_comment {
+            if c == b'\n' {
+                in_line_comment = false;
+            } else {
+                out[i] = b' ';
+            }
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
+            if c == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            if c != b'\n' {
+                out[i] = b' ';
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'/' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'/' {
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if bytes[i + 1] == b'*' {
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                in_block_comment = true;
+                i += 2;
+                continue;
+            }
+        }
+        if c == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out[i] = b' ';
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
+}
+
+fn is_glsl_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// Split `text` on `sep`, ignoring separators nested inside parentheses or
+/// square brackets.
+fn split_top_level<'a>(text: &'a str, sep: char) -> Vec<&'a str> {
+    let bytes = text.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    for (i, &c) in bytes.iter().enumerate() {
+        match c {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            _ if c as char == sep && depth == 0 => {
+                parts.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// GLSL ES type names that can act as constant-expression constructors.
+const GLSL_TYPE_CONSTRUCTORS: &[&str] = &[
+    "float", "int", "bool", "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4", "bvec2",
+    "bvec3", "bvec4", "mat2", "mat3", "mat4", "mat2x2", "mat2x3", "mat2x4", "mat3x2",
+    "mat3x3", "mat3x4", "mat4x2", "mat4x3", "mat4x4",
+];
+
+/// Conservative constant-expression check for a GLSL initializer: an
+/// expression built purely from literals, operators and type constructors
+/// whose arguments are themselves constant. Any other identifier (uniform,
+/// varying, another global, a function call) makes the expression
+/// non-constant. Being over-conservative is safe here: rewriting a legal
+/// initializer into an assignment at the top of `main()` preserves its
+/// semantics.
+fn is_constant_glsl_expr(expr: &str) -> bool {
+    let text = expr.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < bytes.len() && is_glsl_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            let ident = &text[start..i];
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                if !GLSL_TYPE_CONSTRUCTORS.contains(&ident) {
+                    return false;
+                }
+                let mut depth = 0i32;
+                let mut k = j;
+                while k < bytes.len() {
+                    match bytes[k] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                if k >= bytes.len() {
+                    return false;
+                }
+                let args = &text[j + 1..k];
+                if args.trim().is_empty() {
+                    return false;
+                }
+                for arg in split_top_level(args, ',') {
+                    if !is_constant_glsl_expr(arg) {
+                        return false;
+                    }
+                }
+                i = k + 1;
+            } else {
+                return false;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
+/// Find the byte index just after the opening `{` of `main`'s definition
+/// (`void main(...) {`). Returns `None` when `main` has no body.
+fn find_main_body_open(masked: &str) -> Option<usize> {
+    let bytes = masked.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len() && !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+        let start = i;
+        while i < bytes.len() && is_glsl_ident_byte(bytes[i]) {
+            i += 1;
+        }
+        if &masked[start..i] != "main" {
+            continue;
+        }
+        if start > 0 && is_glsl_ident_byte(bytes[start - 1]) {
+            continue;
+        }
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'(' {
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut k = j;
+        while k < bytes.len() {
+            match bytes[k] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        if k >= bytes.len() {
+            return None;
+        }
+        let mut m = k + 1;
+        while m < bytes.len() && bytes[m].is_ascii_whitespace() {
+            m += 1;
+        }
+        if m < bytes.len() && bytes[m] == b'{' {
+            return Some(m + 1);
+        }
+    }
+    None
+}
+
+/// Parse one top-level declaration statement (`masked[s..e]`, including the
+/// trailing `;`). If any declarator has a non-constant initializer, return
+/// the statement rewritten without initializers plus the assignment
+/// statements that reproduce them. Returns `None` for anything that should
+/// be left untouched (function prototypes, struct definitions, qualified
+/// declarations like `uniform`/`const`, array initializers, statements with
+/// no non-constant initializer).
+fn rewrite_global_declaration(
+    source: &str,
+    masked: &str,
+    start: usize,
+    end: usize,
+) -> Option<(String, Vec<String>)> {
+    const SKIP_QUALIFIERS: &[&str] = &[
+        "uniform", "attribute", "varying", "const", "in", "out", "centroid", "flat",
+        "invariant", "layout", "struct", "void", "precision",
+    ];
+    const PRECISION_QUALIFIERS: &[&str] = &["lowp", "mediump", "highp"];
+
+    let stmt = &masked[start..end];
+    let bytes = stmt.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let mut skip = false;
+    loop {
+        let tok_start = i;
+        while i < bytes.len() && is_glsl_ident_byte(bytes[i]) {
+            i += 1;
+        }
+        if i == tok_start {
+            skip = true;
+            break;
+        }
+        let tok = &stmt[tok_start..i];
+        if SKIP_QUALIFIERS.contains(&tok) {
+            skip = true;
+            break;
+        }
+        if PRECISION_QUALIFIERS.contains(&tok) {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    if skip {
+        return None;
+    }
+    // Take the qualifier/type prefix from the original source so any
+    // comments between the qualifiers and the type survive the rewrite.
+    let prefix = source[start..start + i].trim_end();
+    let trimmed = stmt.trim_end();
+    if !trimmed.ends_with(';') {
+        return None;
+    }
+    let decls_text = &stmt[i..trimmed.len() - 1];
+
+    let mut new_parts: Vec<String> = Vec::new();
+    let mut assignments: Vec<String> = Vec::new();
+    let mut changed = false;
+    for part in split_top_level(decls_text, ',') {
+        let p = part.trim();
+        let mut depth = 0i32;
+        let mut eq: Option<usize> = None;
+        let mut function = false;
+        for (j, &c) in p.as_bytes().iter().enumerate() {
+            match c {
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth -= 1,
+                b'=' if depth == 0 => {
+                    eq = Some(j);
+                    break;
+                }
+                b'(' if depth == 0 => {
+                    function = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if function {
+            return None;
+        }
+        match eq {
+            None => new_parts.push(p.to_string()),
+            Some(k) => {
+                let name = p[..k].trim();
+                let init = p[k + 1..].trim();
+                if name.is_empty() || init.is_empty() || name.contains('[') {
+                    return None;
+                }
+                if is_constant_glsl_expr(init) {
+                    new_parts.push(p.to_string());
+                } else {
+                    new_parts.push(name.to_string());
+                    assignments.push(format!("{} = {};", name, init));
+                    changed = true;
+                }
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    Some((format!("{} {};", prefix, new_parts.join(", ")), assignments))
+}
+
+/// Move non-constant global variable initializers into `main()`.
+///
+/// GLSL ES requires global variable initializers to be constant expressions,
+/// but the lenient PowerVR drivers on real iPhone-era hardware accepted them
+/// anyway, so games (e.g. Modern Combat 4) ship shaders that violate the
+/// rule. Strict compilers (ANGLE, modern Mesa/Adreno) reject such shaders
+/// with "global variable initializers must be constant expressions".
+/// GLSL global initializers are evaluated exactly once when the program is
+/// first used, so replacing them with assignments at the top of `main()` is
+/// semantically equivalent. Only default-qualified global declarations are
+/// touched (`const`/`uniform`/`attribute`/`varying`/arrays and anything
+/// ambiguous are left alone); if nothing needs rewriting, the source is
+/// returned unchanged.
+fn rewrite_nonconstant_global_initializers(source: &str) -> String {
+    let masked = mask_glsl_for_analysis(source);
+    let main_open = match find_main_body_open(&masked) {
+        Some(i) => i,
+        None => return source.to_string(),
+    };
+
+    let bytes = masked.as_bytes();
+    let mut statements: Vec<(usize, usize)> = Vec::new();
+    let mut brace = 0i32;
+    let mut paren = 0i32;
+    let mut stmt_start: Option<usize> = None;
+    for (i, &c) in bytes.iter().enumerate() {
+        match c {
+            b'{' => brace += 1,
+            b'}' => {
+                brace = (brace - 1).max(0);
+                if brace == 0 {
+                    stmt_start = None;
+                }
+            }
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b';' if brace == 0 && paren == 0 => {
+                if let Some(s) = stmt_start.take() {
+                    statements.push((s, i + 1));
+                }
+            }
+            _ => {}
+        }
+        if brace == 0 && stmt_start.is_none() && !c.is_ascii_whitespace() && c != b';' {
+            stmt_start = Some(i);
+        }
+    }
+
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut assignments: Vec<String> = Vec::new();
+    for (s, e) in statements {
+        // Declarations after `main` can never be referenced from `main`, so
+        // moving their initializers there would produce out-of-order
+        // declarations; leave them alone.
+        if s >= main_open {
+            continue;
+        }
+        if let Some((replacement, assigns)) = rewrite_global_declaration(source, &masked, s, e) {
+            edits.push((s, e, replacement));
+            assignments.extend(assigns);
+        }
+    }
+    if assignments.is_empty() {
+        return source.to_string();
+    }
+
+    let mut out = String::with_capacity(source.len() + 64);
+    let mut last = 0usize;
+    for (s, e, replacement) in &edits {
+        out.push_str(&source[last..*s]);
+        out.push_str(replacement);
+        last = *e;
+    }
+    out.push_str(&source[last..]);
+
+    let masked_out = mask_glsl_for_analysis(&out);
+    if let Some(open) = find_main_body_open(&masked_out) {
+        let mut insert = String::new();
+        for a in &assignments {
+            insert.push_str("\n    ");
+            insert.push_str(a);
+        }
+        let trailing = match masked_out.as_bytes().get(open) {
+            Some(&b'\n') => "",
+            _ => "\n",
+        };
+        insert.push_str(trailing);
+        out.insert_str(open, &insert);
+    }
+    out
+}
+
 /// Strip `//` and `/* */` comments from GLSL source so declaration scanning
 /// never sees commented-out code (Gameloft's shader generator emits the full
 /// varying block in both stages but comments unused entries out — a
@@ -6257,7 +6686,12 @@ fn glShaderSource(
     // 3. Hoist `#extension` directives to the top — strict compilers (ANGLE
     //    etc.) reject them after non-preprocessor tokens; see
     //    `hoist_shader_extension_directives`.
-    let src = hoist_shader_extension_directives(&src);
+    let src = hoist_shader_extension_directives(&src);    // 4. Move non-constant global variable initializers into `main()` —
+    //    strict GLES compilers (ANGLE) reject them with "global variable
+    //    initializers must be constant expressions" (e.g. Modern Combat 4's
+    //    shaders), which the lenient PowerVR drivers on real iPhone-era
+    //    hardware accepted; see `rewrite_nonconstant_global_initializers`.
+    let src = rewrite_nonconstant_global_initializers(&src);
     let bytes_vec = strip_captain_tomato_shader_precision(&src).into_bytes();
 
     let cs = std::ffi::CString::new(bytes_vec).unwrap_or_default();
@@ -9209,7 +9643,89 @@ mod pvrtc_subimage_matching_tests {
 
 #[cfg(test)]
 mod shader_preprocessor_normalization_tests {
-    use super::{normalize_asphalt8_shader_source, normalize_shader_preprocessor_whitespace};
+    use super::{
+        normalize_asphalt8_shader_source, normalize_shader_preprocessor_whitespace,
+        rewrite_nonconstant_global_initializers,
+    };
+
+    #[test]
+    fn moves_nonconstant_global_initializer_into_main() {
+        let src = "uniform vec4 u_fog;\nvec4 fog = u_fog;\nvoid main() { gl_FragColor = fog; }";
+        let out = rewrite_nonconstant_global_initializers(src);
+        assert!(out.contains("vec4 fog;"));
+        let main_at = out.find("void main()").unwrap();
+        let assign_at = out.find("fog = u_fog;").unwrap();
+        let use_at = out.find("gl_FragColor = fog;").unwrap();
+        assert!(main_at < assign_at && assign_at < use_at);
+    }
+
+    #[test]
+    fn leaves_constant_global_initializers_untouched() {
+        let src = "vec4 c = vec4(1.0, 2.0, 3.0, 4.0);\nfloat s = 2.0 * 3.0;\nvoid main() { gl_FragColor = c; }";
+        assert_eq!(rewrite_nonconstant_global_initializers(src), src);
+    }
+
+    #[test]
+    fn leaves_qualified_declarations_untouched() {
+        let src = "uniform vec4 u_fog;\nconst float k = 1.0;\nvarying float v;\nattribute vec4 a_pos;\nvoid main() { gl_FragColor = u_fog; }";
+        assert_eq!(rewrite_nonconstant_global_initializers(src), src);
+    }
+
+    #[test]
+    fn handles_multiline_constructor_initializer() {
+        let src = "uniform float u_s;\nvec4 col =\n    vec4(u_s);\nvoid main() { gl_FragColor = col; }";
+        let out = rewrite_nonconstant_global_initializers(src);
+        assert!(out.contains("vec4 col;"));
+        assert!(out.contains("col = vec4(u_s);"));
+    }
+
+    #[test]
+    fn moves_function_call_initializer_into_main() {
+        let src = "float s = sin(1.0);\nvoid main() { gl_FragColor = vec4(s); }";
+        let out = rewrite_nonconstant_global_initializers(src);
+        assert!(out.contains("float s;"));
+        assert!(out.contains("s = sin(1.0);"));
+    }
+
+    #[test]
+    fn splits_declarator_lists_preserving_uninitialized_names() {
+        let src = "uniform vec2 u_v;\nvec2 uv = u_v, st;\nvoid main() { gl_FragColor = vec4(uv + st, 0.0, 1.0); }";
+        let out = rewrite_nonconstant_global_initializers(src);
+        assert!(out.contains("vec2 uv, st;"));
+        assert!(out.contains("uv = u_v;"));
+    }
+
+    #[test]
+    fn returns_original_without_main() {
+        let src = "vec4 x = y;";
+        assert_eq!(rewrite_nonconstant_global_initializers(src), src);
+    }
+
+    #[test]
+    fn leaves_declarations_after_main_untouched() {
+        let src = "void main() { gl_FragColor = vec4(1.0); }\nvec4 x = u_fog;";
+        assert_eq!(rewrite_nonconstant_global_initializers(src), src);
+    }
+
+    #[test]
+    fn preserves_comments_and_directives() {
+        let src = "// leading comment\nuniform float u_s;\n/* block */ vec4 c = vec4(u_s);\n#ifdef FOO\n#endif\nvoid main() { gl_FragColor = c; }";
+        let out = rewrite_nonconstant_global_initializers(src);
+        assert!(out.contains("// leading comment"));
+        assert!(out.contains("/* block */"));
+        assert!(out.contains("#ifdef FOO"));
+        assert!(out.contains("vec4 c;"));
+        assert!(out.contains("c = vec4(u_s);"));
+    }
+
+    #[test]
+    fn orders_multiple_assignments_in_declaration_order() {
+        let src = "uniform float u_a;\nfloat b = u_a * 2.0;\nfloat c = b + 1.0;\nvoid main() { gl_FragColor = vec4(c); }";
+        let out = rewrite_nonconstant_global_initializers(src);
+        let b_at = out.find("b = u_a * 2.0;").unwrap();
+        let c_at = out.find("c = b + 1.0;").unwrap();
+        assert!(b_at < c_at);
+    }
 
     #[test]
     fn normalizes_asphalt8_multiline_and_numeric_shader_tokens() {
