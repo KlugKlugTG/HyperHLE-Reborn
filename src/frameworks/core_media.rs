@@ -413,11 +413,6 @@ fn CMSampleBufferGetPresentationTimeStamp(
     0
 }
 
-fn CMSampleBufferGetDuration(env: &mut Environment, out: MutPtr<u8>, _sample_buffer: MutVoidPtr) -> i32 {
-    write_cm_time(env, out, CMTime::from_seconds(0));
-    0
-}
-
 fn CMAudioFormatDescriptionCreate(
     env: &mut Environment,
     _allocator: MutVoidPtr,
@@ -447,7 +442,6 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CMSampleBufferSetDataReady(_)),
     export_c_func!(CMSampleBufferSetDataBufferFromAudioBufferList(_, _, _, _, _)),
     export_c_func!(CMSampleBufferGetPresentationTimeStamp(_, _)),
-    export_c_func!(CMSampleBufferGetDuration(_, _)),
     export_c_func!(CMAudioFormatDescriptionCreate(_, _, _, _, _, _, _, _)),
     export_c_func!(CMTimeMakeWithSeconds(_, _, _)),
     export_c_func!(CMTimeGetSeconds(_)),
