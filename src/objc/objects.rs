@@ -482,6 +482,7 @@ impl super::ObjC {
 #[cfg(test)]
 mod allocation_tests {
     use super::*;
+    use crate::objc::ObjC;
 
     // UIApplicationMain supports a guest subclass as its principal class.
     // Its immortal allocation still needs the entire subclass instance.
