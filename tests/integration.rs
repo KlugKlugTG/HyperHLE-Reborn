@@ -462,7 +462,8 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         "uncaught exception was recovered: {stderr}"
     );
     assert!(
-        stderr.contains("abort"),
+        stderr.contains("Guest received fatal signal 6")
+            && stderr.contains("terminate called after throwing an instance of 'NSException'"),
         "uncaught exception failed for an unrelated reason: {stderr}"
     );
 
