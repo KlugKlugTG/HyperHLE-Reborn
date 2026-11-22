@@ -73,7 +73,7 @@ pub(crate) fn link_symbol(
     }
     let table = vtable(dyld, objc, mem);
     let name_ptr = mem.alloc_and_write_cstr(name.as_bytes());
-    let class = objc.get_class(name, false, mem).unwrap_or(nil);
+    let class = objc.classes.get(name).copied().unwrap_or(nil);
     let ty: MutPtr<u32> = mem.alloc(12).cast();
     mem.write(ty, (table + 2).to_bits());
     mem.write(ty + 1, name_ptr.to_bits());
@@ -112,7 +112,7 @@ fn do_catch(
     let class: Class = Ptr::from_bits(env.mem.read(catch_type + 2));
     // A host descriptor can have been linked before its guest class loaded.
     let class = if class == nil {
-        env.objc.get_class(name, false, &env.mem).unwrap_or(nil)
+        env.objc.classes.get(name).copied().unwrap_or(nil)
     } else {
         class
     };
