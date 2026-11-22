@@ -97,8 +97,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)allocWithZone:(NSZonePtr)_zone {
-    // Безопасно зануляем структуру
-    let host_object = Box::new(unsafe { std::mem::zeroed::<NSTimerHostObject>() });
+    let host_object = Box::<NSTimerHostObject>::default();
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 

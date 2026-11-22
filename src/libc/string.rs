@@ -694,6 +694,22 @@ fn basename(env: &mut Environment, path: MutPtr<u8>) -> MutPtr<u8> {
     path + start as GuestUSize
 }
 
+// The emulator currently models C-locale collation. The ordinary and xlocale
+// entry points must agree; guest libstdc++ imports both spellings.
+// https://github.com/apple-oss-distributions/Libc/blob/main/string/FreeBSD/strxfrm.c
+fn strcoll(env: &mut Environment, a: ConstPtr<u8>, b: ConstPtr<u8>) -> i32 {
+    strcoll_l(env, a, b, MutVoidPtr::null())
+}
+
+fn strxfrm(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    src: ConstPtr<u8>,
+    n: GuestUSize,
+) -> GuestUSize {
+    strxfrm_l(env, dest, src, n, MutVoidPtr::null())
+}
+
 fn strcoll_l(
     env: &mut Environment,
     a: ConstPtr<u8>,
@@ -779,6 +795,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(strerror_r(_, _, _)),
     export_c_func!(strcoll_l(_, _, _)),
     export_c_func!(strxfrm_l(_, _, _, _)),
+    export_c_func!(strcoll(_, _)),
+    export_c_func!(strxfrm(_, _, _)),
     export_c_func!(basename(_)),
     export_c_func!(bcopy(_, _, _)),
     export_c_func!(strnlen(_, _)),

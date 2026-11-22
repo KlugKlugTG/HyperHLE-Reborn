@@ -3788,6 +3788,103 @@ int test_mbstowcs() {
   return 0;
 }
 
+// The C++ libraries in old iPhone OS apps import both ordinary and xlocale
+// functions. Test the public ABI, size queries, partial conversion and errors.
+// https://github.com/apple-oss-distributions/Libc/blob/main/locale/FreeBSD/none.c
+int test_c_locale_codecs_and_collation(void) {
+  setlocale(LC_ALL, "C");
+  mbstate_t state = {0};
+  wchar_t wc = 123;
+  char byte = '?';
+  if (mbrtowc(&wc, "A", 0, &state) != (size_t)-2 || wc != 123)
+    return -1;
+  if (mbrtowc(&wc, NULL, 0, &state) != 0 || wc != 123)
+    return -2;
+  if (mbrtowc(&wc, "\xff", 1, &state) != 1 || wc != 255)
+    return -3;
+  if (wcrtomb(&byte, wc, &state) != 1 || (unsigned char)byte != 255)
+    return -4;
+  if (mbrlen("A", 1, &state) != 1 || mbrlen("", 1, &state) != 0 ||
+      !mbsinit(&state) || !mbsinit(NULL))
+    return -5;
+  byte = '?';
+  errno = 0;
+  if (wcrtomb(&byte, 256, &state) != (size_t)-1 || errno != EILSEQ ||
+      byte != '?')
+    return -6;
+  if (wcrtomb(NULL, -1, &state) != 1 || btowc(255) != 255 ||
+      btowc(256) != WEOF || wctob(255) != 255 || wctob(256) != EOF)
+    return -7;
+
+  const char *narrow = "abc";
+  const char *narrowStart = narrow;
+  wchar_t wideBuffer[8] = {99, 99, 99, 99, 99, 99, 99, 99};
+  if (mbsrtowcs(NULL, &narrow, 0, &state) != 3 || narrow != narrowStart)
+    return -8;
+  if (mbsrtowcs(wideBuffer, &narrow, 2, &state) != 2 ||
+      narrow != narrowStart + 2 || wideBuffer[0] != L'a' ||
+      wideBuffer[1] != L'b' || wideBuffer[2] != 99)
+    return -9;
+  if (mbsrtowcs(wideBuffer + 2, &narrow, 2, &state) != 1 || narrow != NULL ||
+      wcscmp(wideBuffer, L"abc") != 0)
+    return -10;
+
+  const wchar_t *wide = L"abc";
+  const wchar_t *wideStart = wide;
+  char narrowBuffer[8] = {'?', '?', '?', '?', '?', '?', '?', '?'};
+  if (wcsrtombs(NULL, &wide, 0, &state) != 3 || wide != wideStart)
+    return -11;
+  if (wcsrtombs(narrowBuffer, &wide, 2, &state) != 2 || wide != wideStart + 2 ||
+      narrowBuffer[2] != '?')
+    return -12;
+  if (wcsrtombs(narrowBuffer + 2, &wide, 2, &state) != 1 || wide != NULL ||
+      strcmp(narrowBuffer, "abc") != 0)
+    return -13;
+  const wchar_t invalid[] = {L'a', 256, 0};
+  wide = invalid;
+  errno = 0;
+  if (wcsrtombs(narrowBuffer, &wide, sizeof(narrowBuffer), &state) !=
+          (size_t)-1 ||
+      wide != invalid + 1 || errno != EILSEQ)
+    return -14;
+
+  if (strcoll("a", "b") >= 0 || strcoll("same", "same") != 0 ||
+      wcscoll(L"a", L"b") >= 0 || wcscoll(L"same", L"same") != 0)
+    return -15;
+  if (strxfrm(NULL, "abc", 0) != 3 || wcsxfrm(NULL, L"abc", 0) != 3)
+    return -16;
+  if (strxfrm(narrowBuffer, "abc", sizeof(narrowBuffer)) != 3 ||
+      strcmp(narrowBuffer, "abc") != 0 || wcsxfrm(wideBuffer, L"abc", 8) != 3 ||
+      wcscmp(wideBuffer, L"abc") != 0)
+    return -17;
+  return 0;
+}
+
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/strftime.3.html
+int test_time_format_buffer_limits(void) {
+  struct tm tm = {0};
+  tm.tm_year = 108;
+  char narrow[8];
+  wchar_t wide[8];
+  memset(narrow, '?', sizeof(narrow));
+  if (strftime(narrow, 0, "%Y", &tm) != 0 || narrow[0] != '?')
+    return -1;
+  if (strftime(narrow, 4, "%Y", &tm) != 0 || narrow[4] != '?')
+    return -2;
+  if (strftime(narrow, 5, "%Y", &tm) != 4 || strcmp(narrow, "2008") != 0 ||
+      narrow[5] != '?')
+    return -3;
+  wmemset(wide, L'?', 8);
+  if (wcsftime(wide, 0, L"%Y", &tm) != 0 || wide[0] != L'?')
+    return -4;
+  if (wcsftime(wide, 4, L"%Y", &tm) != 0 || wide[4] != L'?')
+    return -5;
+  if (wcsftime(wide, 5, L"%Y", &tm) != 4 || wcscmp(wide, L"2008") != 0 ||
+      wide[5] != L'?')
+    return -6;
+  return 0;
+}
+
 int test_CFMutableString() {
   CFMutableStringRef mut_str = CFStringCreateMutable(NULL, 0);
   CFStringRef fmt = CFStringCreateWithCString(NULL, "%d %.2f", 0x0600);
@@ -7123,6 +7220,8 @@ struct {
     FUNC_DEF(test_CFStringFind),
     FUNC_DEF(test_strcspn),
     FUNC_DEF(test_mbstowcs),
+    FUNC_DEF(test_c_locale_codecs_and_collation),
+    FUNC_DEF(test_time_format_buffer_limits),
     FUNC_DEF(test_wide_numeric_prefixes),
     FUNC_DEF(test_CFMutableString),
     FUNC_DEF(test_fwrite),
