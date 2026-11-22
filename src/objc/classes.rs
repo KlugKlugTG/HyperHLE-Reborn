@@ -19,7 +19,7 @@ use crate::bundle;
 use crate::fastmap::FxHashMap;
 use crate::mach_o::MachO;
 use crate::mem::{
-    guest_size_of, ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutVoidPtr, Ptr, SafeRead,
+    guest_size_of, ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr, SafeRead,
 };
 use std::collections::{HashMap, VecDeque};
 

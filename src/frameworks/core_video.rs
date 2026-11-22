@@ -658,7 +658,8 @@ fn CVOpenGLESTextureCacheCreate(
     cache_out: MutPtr<u32>,
 ) -> i32 {
     if !cache_out.is_null() {
-        env.mem.write(cache_out, alloc_cv_handle(env).to_bits());
+        let handle = alloc_cv_handle(env);
+        env.mem.write(cache_out, handle.to_bits());
     }
     0
 }
@@ -679,7 +680,8 @@ fn CVOpenGLESTextureCacheCreateTextureFromImage(
     texture_out: MutPtr<u32>,
 ) -> i32 {
     if !texture_out.is_null() {
-        env.mem.write(texture_out, alloc_cv_handle(env).to_bits());
+        let handle = alloc_cv_handle(env);
+        env.mem.write(texture_out, handle.to_bits());
     }
     0
 }
@@ -703,7 +705,8 @@ fn CVMetalTextureCacheCreate(
     cache_out: MutPtr<u32>,
 ) -> i32 {
     if !cache_out.is_null() {
-        env.mem.write(cache_out, alloc_cv_handle(env).to_bits());
+        let handle = alloc_cv_handle(env);
+        env.mem.write(cache_out, handle.to_bits());
     }
     0
 }
@@ -723,7 +726,8 @@ fn CVMetalTextureCacheCreateTextureFromImage(
     texture_out: MutPtr<u32>,
 ) -> i32 {
     if !texture_out.is_null() {
-        env.mem.write(texture_out, alloc_cv_handle(env).to_bits());
+        let handle = alloc_cv_handle(env);
+        env.mem.write(texture_out, handle.to_bits());
     }
     0
 }

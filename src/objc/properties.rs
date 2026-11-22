@@ -86,7 +86,7 @@ pub struct objc_property_attribute_t {
     name: ConstPtr<u8>,
     value: ConstPtr<u8>,
 }
-unsafe impl SafeWrite for objc_property_attribute_t {}
+impl SafeWrite for objc_property_attribute_t {}
 
 /// `objc_property_attribute_t *property_copyAttributeList(
 ///     objc_property_t property, unsigned int *outCount)`
