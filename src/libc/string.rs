@@ -702,7 +702,15 @@ fn strcoll_l(
 ) -> i32 {
     let a = env.mem.cstr_at(a);
     let b = env.mem.cstr_at(b);
-    a.cmp(b) as i32
+    match a.cmp(b) {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    }
+}
+
+fn strcoll(env: &mut Environment, a: ConstPtr<u8>, b: ConstPtr<u8>) -> i32 {
+    strcoll_l(env, a, b, MutVoidPtr::null())
 }
 
 fn strxfrm_l(
@@ -722,6 +730,15 @@ fn strxfrm_l(
         env.mem.write(dest + copy as GuestUSize, 0);
     }
     len
+}
+
+fn strxfrm(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    src: ConstPtr<u8>,
+    n: GuestUSize,
+) -> GuestUSize {
+    strxfrm_l(env, dest, src, n, MutVoidPtr::null())
 }
 
 pub const FUNCTIONS: FunctionExports = &[
@@ -777,7 +794,9 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(explicit_bzero(_, _)),
     // strerror is exported from libc::errno; not duplicated here.
     export_c_func!(strerror_r(_, _, _)),
+    export_c_func!(strcoll(_, _)),
     export_c_func!(strcoll_l(_, _, _)),
+    export_c_func!(strxfrm(_, _, _)),
     export_c_func!(strxfrm_l(_, _, _, _)),
     export_c_func!(basename(_)),
     export_c_func!(bcopy(_, _, _)),

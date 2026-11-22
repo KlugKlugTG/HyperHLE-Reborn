@@ -483,6 +483,40 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @implementation UIImageNibPlaceholder: NSObject
 
+// `UIImageNibPlaceholder` is UIKit's private stand-in for an image stored in
+// a nib. Real nibs usually decode the resource name through `-initWithCoder:`,
+// but storyboards and hand-written archives may instead invoke the regular
+// `UIImage` data/file initializers on the placeholder. Forward those to a
+// real `UIImage` and transfer ownership, exactly like `-initWithCoder:` below.
+// <https://developer.apple.com/documentation/uikit/uiimage>
+
+- (id)initWithData:(id)data { // NSData*
+    () = msg![env; this dealloc];
+    let image: id = msg_class![env; UIImage imageWithData:data];
+    if image != nil {
+        retain(env, image);
+    }
+    image
+}
+
+- (id)initWithData:(id)data scale:(CGFloat)scale { // NSData*
+    () = msg![env; this dealloc];
+    let image: id = msg_class![env; UIImage imageWithData:data scale:scale];
+    if image != nil {
+        retain(env, image);
+    }
+    image
+}
+
+- (id)initWithContentsOfFile:(id)path { // NSString*
+    () = msg![env; this dealloc];
+    let image: id = msg_class![env; UIImage imageWithContentsOfFile:path];
+    if image != nil {
+        retain(env, image);
+    }
+    image
+}
+
 - (id)initWithCoder:(id)coder {
     // В NIB-файлах плейсхолдеры картинок хранят имя ресурса под ключом
     // UIResourceName

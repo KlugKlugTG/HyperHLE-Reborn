@@ -678,6 +678,44 @@ fn setpriority(_env: &mut Environment, _which: i32, _who: i32, _priority: i32) -
     0
 }
 
+/// `const char *getprogname(void)` — Darwin's process name. The emulator's
+/// own name is a stable, non-NULL answer; the buffer is allocated once and
+/// cached so repeated calls return the same pointer, as on Darwin.
+fn getprogname(env: &mut Environment) -> MutPtr<u8> {
+    if let Some(buf) = env.libc_state.getprogname_buf {
+        return buf;
+    }
+    const NAME: &[u8] = b"HyperHLE\0";
+    let buf: MutPtr<u8> = env.mem.alloc(NAME.len() as GuestUSize).cast();
+    env.mem
+        .bytes_at_mut(buf.cast(), NAME.len() as GuestUSize)
+        .copy_from_slice(NAME);
+    env.libc_state.getprogname_buf = Some(buf);
+    buf
+}
+
+/// Darwin `struct termios` is 44 bytes (four 32-bit flags, 20 control
+/// characters and two 32-bit speeds). Nothing in HyperHLE is attached to a
+/// real terminal, so report a deterministic zeroed configuration instead of
+/// leaking uninitialised guest memory.
+fn tcgetattr(env: &mut Environment, _fd: i32, termios_p: MutPtr<u8>) -> i32 {
+    if termios_p.is_null() {
+        return -1;
+    }
+    for i in 0..44u32 {
+        env.mem.write(termios_p + i as GuestUSize, 0u8);
+    }
+    0
+}
+
+fn tcsetattr(_env: &mut Environment, _fd: i32, _optional_actions: i32, _termios_p: MutPtr<u8>) -> i32 {
+    0
+}
+
+fn tcflush(_env: &mut Environment, _fd: i32, _queue_selector: i32) -> i32 {
+    0
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(syscall(_, _)),
     export_c_func!(sleep(_)),
@@ -710,6 +748,10 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(fchmod(_, _)),
     export_c_func!(sync()),
     export_c_func!(setpriority(_, _, _)),
+    export_c_func!(getprogname()),
+    export_c_func!(tcgetattr(_, _)),
+    export_c_func!(tcsetattr(_, _, _)),
+    export_c_func!(tcflush(_, _)),
 ];
 
 #[cfg(test)]

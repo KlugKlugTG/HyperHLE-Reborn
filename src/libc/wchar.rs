@@ -999,6 +999,34 @@ fn mbsrtowcs_l(
     mbsrtowcs(env, dest, src, len, ps)
 }
 
+// Non-`_l` variants.  The emulator only models the C locale, so they are
+// the `_l` implementations with a null locale argument.
+fn mbrtowc(
+    env: &mut Environment,
+    pwc: MutPtr<wchar_t>,
+    s: ConstPtr<u8>,
+    n: GuestUSize,
+) -> GuestUSize {
+    mbrtowc_l(env, pwc, s, n, MutVoidPtr::null(), MutVoidPtr::null())
+}
+
+fn wcrtomb(env: &mut Environment, s: MutPtr<u8>, wc: wchar_t) -> GuestUSize {
+    wcrtomb_l(env, s, wc, MutVoidPtr::null(), MutVoidPtr::null())
+}
+
+fn wcscoll(env: &mut Environment, a: ConstPtr<wchar_t>, b: ConstPtr<wchar_t>) -> i32 {
+    wcscoll_l(env, a, b, MutVoidPtr::null())
+}
+
+fn wcsxfrm(
+    env: &mut Environment,
+    dest: MutPtr<wchar_t>,
+    src: ConstPtr<wchar_t>,
+    n: GuestUSize,
+) -> GuestUSize {
+    wcsxfrm_l(env, dest, src, n, MutVoidPtr::null())
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(btowc(_)),
     export_c_func!(wctob(_)),
@@ -1043,8 +1071,12 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(wcstoll(_, _, _)),
     export_c_func!(wcstoull(_, _, _)),
     export_c_func!(wcstold(_, _)),
+    export_c_func!(wcrtomb(_, _)),
     export_c_func!(wcrtomb_l(_, _, _, _)),
+    export_c_func!(mbrtowc(_, _, _)),
     export_c_func!(mbrtowc_l(_, _, _, _, _)),
+    export_c_func!(wcscoll(_, _)),
+    export_c_func!(wcsxfrm(_, _, _)),
     export_c_func!(mbrlen_l(_, _, _, _)),
     export_c_func!(btowc_l(_, _)),
     export_c_func!(wctob_l(_, _)),

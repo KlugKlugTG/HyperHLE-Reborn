@@ -80,6 +80,28 @@ pub fn CGRectFromString(env: &mut Environment, string: id) -> CGRect {
         .unwrap_or_default()
 }
 
+/// `UIEdgeInsets UIEdgeInsetsFromString(NSString *string)`
+/// Parses UIKit's `{top, left, bottom, right}` representation. Apple
+/// documents that malformed input produces `UIEdgeInsetsZero`.
+/// <https://developer.apple.com/documentation/uikit/uiedgeinsetsfromstring>
+pub fn UIEdgeInsetsFromString(env: &mut Environment, string: id) -> UIEdgeInsets {
+    let raw = ns_string::to_rust_string(env, string);
+    let trimmed = raw.trim().trim_start_matches('{').trim_end_matches('}');
+    let values: Vec<f32> = trimmed
+        .split(',')
+        .filter_map(|part| part.trim().parse::<f32>().ok())
+        .collect();
+    if values.len() != 4 {
+        return UIEdgeInsets::default();
+    }
+    UIEdgeInsets {
+        top: values[0],
+        left: values[1],
+        bottom: values[2],
+        right: values[3],
+    }
+}
+
 pub fn NSStringFromCGPoint(env: &mut Environment, point: CGPoint) -> id {
     let s = ns_string::from_rust_string(env, point.to_string());
     autorelease(env, s)
@@ -124,6 +146,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGPointFromString(_)),
     export_c_func!(CGSizeFromString(_)),
     export_c_func!(CGRectFromString(_)),
+    export_c_func!(UIEdgeInsetsFromString(_)),
     export_c_func!(NSStringFromCGPoint(_)),
     export_c_func!(NSStringFromCGSize(_)),
     export_c_func!(NSStringFromCGRect(_)),
