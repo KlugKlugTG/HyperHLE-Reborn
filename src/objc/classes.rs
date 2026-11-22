@@ -1433,66 +1433,6 @@ pub fn objc_getClass(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class 
     nil
 }
 
-pub fn objc_begin_catch(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
-}
-
-pub fn objc_end_catch(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
-}
-
-pub fn objc_exception_throw(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
-}
-
 pub fn object_getClassName(env: &mut crate::Environment, obj: id) -> Class {
     if obj.is_null() {
         return nil;
@@ -2292,27 +2232,6 @@ pub fn __objc_deallocOnMainThreadHelper(env: &mut crate::Environment, context: M
     if !obj.is_null() {
         crate::objc::release(env, obj);
     }
-}
-
-pub fn ___objc_personality_v0(
-    _env: &mut crate::Environment,
-    version: i32,
-    actions: i32,
-    exception_class: u64,
-    exception_object: MutVoidPtr,
-    context: MutVoidPtr,
-) -> i32 {
-    log!(
-        "___objc_personality_v0 called! Exception handling is not fully implemented in touchHLE.\n\
-        version: {}, actions: {}, class: {:x}, object: {:?}, context: {:?}",
-        version,
-        actions,
-        exception_class,
-        exception_object,
-        context
-    );
-    // _URC_FATAL_PHASE1_ERROR
-    3
 }
 
 /// `_objc_msgForward` — the ObjC runtime's message forwarding trampoline.

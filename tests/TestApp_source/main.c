@@ -16,6 +16,7 @@
 
 int TestApp_cli_tests_main(void);
 int TestApp_gui_tests_main(int argc, char **argv);
+void TestApp_uncaught_objc_exception_probe(void);
 
 int main(int argc, char **argv) {
   if (argc == 2 && !strcmp(argv[1], "--trap-probe")) {
@@ -27,6 +28,8 @@ int main(int argc, char **argv) {
     fflush(stdout);
     __asm__ volatile("bkpt #0");
     return 0;
+  } else if (argc == 2 && !strcmp(argv[1], "--objc-exception-probe")) {
+    TestApp_uncaught_objc_exception_probe();
   } else if (argc == 2 && !strcmp(argv[1], "--cli-tests")) {
     printf("Starting command-line automated tests (omit --cli-tests for UIKit "
            "test app).\n");

@@ -148,7 +148,7 @@ fn run_test_app(
             .copied()
             .filter(|a| {
                 *a != "-ObjC"
-                    && *a != "-fno-objc-exceptions"
+                    && *a != "-fobjc-exceptions"
                     && *a != "-fno-objc-arc"
                     && *a != "-fno-objc-arc-exceptions"
             })
@@ -292,7 +292,7 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         stubs_lib_search_arg.as_str(),
         stubs_frameworks_search_arg.as_str(),
         "-ObjC",
-        "-fno-objc-exceptions",
+        "-fobjc-exceptions",
         // ARC is not available until IOS 5, so it can't be used.
         "-fno-objc-arc",
         "-fno-objc-arc-exceptions",
@@ -452,6 +452,20 @@ fn test_app() -> Result<(), Box<dyn Error>> {
             "{argument} failed for an unrelated reason: {stderr}"
         );
     }
+    let uncaught = Command::new(binary_path)
+        .arg(tests_dir.join("TestApp.app"))
+        .args(["--headless", "--args", "--objc-exception-probe"])
+        .output()?;
+    let stderr = String::from_utf8_lossy(&uncaught.stderr);
+    assert!(
+        !uncaught.status.success(),
+        "uncaught exception was recovered: {stderr}"
+    );
+    assert!(
+        stderr.contains("abort"),
+        "uncaught exception failed for an unrelated reason: {stderr}"
+    );
+
     run_test_app(
         &tests_dir,
         "AudioUnitThread",

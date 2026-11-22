@@ -48,6 +48,7 @@
 #import "SyncTester.h"
 
 int test_UITableViewCell_nib_controls(void);
+int test_ObjC_exception_catch_rethrow_cleanup(void);
 
 @interface NSObject (PerformSelectorOnMainThreadTest)
 - (void)performSelectorOnMainThread:(SEL)selector
@@ -7347,6 +7348,7 @@ struct {
     FUNC_DEF(test_CFURL),
     FUNC_DEF(test_CFNumberCompare_simple),
     FUNC_DEF(test_CFNumber_type_queries),
+    FUNC_DEF(test_ObjC_exception_catch_rethrow_cleanup),
     XFUNC_DEF(test_CFNumberCompare_extended),
     FUNC_DEF(test_memset_pattern),
     FUNC_DEF(test_CGGeometry),
