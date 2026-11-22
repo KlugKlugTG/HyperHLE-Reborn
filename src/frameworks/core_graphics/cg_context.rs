@@ -1527,7 +1527,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextSetGrayFillColor(_, _, _)),
     export_c_func!(CGContextFillRect(_, _)),
     export_c_func!(CGContextClearRect(_, _)),
-    export_c_func!(CGContextClip(_, _)),
+    export_c_func!(CGContextClip(_)),
     export_c_func!(CGContextClipToRect(_, _)),
     export_c_func!(CGContextConcatCTM(_, _)),
     export_c_func!(CGContextGetCTM(_)),
