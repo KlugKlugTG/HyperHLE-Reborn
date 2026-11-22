@@ -530,6 +530,7 @@ struct AppPickerDelegateHostObject {
     overlay_corner: Option<PerformanceOverlayCorner>,
     cheat_engine: Option<bool>,
     quick_menu: Option<bool>,
+    dladdr: Option<bool>,
     /// `Some(..)` only when the user just flipped the switch: `None` means no
     /// change is pending. The saved state is tri-state (see `PickerSettings`).
     rotation_fix: Option<bool>,
@@ -715,6 +716,9 @@ struct PickerSettings {
     gles_native: bool,
     force_composition: bool,
     show_fps: bool,
+    /// `--dladdr`: use the real dyld image list for `dladdr()`. Off by
+    /// default because the bare stub keeps many legacy apps bootable.
+    dladdr: bool,
     overlay_mode: PerformanceOverlayMode,
     overlay_corner: PerformanceOverlayCorner,
     /// `None` leaves these compatibility fixes to the command line and the
@@ -753,6 +757,7 @@ impl PickerSettings {
             gles_native,
             force_composition: options.force_composition,
             show_fps: options.performance_overlay_enabled,
+            dladdr: options.dladdr,
             overlay_mode: options.performance_overlay_mode.for_current_platform(),
             overlay_corner: options.performance_overlay_corner,
             // A flag passed on the command line is already an explicit choice;
@@ -804,6 +809,7 @@ impl PickerSettings {
                 "gles_native" => set_bool(value, &mut settings.gles_native),
                 "force_composition" => set_bool(value, &mut settings.force_composition),
                 "show_fps" => set_bool(value, &mut settings.show_fps),
+                "dladdr" => set_bool(value, &mut settings.dladdr),
                 "overlay_mode" => {
                     if let Some(mode) = PerformanceOverlayMode::from_short_name(value) {
                         settings.overlay_mode = mode;
@@ -862,6 +868,7 @@ impl PickerSettings {
              gles_native={}\n\
              force_composition={}\n\
              show_fps={}\n\
+             dladdr={}\n\
              overlay_mode={}\n\
              overlay_corner={}\n\
              rotation_fix={}\n\
@@ -883,6 +890,7 @@ impl PickerSettings {
             self.gles_native,
             self.force_composition,
             self.show_fps,
+            self.dladdr,
             self.overlay_mode.short_name(),
             self.overlay_corner.short_name(),
             optional_bool(self.rotation_fix),
@@ -1181,6 +1189,10 @@ const CLASSES: ClassExports = objc_classes! {
 - (())quickMenu:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).quick_menu = Some(switch_state);
+}
+- (())dladdr:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).dladdr = Some(switch_state);
 }
 - (())fullscreen:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -1496,6 +1508,7 @@ fn app_picker_inner(
     let mut quick_options_force_composition_override = Some(picker_settings.force_composition);
     let mut quick_options_cheat_engine = picker_settings.cheat_engine;
     let mut quick_options_quick_menu = picker_settings.quick_menu;
+    let mut quick_options_dladdr = picker_settings.dladdr;
     let mut quick_options_gles_native = picker_settings.gles_native;
     let mut device_state = DropdownState {
         selected: picker_settings.device_model_tag,
@@ -2118,6 +2131,8 @@ fn app_picker_inner(
             picker_settings.game_center_authenticated = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.quick_menu) {
             quick_options_quick_menu = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.dladdr) {
+            quick_options_dladdr = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.cheat_engine) {
             quick_options_cheat_engine = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.show_fps) {
@@ -2225,6 +2240,7 @@ fn app_picker_inner(
         picker_settings.memory_limit_mb = quick_options_memory_limit_mb;
         picker_settings.cheat_engine = quick_options_cheat_engine;
         picker_settings.quick_menu = quick_options_quick_menu;
+        picker_settings.dladdr = quick_options_dladdr;
         picker_settings.network = quick_options_network;
         picker_settings.analog_stick_tilt_controls = quick_options_analog_stick_tilt_controls;
         picker_settings.device_model_tag = device_state.selected;
@@ -2306,6 +2322,14 @@ fn app_picker_inner(
         option_args.push("--no-network-access".to_string());
     }
     option_args.push(quick_options_trainer_argument(quick_options_cheat_engine).to_string());
+    option_args.push(
+        if quick_options_dladdr {
+            "--dladdr"
+        } else {
+            "--no-dladdr"
+        }
+        .to_string(),
+    );
     option_args.push(
         if picker_settings.quick_menu {
             "--quick-menu"
@@ -4529,6 +4553,7 @@ fn setup_settings(
             SettingsRow::MemoryLimitDropdown,
             SettingsRow::Toggle("Cheat Engine", "cheatEngine:", picker_settings.cheat_engine, true),
             SettingsRow::Toggle("Quick menu", "quickMenu:", picker_settings.quick_menu, true),
+            SettingsRow::Toggle("Implement dladdr", "dladdr:", picker_settings.dladdr, true),
             SettingsRow::Toggle("Network access", "network:", picker_settings.network, true),
             SettingsRow::Toggle(
                 "Local Game Center sign-in",

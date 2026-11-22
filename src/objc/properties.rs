@@ -18,7 +18,7 @@ use super::classes::IvarInfo;
 use super::{id, msg, nil, release, retain, Class, ClassHostObject, ObjC, SEL};
 use crate::mem::{
     guest_size_of, ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr,
-    SafeRead,
+    SafeRead, SafeWrite,
 };
 use crate::{Environment, MutexType};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -65,6 +65,98 @@ pub fn ivar_getOffset(env: &mut Environment, ivar: MutVoidPtr) -> GuestISize {
     }
     let metadata: ivar_t = env.mem.read(ivar.cast());
     env.mem.read(metadata.offset) as GuestISize
+}
+
+/// `const char *ivar_getName(Ivar v)` — returns the ivar's name from the
+/// runtime metadata.
+/// <https://developer.apple.com/documentation/objectivec/1418498-ivar_getname>
+pub fn ivar_getName(env: &mut Environment, ivar: MutVoidPtr) -> ConstPtr<u8> {
+    if ivar.is_null() {
+        return ConstPtr::null();
+    }
+    let metadata: ivar_t = env.mem.read(ivar.cast());
+    metadata.name
+}
+
+/// `objc_property_attribute_t` from `<objc/runtime.h>`: two guest cstring
+/// pointers, `name` (the one-letter attribute code) and `value` (may be
+/// NULL).
+#[repr(C, packed)]
+pub struct objc_property_attribute_t {
+    name: ConstPtr<u8>,
+    value: ConstPtr<u8>,
+}
+impl SafeWrite for objc_property_attribute_t {}
+
+/// `objc_property_attribute_t *property_copyAttributeList(
+///     objc_property_t property, unsigned int *outCount)`
+///
+/// Parses the comma-separated attribute string stored in the guest's
+/// property metadata into the documented array of name/value pairs. The
+/// caller owns the returned array and strings (matching Apple's copy rule).
+/// <https://developer.apple.com/documentation/objectivec/1418670-property_copyattributelist>
+pub fn property_copyAttributeList(
+    env: &mut Environment,
+    property: ConstVoidPtr,
+    out_count: MutPtr<u32>,
+) -> MutPtr<objc_property_attribute_t> {
+    if !out_count.is_null() {
+        env.mem.write(out_count, 0);
+    }
+    if property.is_null() {
+        return MutPtr::null();
+    }
+    let metadata: property_t = env.mem.read(property.cast());
+    if metadata.attributes.is_null() {
+        return MutPtr::null();
+    }
+    let attributes = env.mem.cstr_at(metadata.attributes).to_vec();
+    let text = String::from_utf8_lossy(&attributes).into_owned();
+    let mut entries = Vec::new();
+    for token in text.split(',').filter(|token| !token.is_empty()) {
+        let (name, value) = match token.split_once(' ') {
+            Some((name, value)) => (name, value),
+            None => (&token[..1], &token[1..]),
+        };
+        // An attribute code is always a single character; keep the raw
+        // remainder as the value (Apple uses e.g. `T@"NSString"` and `V_name`).
+        if name.is_empty() {
+            continue;
+        }
+        let name = &name[..1];
+        entries.push((name.to_string(), value.to_string()));
+    }
+    let count = entries.len() as u32;
+    if count == 0 {
+        return MutPtr::null();
+    }
+    let array: MutPtr<objc_property_attribute_t> = env.mem.alloc(count * 8).cast();
+    for (index, (name, value)) in entries.iter().enumerate() {
+        let name_buf: MutPtr<u8> = env.mem.alloc(name.len() as u32 + 1).cast();
+        env.mem
+            .bytes_at_mut(name_buf, name.len() as u32)
+            .copy_from_slice(name.as_bytes());
+        env.mem.write(name_buf + name.len() as u32, 0u8);
+        let value_buf = if value.is_empty() {
+            MutPtr::null()
+        } else {
+            let buf: MutPtr<u8> = env.mem.alloc(value.len() as u32 + 1).cast();
+            env.mem
+                .bytes_at_mut(buf, value.len() as u32)
+                .copy_from_slice(value.as_bytes());
+            env.mem.write(buf + value.len() as u32, 0u8);
+            buf
+        };
+        env.mem.write(
+            array + index as u32,
+            objc_property_attribute_t {
+                name: name_buf.cast_const(),
+                value: value_buf.cast_const(),
+            },
+        );
+    }
+    env.mem.write(out_count, count);
+    array
 }
 
 /// The layout of an Objective-C property list in an app binary.

@@ -42,6 +42,45 @@ fn set_range(host: &mut NSIndexSetHostObject, location: NSUInteger, length: NSUI
     }
 }
 
+fn add_range(host: &mut NSIndexSetHostObject, location: NSUInteger, length: NSUInteger) {
+    if length == 0 {
+        return;
+    }
+    let end = (location as u64).saturating_add(length as u64);
+    let mut i = location as u64;
+    while i < end {
+        let index = i as NSUInteger;
+        match host.indexes.binary_search(&index) {
+            Ok(_) => {}
+            Err(pos) => host.indexes.insert(pos, index),
+        }
+        i = match i.checked_add(1) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+}
+
+fn remove_range(host: &mut NSIndexSetHostObject, location: NSUInteger, length: NSUInteger) {
+    if length == 0 {
+        return;
+    }
+    let end = (location as u64).saturating_add(length as u64);
+    host.indexes
+        .retain(|&index| (index as u64) < (location as u64) || (index as u64) >= end);
+}
+
+fn indexes_of(env: &mut crate::Environment, other: id) -> Vec<NSUInteger> {
+    if other == nil {
+        Vec::new()
+    } else {
+        env.objc
+            .borrow::<NSIndexSetHostObject>(other)
+            .indexes
+            .clone()
+    }
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -216,7 +255,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)mutableCopyWithZone:(NSZonePtr)_zone {
-    let new: id = msg_class![env; NSIndexSet alloc];
+    let new: id = msg_class![env; NSMutableIndexSet alloc];
     let idxs = env.objc.borrow::<NSIndexSetHostObject>(this).indexes.clone();
     env.objc.borrow_mut::<NSIndexSetHostObject>(new).indexes = idxs;
     autorelease(env, new)
@@ -230,6 +269,105 @@ pub const CLASSES: ClassExports = objc_classes! {
     let s = format!("<NSIndexSet: {} index(es) [{}]>", parts.len(), parts.join(", "));
     let ns = from_rust_string(env, s);
     autorelease(env, ns)
+}
+
+@end
+
+// NSMutableIndexSet adds the mutation half of Apple's index-set API.
+// <https://developer.apple.com/documentation/foundation/nsmutableindexset>
+@implementation NSMutableIndexSet: NSIndexSet
+
+- (id)copyWithZone:(NSZonePtr)_zone {
+    let new: id = msg_class![env; NSIndexSet alloc];
+    let idxs = env.objc.borrow::<NSIndexSetHostObject>(this).indexes.clone();
+    env.objc.borrow_mut::<NSIndexSetHostObject>(new).indexes = idxs;
+    new
+}
+
+- (())addIndex:(NSUInteger)index {
+    add_range(
+        env.objc.borrow_mut::<NSIndexSetHostObject>(this),
+        index,
+        1,
+    );
+}
+
+- (())addIndexes:(id)other { // NSIndexSet*
+    for index in indexes_of(env, other) {
+        add_range(
+            env.objc.borrow_mut::<NSIndexSetHostObject>(this),
+            index,
+            1,
+        );
+    }
+}
+
+- (())addIndexesInRange:(NSRange)range {
+    add_range(
+        env.objc.borrow_mut::<NSIndexSetHostObject>(this),
+        range.location,
+        range.length,
+    );
+}
+
+- (())removeIndex:(NSUInteger)index {
+    remove_range(
+        env.objc.borrow_mut::<NSIndexSetHostObject>(this),
+        index,
+        1,
+    );
+}
+
+- (())removeIndexes:(id)other { // NSIndexSet*
+    for index in indexes_of(env, other) {
+        remove_range(
+            env.objc.borrow_mut::<NSIndexSetHostObject>(this),
+            index,
+            1,
+        );
+    }
+}
+
+- (())removeIndexesInRange:(NSRange)range {
+    remove_range(
+        env.objc.borrow_mut::<NSIndexSetHostObject>(this),
+        range.location,
+        range.length,
+    );
+}
+
+- (())removeAllIndexes {
+    env.objc
+        .borrow_mut::<NSIndexSetHostObject>(this)
+        .indexes
+        .clear();
+}
+
+// Shifts every index greater than or equal to `index` by `delta`. Apple's
+// documentation does not allow the result to become negative: indexes that
+// would move below zero are removed instead of wrapping.
+// https://developer.apple.com/documentation/foundation/nsmutableindexset/1415640-shiftindexesstartingatindex
+- (())shiftIndexesStartingAtIndex:(NSUInteger)index by:(NSInteger)delta {
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    let mut shifted = Vec::with_capacity(host.indexes.len());
+    for &old in &host.indexes {
+        let new = if old >= index {
+            (old as i64) + (delta as i64)
+        } else {
+            old as i64
+        };
+        if new >= 0 {
+            shifted.push(new as NSUInteger);
+        }
+    }
+    host.indexes = shifted;
+}
+
+// Removes every index not present in `other`.
+- (())intersectIndexes:(id)other { // NSIndexSet*
+    let keep = indexes_of(env, other);
+    let host = env.objc.borrow_mut::<NSIndexSetHostObject>(this);
+    host.indexes.retain(|index| keep.binary_search(index).is_ok());
 }
 
 @end

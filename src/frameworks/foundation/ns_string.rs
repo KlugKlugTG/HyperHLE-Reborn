@@ -1674,6 +1674,32 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; file_manager fileExistsAtPath:path]
 }
 
+// Two more selectors from the same family of app-provided NSString
+// categories. Both are absent from Apple's public NSString API; apps ship
+// them as categories (often "NSString+UniqueId" or a model-object helper),
+// and partial IPA decryption can leave the category's selector names
+// unreadable, so the runtime falls through to us.
+//
+// `-uniqueId` must be stable for a given receiver and must not collide
+// between different objects. We derive it from the string contents plus the
+// object address, which keeps equal-but-distinct receivers distinct and
+// avoids introducing a retain cycle or a side table that would outlive the
+// string.
+- (id)uniqueId {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    to_rust_string(env, this).hash(&mut hasher);
+    let id = format!("{:016x}-{:08x}", hasher.finish(), this.to_bits());
+    let string = from_rust_string(env, id);
+    autorelease(env, string)
+}
+
+// The matching setter is a no-op: the value is only meaningful to the app's
+// own (missing) category, and returning nil/0 here would be no better than
+// the previous "does not respond" fallback. Keeping the selector implemented
+// suppresses the per-call warning without changing object lifetime.
+- (())setSignature:(id)_signature {}
+
 - (id)stringByAddingPercentEscapesUsingEncoding:(NSStringEncoding)encoding {
     let bytes = bytes_for_percent_escaping(env, this, encoding);
     let mut escaped = String::with_capacity(bytes.len());

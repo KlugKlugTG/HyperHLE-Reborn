@@ -19,7 +19,7 @@ use crate::bundle;
 use crate::fastmap::FxHashMap;
 use crate::mach_o::MachO;
 use crate::mem::{
-    guest_size_of, ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutVoidPtr, Ptr, SafeRead,
+    guest_size_of, ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr, SafeRead,
 };
 use std::collections::{HashMap, VecDeque};
 
@@ -900,7 +900,6 @@ impl ObjC {
                 "Warning: register_bin_classes: {garbage_entries} of {total_entries} ObjC class entries were garbage (truncated/zero-filled binary — the .ipa is likely damaged); the app may fail to start or misbehave."
             );
         }
-
     }
 
     pub(crate) fn reconcile_bin_class_ivars(&mut self, mem: &mut Mem) {
@@ -3493,6 +3492,166 @@ pub fn class_getProperty(
 
     // Property not found in hierarchy — return NULL (spec-compliant).
     ConstVoidPtr::null()
+}
+
+/// `BOOL class_addProtocol(Class cls, Protocol *protocol)` — adds the
+/// protocol to the class's declared protocol list. HyperHLE only needs the
+/// list for `class_conformsToProtocol:` / `class_copyProtocolList:`, which
+/// read this vector directly.
+/// <https://developer.apple.com/documentation/objectivec/1418767-class_addprotocol>
+pub fn class_addProtocol(env: &mut crate::Environment, cls: Class, protocol: id) -> bool {
+    if cls.is_null() || protocol.is_null() {
+        return false;
+    }
+    let Some(class_obj) = env
+        .objc
+        .get_host_object(cls)
+        .and_then(|host| host.as_any().downcast_ref::<ClassHostObject>())
+    else {
+        return false;
+    };
+    if class_obj.protocols.contains(&protocol) {
+        return false;
+    }
+    env.objc
+        .borrow_mut::<ClassHostObject>(cls)
+        .protocols
+        .push(protocol);
+    true
+}
+
+/// `const uint8_t *class_getIvarLayout(Class cls)` — weak-ivar layout.
+/// HyperHLE does not implement generational GC/weak references, so there is
+/// no layout to return; NULL is the documented answer for a class without
+/// weak ivars.
+/// <https://developer.apple.com/documentation/objectivec/1418606-class_getivarlayout>
+pub fn class_getIvarLayout(_env: &mut crate::Environment, _cls: Class) -> ConstPtr<u8> {
+    ConstPtr::null()
+}
+
+/// `BOOL class_addProperty(Class cls, const char *name,
+///     const objc_property_attribute_t *attributes, unsigned int count)`
+///
+/// HyperHLE's class metadata is built from the binary and has no writable
+/// property-list representation, so runtime-added properties are rejected
+/// rather than exposed as half-initialised metadata.
+/// <https://developer.apple.com/documentation/objectivec/1418666-class_addproperty>
+pub fn class_addProperty(
+    _env: &mut crate::Environment,
+    _cls: Class,
+    _name: ConstPtr<u8>,
+    _attributes: ConstVoidPtr,
+    _count: u32,
+) -> bool {
+    false
+}
+
+/// `struct objc_method_description *protocol_copyMethodDescriptionList(
+///     Protocol *p, BOOL isRequiredMethod, BOOL isInstanceMethod,
+///     unsigned int *outCount)` — our protocol metadata is read-only and
+/// reader helpers only look up one selector at a time, so there is no list
+/// to copy. Report an empty list instead of a NULL count.
+/// <https://developer.apple.com/documentation/objectivec/1418640-protocol_copymethoddescription>
+pub fn protocol_copyMethodDescriptionList(
+    env: &mut crate::Environment,
+    _proto: id,
+    _is_required: bool,
+    _is_instance: bool,
+    out_count: MutPtr<u32>,
+) -> ConstPtr<objc_method_description> {
+    if !out_count.is_null() {
+        env.mem.write(out_count, 0);
+    }
+    ConstPtr::null()
+}
+
+/// `Protocol **protocol_copyProtocolList(Protocol *proto,
+///     unsigned int *outCount)` — copies the protocol's directly adopted
+/// protocols from the guest `protocol_t` layout.
+/// <https://developer.apple.com/documentation/objectivec/1418762-protocol_copyprotocollist>
+pub fn protocol_copyProtocolList(
+    env: &mut crate::Environment,
+    proto: id,
+    out_count: MutPtr<u32>,
+) -> MutPtr<ConstVoidPtr> {
+    if !out_count.is_null() {
+        env.mem.write(out_count, 0);
+    }
+    if proto.is_null() {
+        return Ptr::null();
+    }
+    // `protocol_t` words: isa, name, protocols, ...
+    let words: ConstPtr<u32> = Ptr::from_bits(proto.to_bits());
+    let adopted_list: ConstVoidPtr = Ptr::from_bits(env.mem.read(words + 2));
+    let protocols = protocol_list_entries(&env.mem, adopted_list);
+    let Ok(count) = u32::try_from(protocols.len()) else {
+        return Ptr::null();
+    };
+    if count == 0 {
+        return Ptr::null();
+    }
+    let array: MutPtr<ConstVoidPtr> = env.mem.alloc(count * 4).cast();
+    for (index, protocol) in protocols.iter().enumerate() {
+        env.mem
+            .write(array + index as u32, protocol.cast_const().cast());
+    }
+    env.mem.write(out_count, count);
+    array
+}
+
+/// `id objc_constructInstance(Class cls, void *bytes)` — initialises an
+/// object from preallocated storage. HyperHLE always owns object storage
+/// (the host side needs a host-object record), so allocate a fresh instance
+/// with the same class; the guest-visible isa and ivar offsets are identical.
+/// <https://developer.apple.com/documentation/objectivec/1418643-objc_constructinstance>
+pub fn objc_constructInstance(env: &mut crate::Environment, cls: Class, bytes: MutVoidPtr) -> id {
+    if cls.is_null() {
+        return nil;
+    }
+    if !bytes.is_null() {
+        log_dbg!(
+            "objc_constructInstance({:?}, {:?}): host-owned storage required, allocating instead",
+            cls,
+            bytes
+        );
+    }
+    class_createInstance(env, cls, 0)
+}
+
+/// `Class objc_initializeClassPair(Class superclass, const char *name,
+///     Class cls, Class metalass)` (legacy runtime). The guest-provided
+/// class storage cannot carry HyperHLE host state, so allocate an equivalent
+/// dynamic pair and return it.
+/// <https://developer.apple.com/documentation/objectivec/1418697-objc_initializeclasspair>
+pub fn objc_initializeClassPair(
+    env: &mut crate::Environment,
+    superclass: Class,
+    name: ConstPtr<u8>,
+    cls: Class,
+    _meta_cls: Class,
+) -> Class {
+    let allocated = objc_allocateClassPair(env, superclass, name, 0);
+    if !allocated.is_null() {
+        log_dbg!(
+            "objc_initializeClassPair({:?}, ...): allocated dynamic pair {:?} (requested {:?})",
+            superclass,
+            allocated,
+            cls
+        );
+    }
+    allocated
+}
+
+/// Termination must use the guest C++ handler and must never return normally.
+/// https://github.com/apple-oss-distributions/objc4/blob/main/runtime/objc-exception.mm
+pub fn objc_terminate(env: &mut crate::Environment) {
+    let address = env
+        .dyld
+        .guest_cxxabi_export("__ZSt9terminatev")
+        .expect("objc_terminate requires the guest C++ termination handler");
+    env.cpu
+        .branch(crate::abi::GuestFunction::from_addr_with_thumb_bit(address));
+    env.note_guest_control_flow_redirect();
 }
 
 #[cfg(test)]

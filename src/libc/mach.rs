@@ -20,6 +20,7 @@
 pub mod arm;
 pub mod core_types;
 pub mod error;
+pub mod exception;
 pub mod host;
 pub mod init;
 pub mod mach_port;

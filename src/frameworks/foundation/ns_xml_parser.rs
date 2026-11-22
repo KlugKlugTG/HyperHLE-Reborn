@@ -10,7 +10,7 @@ use super::NSUInteger;
 use crate::environment::Environment;
 use crate::mem::ConstVoidPtr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, todo_objc_setter,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain,
     ClassExports, HostObject, NSZonePtr, SEL,
 };
 use quick_xml::events::{BytesStart, Event};
@@ -25,6 +25,11 @@ struct NSXMLParserHostObject {
     delegate: id,
     error: id, // NSError*
     should_resolve_external_entities: bool,
+    should_process_namespaces: bool,
+    should_report_namespace_prefixes: bool,
+    /// Set by `-abortParsing`; checked between events so a delegate can stop
+    /// a long document without unwinding through quick-xml.
+    aborted: bool,
 }
 impl HostObject for NSXMLParserHostObject {}
 
@@ -40,6 +45,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         delegate: nil,
         error: nil,
         should_resolve_external_entities: false,
+        should_process_namespaces: false,
+        should_report_namespace_prefixes: false,
+        aborted: false,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -70,10 +78,25 @@ pub const CLASSES: ClassExports = objc_classes! {
         env.objc.borrow_mut::<NSXMLParserHostObject>(this).should_resolve_external_entities = should_resolve;
 }
 - (())setShouldProcessNamespaces:(bool)should {
-    todo_objc_setter!(this, should);
+    env.objc
+        .borrow_mut::<NSXMLParserHostObject>(this)
+        .should_process_namespaces = should;
 }
+- (bool)shouldProcessNamespaces {
+    env.objc
+        .borrow::<NSXMLParserHostObject>(this)
+        .should_process_namespaces
+}
+
 - (())setShouldReportNamespacePrefixes:(bool)should {
-    todo_objc_setter!(this, should);
+    env.objc
+        .borrow_mut::<NSXMLParserHostObject>(this)
+        .should_report_namespace_prefixes = should;
+}
+- (bool)shouldReportNamespacePrefixes {
+    env.objc
+        .borrow::<NSXMLParserHostObject>(this)
+        .should_report_namespace_prefixes
 }
 
 - (id)parserError {
@@ -81,6 +104,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)parse {
+    // Every parse starts with a clean abort flag: a previous delegate may
+    // have aborted an earlier run, and Apple lets the same parser be reused.
+    env.objc
+        .borrow_mut::<NSXMLParserHostObject>(this)
+        .aborted = false;
+
     let data = env.objc.borrow::<NSXMLParserHostObject>(this).data;
 
     if data == nil {
@@ -119,6 +148,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     let mut consecutive_errors: usize = 0;
 
     loop {
+        // `-abortParsing` is documented as stopping the parser at the next
+        // opportunity. Check between events so we do not materialise the
+        // rest of a large document after the delegate asked us to stop.
+        if env.objc.borrow::<NSXMLParserHostObject>(this).aborted {
+            had_error = true;
+            error_position = reader.error_position() as i32;
+            error_message = String::from("Parser aborted by delegate");
+            break;
+        }
         match reader.read_event() {
             Ok(Event::Eof) => break,
             Ok(e) => {
@@ -167,6 +205,22 @@ pub const CLASSES: ClassExports = objc_classes! {
         had_error
     );
 
+    if env.objc.borrow::<NSXMLParserHostObject>(this).aborted {
+        let error = make_aborted_error(env);
+        env.objc.borrow_mut::<NSXMLParserHostObject>(this).error = error;
+        let delegate = env.objc.borrow::<NSXMLParserHostObject>(this).delegate;
+
+        let sel_err: SEL = env.objc.register_host_selector(
+            "parser:parseErrorOccurred:".to_string(),
+            &mut env.mem,
+        );
+        if delegate != nil && msg![env; delegate respondsToSelector:sel_err] {
+            let err = env.objc.borrow::<NSXMLParserHostObject>(this).error;
+            () = msg![env; delegate parser:this parseErrorOccurred:err];
+        }
+        return false;
+    }
+
     // ── Phase 2: Deliver events to delegate ───────────────────────────
     let delegate = env.objc.borrow::<NSXMLParserHostObject>(this).delegate;
 
@@ -178,7 +232,12 @@ pub const CLASSES: ClassExports = objc_classes! {
         () = msg![env; delegate parserDidStartDocument:this];
     }
 
+    let mut delivery_aborted = false;
     for event in &events {
+        if env.objc.borrow::<NSXMLParserHostObject>(this).aborted {
+            delivery_aborted = true;
+            break;
+        }
         match event {
             Event::Empty(e) => {
                 let name = safe_local_name(e.local_name().as_ref());
@@ -292,6 +351,20 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
 
+    if delivery_aborted {
+        let error = make_aborted_error(env);
+        env.objc.borrow_mut::<NSXMLParserHostObject>(this).error = error;
+        let sel_err: SEL = env.objc.register_host_selector(
+            "parser:parseErrorOccurred:".to_string(),
+            &mut env.mem,
+        );
+        if delegate != nil && msg![env; delegate respondsToSelector:sel_err] {
+            let err = env.objc.borrow::<NSXMLParserHostObject>(this).error;
+            () = msg![env; delegate parser:this parseErrorOccurred:err];
+        }
+        return false;
+    }
+
     // ── Phase 3: Finalize ─────────────────────────────────────────────
     let sel_did_end: SEL = env.objc.register_host_selector(
         "parserDidEndDocument:".to_string(),
@@ -325,6 +398,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     true
+}
+
+- (())abortParsing {
+    // <https://developer.apple.com/documentation/foundation/nsxmlparser/1408131-abortparsing>
+    env.objc
+        .borrow_mut::<NSXMLParserHostObject>(this)
+        .aborted = true;
 }
 
 - (bool)shouldResolveExternalEntities {
@@ -388,6 +468,13 @@ fn build_attributes_dict(env: &mut Environment, e: &BytesStart) -> id {
     }
 
     autorelease(env, dict)
+}
+
+/// `NSXMLParserDelegateAborted` is one of NSXMLParserError's documented
+/// codes (512); `-abortParsing` must make `-parse` report this error.
+/// <https://developer.apple.com/documentation/foundation/nsxmlparsererror>
+fn make_aborted_error(env: &mut Environment) -> id {
+    make_parse_error(env, 512, String::from("Parser aborted"))
 }
 
 fn make_parse_error(env: &mut Environment, code: i32, message: String) -> id {

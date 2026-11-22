@@ -1,4 +1,6 @@
-use crate::dyld::{ConstantExports, HostConstant, HostDylib, HostFunction};
+use crate::dyld::{
+    export_c_func, ConstantExports, FunctionExports, HostConstant, HostDylib, HostFunction,
+};
 use crate::mem::{ConstPtr, GuestUSize, MutPtr, MutVoidPtr};
 use crate::Environment;
 use std::sync::Mutex;
@@ -630,12 +632,139 @@ pub const FUNCTIONS: &[(&str, HostFunction)] = &[
     ),
 ];
 
+// ===== CVOpenGLESTextureCache / CVMetalTextureCache =====
+//
+// The guest gets opaque handles with the same lifetime rules as CoreVideo's
+// objects. HyperHLE's OpenGL ES backend owns guest GL names, so there is no
+// host texture to wrap here: -GetName returns 0 (the GL "no texture" name)
+// and the Metal texture getter returns nil. This keeps video-player code
+// that requires a non-NULL cache/texture object running without pretending a
+// real texture exists.
+
+fn alloc_cv_handle(env: &mut Environment) -> MutPtr<u8> {
+    let handle: MutPtr<u8> = env.mem.alloc(16).cast();
+    for i in 0..16u32 {
+        env.mem.write(handle + i, 0u8);
+    }
+    handle
+}
+
+fn CVOpenGLESTextureCacheCreate(
+    env: &mut Environment,
+    _allocator: MutVoidPtr,
+    _cache_attributes: MutVoidPtr,
+    _eagl_context: MutVoidPtr,
+    _texture_attributes: MutVoidPtr,
+    cache_out: MutPtr<u32>,
+) -> i32 {
+    if !cache_out.is_null() {
+        let handle = alloc_cv_handle(env);
+        env.mem.write(cache_out, handle.to_bits());
+    }
+    0
+}
+
+fn CVOpenGLESTextureCacheCreateTextureFromImage(
+    env: &mut Environment,
+    _allocator: MutVoidPtr,
+    _texture_cache: MutVoidPtr,
+    _source_image: MutVoidPtr,
+    _texture_attributes: MutVoidPtr,
+    _target: u32,
+    _internal_format: i32,
+    _width: i32,
+    _height: i32,
+    _format: u32,
+    _type: u32,
+    _plane_index: u32,
+    texture_out: MutPtr<u32>,
+) -> i32 {
+    if !texture_out.is_null() {
+        let handle = alloc_cv_handle(env);
+        env.mem.write(texture_out, handle.to_bits());
+    }
+    0
+}
+
+fn CVOpenGLESTextureGetName(_env: &mut Environment, _texture: MutVoidPtr) -> u32 {
+    0
+}
+
+fn CVOpenGLESTextureIsFlipped(_env: &mut Environment, _texture: MutVoidPtr) -> bool {
+    false
+}
+
+fn CVOpenGLESTextureCacheFlush(_env: &mut Environment, _texture_cache: MutVoidPtr, _flags: u32) {}
+
+fn CVMetalTextureCacheCreate(
+    env: &mut Environment,
+    _allocator: MutVoidPtr,
+    _cache_attributes: MutVoidPtr,
+    _metal_device: MutVoidPtr,
+    _texture_attributes: MutVoidPtr,
+    cache_out: MutPtr<u32>,
+) -> i32 {
+    if !cache_out.is_null() {
+        let handle = alloc_cv_handle(env);
+        env.mem.write(cache_out, handle.to_bits());
+    }
+    0
+}
+
+fn CVMetalTextureCacheCreateTextureFromImage(
+    env: &mut Environment,
+    _allocator: MutVoidPtr,
+    _texture_cache: MutVoidPtr,
+    _source_image: MutVoidPtr,
+    _texture_attributes: MutVoidPtr,
+    _pixel_format: u32,
+    _width: u32,
+    _height: u32,
+    _usage: u32,
+    _texture_type: u32,
+    _plane_index: u32,
+    texture_out: MutPtr<u32>,
+) -> i32 {
+    if !texture_out.is_null() {
+        let handle = alloc_cv_handle(env);
+        env.mem.write(texture_out, handle.to_bits());
+    }
+    0
+}
+
+fn CVMetalTextureGetTexture(_env: &mut Environment, _texture: MutVoidPtr) -> MutVoidPtr {
+    MutVoidPtr::null()
+}
+
+fn CVMetalTextureIsFlipped(_env: &mut Environment, _texture: MutVoidPtr) -> bool {
+    false
+}
+
+fn CVMetalTextureCacheFlush(_env: &mut Environment, _texture_cache: MutVoidPtr, _flags: u32) {}
+
+pub const TEXTURE_FUNCTIONS: FunctionExports = &[
+    export_c_func!(CVOpenGLESTextureCacheCreate(_, _, _, _, _)),
+    export_c_func!(CVOpenGLESTextureCacheCreateTextureFromImage(
+        _, _, _, _, _, _, _, _, _, _, _, _
+    )),
+    export_c_func!(CVOpenGLESTextureGetName(_)),
+    export_c_func!(CVOpenGLESTextureIsFlipped(_)),
+    export_c_func!(CVOpenGLESTextureCacheFlush(_, _)),
+    export_c_func!(CVMetalTextureCacheCreate(_, _, _, _, _)),
+    export_c_func!(CVMetalTextureCacheCreateTextureFromImage(
+        _, _, _, _, _, _, _, _, _, _, _
+    )),
+    export_c_func!(CVMetalTextureGetTexture(_)),
+    export_c_func!(CVMetalTextureIsFlipped(_)),
+    export_c_func!(CVMetalTextureCacheFlush(_, _)),
+];
+
 // ===== РЕГИСТРАЦИЯ ФРЕЙМВОРКА =====
 
 pub const DYLIB: HostDylib = HostDylib {
     path: "/System/Library/Frameworks/CoreVideo.framework/CoreVideo",
     aliases: &[],
-    function_exports: &[FUNCTIONS],
+    function_exports: &[FUNCTIONS, TEXTURE_FUNCTIONS],
     class_exports: &[],
     constant_exports: &[CONSTANTS],
 };

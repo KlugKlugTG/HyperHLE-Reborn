@@ -11,6 +11,8 @@
 //!
 //! - Apple's [iOS Manual Pages](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/) (contains what would be `man` pages if iOS had a command line)
 
+use crate::mem::MutPtr;
+
 pub mod aio;
 pub mod arpa;
 pub mod asl;
@@ -115,6 +117,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         mach::arm::task::FUNCTIONS,
         mach::arm::thread_act::FUNCTIONS,
         mach::error::FUNCTIONS,
+        mach::exception::FUNCTIONS,
         libkern::task::FUNCTIONS,
         mach::host::FUNCTIONS,
         mach::init::FUNCTIONS,
@@ -197,6 +200,8 @@ pub struct State {
     mach_ports: mach::mach_port::State,
     mach_error: mach::error::State,
     mmap: mmap::State,
+    /// Guest copy of the program name returned by `getprogname()`.
+    getprogname_buf: Option<MutPtr<u8>>,
 }
 
 impl State {

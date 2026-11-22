@@ -129,13 +129,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)pointerAtIndex:(NSUInteger)index {
     let host = env.objc.borrow::<PointerArrayHostObject>(this);
     let index = index as usize;
-    assert!(
-        index < host.pointers.len(),
-        "-[NSPointerArray pointerAtIndex:] index {} out of bounds (count {})",
-        index,
-        host.pointers.len()
-    );
-    host.pointers[index]
+    match host.pointers.get(index) {
+        Some(&pointer) => pointer,
+        None => {
+            // Apple raises NSRangeException here. Killing the emulator
+            // because a guest passed a stale index would hide the actual
+            // guest bug and lose the session, so log and return nil like
+            // the other Foundation collections do for out-of-range access.
+            log!(
+                "Warning: -[NSPointerArray pointerAtIndex:] index {} out of bounds (count {}); returning nil.",
+                index,
+                host.pointers.len()
+            );
+            nil
+        }
+    }
 }
 
 - (id)allObjects {
@@ -179,13 +187,16 @@ pub const CLASSES: ClassExports = objc_classes! {
         retain(env, pointer);
     }
     let host = env.objc.borrow_mut::<PointerArrayHostObject>(this);
-    assert!(
-        index <= host.pointers.len(),
-        "-[NSPointerArray insertPointer:atIndex:] index {} out of bounds (count {})",
-        index,
-        host.pointers.len()
-    );
-    host.pointers.insert(index, pointer);
+    if index > host.pointers.len() {
+        log!(
+            "Warning: -[NSPointerArray insertPointer:atIndex:] index {} out of bounds (count {}); appending instead.",
+            index,
+            host.pointers.len()
+        );
+        host.pointers.push(pointer);
+    } else {
+        host.pointers.insert(index, pointer);
+    }
 }
 
 - (())replacePointerAtIndex:(NSUInteger)index
@@ -195,12 +206,14 @@ pub const CLASSES: ClassExports = objc_classes! {
         retain(env, pointer);
     }
     let host = env.objc.borrow_mut::<PointerArrayHostObject>(this);
-    assert!(
-        index < host.pointers.len(),
-        "-[NSPointerArray replacePointerAtIndex:withPointer:] index {} out of bounds (count {})",
-        index,
-        host.pointers.len()
-    );
+    if index >= host.pointers.len() {
+        log!(
+            "Warning: -[NSPointerArray replacePointerAtIndex:withPointer:] index {} out of bounds (count {}); growing array.",
+            index,
+            host.pointers.len()
+        );
+        host.pointers.resize(index + 1, nil);
+    }
     let old = std::mem::replace(&mut host.pointers[index], pointer);
     if old != nil {
         release(env, old);
@@ -210,12 +223,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())removePointerAtIndex:(NSUInteger)index {
     let index = index as usize;
     let host = env.objc.borrow_mut::<PointerArrayHostObject>(this);
-    assert!(
-        index < host.pointers.len(),
-        "-[NSPointerArray removePointerAtIndex:] index {} out of bounds (count {})",
-        index,
-        host.pointers.len()
-    );
+    if index >= host.pointers.len() {
+        // Apple raises NSRangeException. Keep the guest alive and avoid the
+        // previous Rust panic (which took down the whole emulator); the
+        // caller's stale index is simply a no-op here.
+        log!(
+            "Warning: -[NSPointerArray removePointerAtIndex:] index {} out of bounds (count {}); ignoring.",
+            index,
+            host.pointers.len()
+        );
+        return;
+    }
     let removed = host.pointers.remove(index);
     if removed != nil {
         release(env, removed);

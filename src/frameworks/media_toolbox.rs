@@ -27,6 +27,34 @@ unsafe impl SafeRead for CMTime {}
 crate::abi::impl_GuestRet_for_large_struct!(CMTime);
 
 impl CMTime {
+    /// Build a `CMTime` from its four raw fields. Used by the CoreMedia
+    /// arithmetic helpers, which need to preserve the flags/epoch of the
+    /// operands.
+    pub fn from_parts(value: i64, timescale: i32, flags: u32, epoch: i64) -> Self {
+        Self {
+            value,
+            timescale,
+            flags,
+            epoch,
+        }
+    }
+
+    pub fn value(self) -> i64 {
+        self.value
+    }
+
+    pub fn timescale(self) -> i32 {
+        self.timescale
+    }
+
+    pub fn flags(self) -> u32 {
+        self.flags
+    }
+
+    pub fn epoch(self) -> i64 {
+        self.epoch
+    }
+
     pub const fn from_seconds(value: i64) -> Self {
         Self {
             value,

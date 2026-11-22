@@ -37,9 +37,10 @@ pub(crate) mod type_encoding;
 mod weak;
 
 pub use classes::{
-    __objc_deallocOnMainThreadHelper, class_addIvar, class_addMethod, class_conformsToProtocol,
-    class_copyIvarList, class_copyMethodList, class_copyPropertyList, class_copyProtocolList,
-    class_createInstance, class_getClassMethod, class_getInstanceMethod, class_getInstanceSize,
+    __objc_deallocOnMainThreadHelper, class_addIvar, class_addMethod, class_addProperty,
+    class_addProtocol, class_conformsToProtocol, class_copyIvarList, class_copyMethodList,
+    class_copyPropertyList, class_copyProtocolList, class_createInstance, class_getClassMethod,
+    class_getInstanceMethod, class_getInstanceSize, class_getIvarLayout,
     class_getMethodImplementation, class_getMethodImplementation_stret, class_getName,
     class_getProperty, class_getSuperclass, class_isMetaClass, class_replaceMethod,
     class_respondsToSelector, class_setSuperclass, method_copyArgumentType, method_copyReturnType,
@@ -47,15 +48,16 @@ pub use classes::{
     method_getName, method_getNumberOfArguments, method_getReturnType, method_getTypeEncoding,
     method_setImplementation, objc_alloc, objc_allocWithZone, objc_allocateClassPair,
     objc_autorelease, objc_autoreleasePoolPop, objc_autoreleasePoolPush,
-    objc_autoreleaseReturnValue, objc_classes, objc_copyClassList, objc_copyClassNamesForImage,
-    objc_copyImageNames, objc_disposeClassPair, objc_getClass, objc_getClassList,
-    objc_getMetaClass, objc_getProtocol, objc_getRequiredClass, objc_lookUpClass,
-    objc_readClassPair, objc_registerClassPair, objc_release, objc_retain, objc_retainAutorelease,
-    objc_retainAutoreleaseReturnValue, objc_retainAutoreleasedReturnValue, objc_retainBlock,
-    objc_storeStrong, objc_unsafeClaimAutoreleasedReturnValue, object_getClass,
-    object_getClassName, object_getIndexedIvars, protocol_conformsToProtocol,
-    protocol_getMethodDescription, protocol_getName, swift_getInitializedObjCClass, Class,
-    ClassExports, ClassTemplate,
+    objc_autoreleaseReturnValue, objc_classes, objc_constructInstance, objc_copyClassList,
+    objc_copyClassNamesForImage, objc_copyImageNames, objc_disposeClassPair, objc_getClass,
+    objc_getClassList, objc_getMetaClass, objc_getProtocol, objc_getRequiredClass,
+    objc_initializeClassPair, objc_lookUpClass, objc_readClassPair, objc_registerClassPair,
+    objc_release, objc_retain, objc_retainAutorelease, objc_retainAutoreleaseReturnValue,
+    objc_retainAutoreleasedReturnValue, objc_retainBlock, objc_storeStrong, objc_terminate,
+    objc_unsafeClaimAutoreleasedReturnValue, object_getClass, object_getClassName,
+    object_getIndexedIvars, protocol_conformsToProtocol, protocol_copyMethodDescriptionList,
+    protocol_copyProtocolList, protocol_getMethodDescription, protocol_getName,
+    swift_getInitializedObjCClass, Class, ClassExports, ClassTemplate,
 };
 pub use exceptions::{
     __objc_personality_v0, objc_begin_catch, objc_end_catch, objc_exception_rethrow,
@@ -70,8 +72,9 @@ pub use objects::{
     id, impl_HostObject_with_superclass, nil, AnyHostObject, HostObject, TrivialHostObject,
 };
 pub use properties::{
-    class_getInstanceVariable, ivar_getOffset, object_getInstanceVariable, object_getIvar,
-    object_setInstanceVariable, object_setIvar, todo_objc_setter,
+    class_getInstanceVariable, ivar_getName, ivar_getOffset, object_getInstanceVariable,
+    object_getIvar, object_setInstanceVariable, object_setIvar, property_copyAttributeList,
+    todo_objc_setter,
 };
 pub use selectors::{selector, SEL};
 
@@ -483,6 +486,16 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(class_getClassMethod(_, _)),
     export_c_func!(class_respondsToSelector(_, _)),
     export_c_func!(class_addMethod(_, _, _, _)),
+    export_c_func!(class_addProtocol(_, _)),
+    export_c_func!(class_addProperty(_, _, _, _)),
+    export_c_func!(class_getIvarLayout(_)),
+    export_c_func!(ivar_getName(_)),
+    export_c_func!(property_copyAttributeList(_, _)),
+    export_c_func!(protocol_copyMethodDescriptionList(_, _, _, _)),
+    export_c_func!(protocol_copyProtocolList(_, _)),
+    export_c_func!(objc_constructInstance(_, _)),
+    export_c_func!(objc_initializeClassPair(_, _, _, _)),
+    export_c_func!(objc_terminate()),
     export_c_func!(class_addIvar(_, _, _, _, _)),
     export_c_func!(class_getProperty(_, _)),
     export_c_func!(property_getName(_)),

@@ -914,6 +914,22 @@ fn pthread_threadid_np(env: &mut Environment, _thread: pthread_t, thread_id: Mut
     0
 }
 
+/// `int pthread_atfork(void (*prepare)(void), void (*parent)(void),
+///                     void (*child)(void));`
+///
+/// HyperHLE never forks (see `unistd::fork`), so there is no fork event to
+/// dispatch these handlers to. Registering them successfully is still
+/// important: libstdc++ and several analytics SDKs call this during static
+/// initialisation and treat a failure as a fatal error.
+fn pthread_atfork(
+    _env: &mut Environment,
+    _prepare: GuestFunction,
+    _parent: GuestFunction,
+    _child: GuestFunction,
+) -> i32 {
+    0
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     // Attributes
     export_c_func!(pthread_attr_init(_)),
@@ -937,6 +953,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(pthread_exit(_)),
     export_c_func!(pthread_join(_, _)),
     export_c_func!(pthread_detach(_)),
+    export_c_func!(pthread_atfork(_, _, _)),
     // Cancellation
     export_c_func!(pthread_cancel(_)),
     export_c_func!(pthread_setcancelstate(_, _)),

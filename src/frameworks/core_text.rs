@@ -1640,6 +1640,217 @@ fn CTParagraphStyleGetValueForSpecifier(
     false
 }
 
+// MARK: - Line / run metrics used by text-field and label layout
+
+fn line_string_range(env: &mut Environment, line: CTLineRef) -> CFRange {
+    if line.is_null() {
+        return CFRange { location: 0, length: 0 };
+    }
+    let text = line_text(env, line);
+    if text == nil {
+        return CFRange { location: 0, length: 0 };
+    }
+    let length: NSUInteger = msg![env; text length];
+    CFRange {
+        location: 0,
+        length: length as CFIndex,
+    }
+}
+
+/// `CFRange CTLineGetStringRange(CTLineRef line)`
+/// <https://developer.apple.com/documentation/coretext/1509536-ctlinegetstringrange>
+fn CTLineGetStringRange(env: &mut Environment, line: CTLineRef) -> CFRange {
+    line_string_range(env, line)
+}
+
+fn line_measure(env: &mut Environment, line: CTLineRef, text: &str) -> f32 {
+    let font = line_font(env, line);
+    if font == nil {
+        return 0.0;
+    }
+    let size: CGFloat = msg![env; font pointSize];
+    let font_obj = font_for_text(env, font, text).unwrap_or_else(Font::sans_regular);
+    font_obj.calculate_text_size(size, text, None).0
+}
+
+/// `CFIndex CTLineGetStringIndexForPosition(CTLineRef line, CGPoint position)`
+///
+/// CoreText returns the UTF-16 index of the character whose advance contains
+/// `position.x`. Our layout is a single left-aligned run, so walking the
+/// line's characters with the same font metrics used for drawing gives the
+/// expected hit-testing result for text fields and links.
+/// <https://developer.apple.com/documentation/coretext/1509569-ctlinegetstringindexforposition>
+fn CTLineGetStringIndexForPosition(
+    env: &mut Environment,
+    line: CTLineRef,
+    position: CGPoint,
+) -> CFIndex {
+    if line.is_null() {
+        return 0;
+    }
+    let text = line_text(env, line);
+    if text == nil {
+        return 0;
+    }
+    let text_str = to_rust_string(env, text).into_owned();
+    let mut utf16_index = 0usize;
+    let mut prefix = String::new();
+    for ch in text_str.chars() {
+        let mut candidate = prefix.clone();
+        candidate.push(ch);
+        let width = line_measure(env, line, &candidate);
+        if position.x < width {
+            return utf16_index as CFIndex;
+        }
+        prefix = candidate;
+        utf16_index += ch.len_utf16();
+    }
+    utf16_index as CFIndex
+}
+
+/// `CGFloat CTLineGetOffsetForStringIndex(CTLineRef line, CFIndex charIndex,
+///     CGFloat *secondaryOffset)`
+/// <https://developer.apple.com/documentation/coretext/1509561-ctlinegetoffsetforstringindex>
+fn CTLineGetOffsetForStringIndex(
+    env: &mut Environment,
+    line: CTLineRef,
+    char_index: CFIndex,
+    secondary_offset: MutPtr<CGFloat>,
+) -> CGFloat {
+    if line.is_null() || char_index <= 0 {
+        if !secondary_offset.is_null() {
+            env.mem.write(secondary_offset, 0.0);
+        }
+        return 0.0;
+    }
+    let text = line_text(env, line);
+    if text == nil {
+        return 0.0;
+    }
+    let text_str = to_rust_string(env, text).into_owned();
+    let mut utf16_seen = 0usize;
+    let mut prefix = String::new();
+    for ch in text_str.chars() {
+        if utf16_seen >= char_index as usize {
+            break;
+        }
+        prefix.push(ch);
+        utf16_seen += ch.len_utf16();
+    }
+    let offset = line_measure(env, line, &prefix);
+    if !secondary_offset.is_null() {
+        env.mem.write(secondary_offset, offset);
+    }
+    offset
+}
+
+/// `double CTLineGetPenOffsetForFlush(CTLineRef line, CGFloat flushFactor,
+///     double flushWidth)` — offsets a line inside a flush-width box.
+/// <https://developer.apple.com/documentation/coretext/1509565-ctlinegetpenoffsetforflush>
+fn CTLineGetPenOffsetForFlush(
+    env: &mut Environment,
+    line: CTLineRef,
+    flush_factor: CGFloat,
+    flush_width: f64,
+) -> f64 {
+    if line.is_null() {
+        return 0.0;
+    }
+    let width = CTLineGetTypographicBounds(
+        env,
+        line,
+        MutPtr::null(),
+        MutPtr::null(),
+        MutPtr::null(),
+    ) as f64;
+    (flush_width - width) * flush_factor as f64
+}
+
+/// `CTRunStatus CTRunGetStatus(CTRunRef run)` — our single run never carries
+/// the non-monotonic or right-to-left status bits.
+/// <https://developer.apple.com/documentation/coretext/1509621-ctrungetstatus>
+fn CTRunGetStatus(_env: &mut Environment, _run: CTRunRef) -> u32 {
+    0
+}
+
+/// `CFRange CTRunGetStringRange(CTRunRef run)`
+/// <https://developer.apple.com/documentation/coretext/1509573-ctrungetstringrange>
+fn CTRunGetStringRange(env: &mut Environment, run: CTRunRef) -> CFRange {
+    line_string_range(env, run)
+}
+
+/// `double CTRunGetTypographicBounds(CTRunRef run, CFRange range,
+///     CGFloat *ascent, CGFloat *descent, CGFloat *leading)`
+/// <https://developer.apple.com/documentation/coretext/1509614-ctrungettypographicbounds>
+fn CTRunGetTypographicBounds(
+    env: &mut Environment,
+    run: CTRunRef,
+    _range: CFRange,
+    ascent: MutPtr<CGFloat>,
+    descent: MutPtr<CGFloat>,
+    leading: MutPtr<CGFloat>,
+) -> f64 {
+    CTLineGetTypographicBounds(env, run, ascent, descent, leading) as f64
+}
+
+/// `CGFloat CTFontGetUnderlineThickness(CTFontRef font)`
+/// CoreText derives this from the font's underline metrics; for the system
+/// fonts used by iPhone OS apps a size-proportional approximation is enough
+/// for underline drawing code.
+/// <https://developer.apple.com/documentation/coretext/1509575-ctfontgetunderlinethickness>
+fn CTFontGetUnderlineThickness(env: &mut Environment, font: CTFontRef) -> CGFloat {
+    if font.is_null() {
+        return 0.0;
+    }
+    let ui_font = match env
+        .objc
+        .get_host_object(font)
+        .and_then(|host| host.as_any().downcast_ref::<CTFontHostObject>())
+    {
+        Some(host) => host.font,
+        None => return 0.0,
+    };
+    if ui_font == nil {
+        return 0.0;
+    }
+    let size: CGFloat = msg![env; ui_font pointSize];
+    (size * 0.08).max(0.5)
+}
+
+/// `CFStringRef CTFontCopyName(CTFontRef font, CFStringRef nameKey)`
+/// <https://developer.apple.com/documentation/coretext/1509609-ctfontcopyname>
+fn CTFontCopyName(env: &mut Environment, font: CTFontRef, name_key: CFStringRef) -> id {
+    if font.is_null() {
+        return nil;
+    }
+    let ui_font = match env
+        .objc
+        .get_host_object(font)
+        .and_then(|host| host.as_any().downcast_ref::<CTFontHostObject>())
+    {
+        Some(host) => host.font,
+        None => return nil,
+    };
+    if ui_font == nil {
+        return nil;
+    }
+    let key = if name_key == nil {
+        String::new()
+    } else {
+        to_rust_string(env, name_key).into_owned()
+    };
+    let name: id = if key.contains("Family") {
+        msg![env; ui_font familyName]
+    } else {
+        msg![env; ui_font fontName]
+    };
+    if name == nil {
+        nil
+    } else {
+        retain(env, name)
+    }
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CTGetCoreTextVersion()),
     export_c_func!(CTFontCreateWithGraphicsFont(_, _, _, _)),
@@ -1657,6 +1868,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CTFontGetLeading(_)),
     export_c_func!(CTFontGetSize(_)),
     export_c_func!(CTFontCopyPostScriptName(_)),
+    export_c_func!(CTFontCopyName(_, _)),
+    export_c_func!(CTFontGetUnderlineThickness(_)),
     export_c_func!(CTFontGetAdvancesForGlyphs(_, _, _, _, _)),
     export_c_func!(CTFontGetBoundingRectsForGlyphs(_, _, _, _, _)),
     export_c_func!(CTRunGetGlyphCount(_)),
@@ -1678,6 +1891,13 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CTLineDraw(_, _)),
     export_c_func!(CTLineGetGlyphCount(_)),
     export_c_func!(CTLineGetGlyphRuns(_)),
+    export_c_func!(CTLineGetStringRange(_)),
+    export_c_func!(CTLineGetStringIndexForPosition(_, _)),
+    export_c_func!(CTLineGetOffsetForStringIndex(_, _, _)),
+    export_c_func!(CTLineGetPenOffsetForFlush(_, _, _)),
+    export_c_func!(CTRunGetStatus(_)),
+    export_c_func!(CTRunGetStringRange(_)),
+    export_c_func!(CTRunGetTypographicBounds(_, _, _, _, _)),
     export_c_func!(CTFontGetGlyphsForCharacters(_, _, _, _)),
     export_c_func!(CTFontCopyGraphicsFont(_, _)),
     export_c_func!(CTFramesetterCreateWithAttributedString(_)),

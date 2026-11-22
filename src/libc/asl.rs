@@ -107,6 +107,33 @@ fn asl_log_message(
     0
 }
 
+/// `char *asl_get(aslmsg msg, const char *key)` — returns the value stored
+/// under `key`. HyperHLE does not keep an ASL message dictionary, so every
+/// lookup reports "not present" instead of dereferencing a guest pointer.
+fn asl_get(_env: &mut Environment, _msg: MutVoidPtr, _key: ConstPtr<u8>) -> MutVoidPtr {
+    MutVoidPtr::null()
+}
+
+/// `char *asl_key(aslmsg msg, uint32_t n)` — enumerates keys. No dictionary
+/// is stored, so there is no key at any index.
+fn asl_key(_env: &mut Environment, _msg: MutVoidPtr, _index: u32) -> MutVoidPtr {
+    MutVoidPtr::null()
+}
+
+/// `aslresponse asl_search(aslclient client, const char *query)` — returns
+/// NULL when no matching messages exist, which is always the case here.
+fn asl_search(_env: &mut Environment, _client: MutVoidPtr, _query: ConstPtr<u8>) -> MutVoidPtr {
+    MutVoidPtr::null()
+}
+
+/// `aslmsg aslresponse_next(aslresponse response)` — empty response.
+fn aslresponse_next(_env: &mut Environment, _response: MutVoidPtr) -> MutVoidPtr {
+    MutVoidPtr::null()
+}
+
+/// `void aslresponse_free(aslresponse response)`.
+fn aslresponse_free(_env: &mut Environment, _response: MutVoidPtr) {}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(asl_open(_, _, _)),
     export_c_func!(asl_close(_)),
@@ -122,4 +149,9 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(asl_remove_log_file(_, _)),
     export_c_func!(asl_set_filter(_, _)),
     export_c_func!(asl_log_message(_, _)),
+    export_c_func!(asl_get(_, _)),
+    export_c_func!(asl_key(_, _)),
+    export_c_func!(asl_search(_, _)),
+    export_c_func!(aslresponse_next(_)),
+    export_c_func!(aslresponse_free(_)),
 ];

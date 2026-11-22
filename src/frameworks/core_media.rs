@@ -26,10 +26,10 @@
 //! dylib they were declared under, so the binding still resolves correctly
 //! whether the app links CoreMedia or CoreVideo.
 
-use crate::abi::GuestArg;
+use crate::abi::{GuestArg, GuestFunction};
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::media_toolbox::CMTime;
-use crate::mem::{ConstVoidPtr, MutPtr};
+use crate::mem::{ConstVoidPtr, MutPtr, MutVoidPtr};
 use crate::Environment;
 
 /// `CMTime` is a 24-byte struct (`int64_t value`, `int32_t timescale`,
@@ -224,8 +224,225 @@ fn CMTimeGetSeconds(_env: &mut Environment, time: CMTime) -> f64 {
     time.as_seconds()
 }
 
+const CM_TIME_FLAGS_VALID: u32 = 0x1;
+
+fn cm_time_is_valid(time: CMTime) -> bool {
+    time.timescale() > 0 && (time.flags() & CM_TIME_FLAGS_VALID) != 0
+}
+
+fn write_cm_time(env: &mut Environment, out: MutPtr<u8>, time: CMTime) {
+    let mut words = [0u32; 6];
+    time.to_regs(&mut words);
+    for (word_index, word) in words.into_iter().enumerate() {
+        for (byte_index, byte) in word.to_le_bytes().into_iter().enumerate() {
+            env.mem
+                .write(out + (word_index * 4 + byte_index) as u32, byte);
+        }
+    }
+}
+
+fn write_invalid_cm_time(env: &mut Environment, out: MutPtr<u8>) {
+    write_cm_time(env, out, CMTime::default());
+}
+
+fn gcd(mut a: i64, mut b: i64) -> i64 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a.abs().max(1)
+}
+
+/// Adds or subtracts two `CMTime` values exactly in their least common
+/// timescale. Apple's `CMTimeAdd`/`CMTimeSubtract` return an invalid time
+/// when either operand is invalid or the result would overflow.
+/// <https://developer.apple.com/documentation/coremedia/cmtimeadd(_:_:)>
+fn cm_time_arithmetic(
+    env: &mut Environment,
+    out: MutPtr<u8>,
+    lhs: CMTime,
+    rhs: CMTime,
+    subtract: bool,
+) -> MutPtr<u8> {
+    if !cm_time_is_valid(lhs) || !cm_time_is_valid(rhs) {
+        write_invalid_cm_time(env, out);
+        return out;
+    }
+    let l_scale = lhs.timescale() as i64;
+    let r_scale = rhs.timescale() as i64;
+    let common = l_scale / gcd(l_scale, r_scale) * r_scale;
+    if common <= 0 || common > i32::MAX as i64 {
+        write_invalid_cm_time(env, out);
+        return out;
+    }
+    let l_value = lhs.value() as i128 * (common / l_scale) as i128;
+    let r_value = rhs.value() as i128 * (common / r_scale) as i128;
+    let value = if subtract {
+        l_value - r_value
+    } else {
+        l_value + r_value
+    };
+    let value = match i64::try_from(value) {
+        Ok(value) => value,
+        Err(_) => {
+            write_invalid_cm_time(env, out);
+            return out;
+        }
+    };
+    let result = CMTime::from_parts(value, common as i32, CM_TIME_FLAGS_VALID, 0);
+    write_cm_time(env, out, result);
+    out
+}
+
+fn CMTimeAdd(env: &mut Environment, out: MutPtr<u8>, lhs: CMTime, rhs: CMTime) -> MutPtr<u8> {
+    cm_time_arithmetic(env, out, lhs, rhs, false)
+}
+
+fn CMTimeSubtract(env: &mut Environment, out: MutPtr<u8>, lhs: CMTime, rhs: CMTime) -> MutPtr<u8> {
+    cm_time_arithmetic(env, out, lhs, rhs, true)
+}
+
+/// `int32_t CMTimeCompare(CMTime time1, CMTime time2)`
+/// <https://developer.apple.com/documentation/coremedia/cmtimesetisfinite>
+fn CMTimeCompare(_env: &mut Environment, lhs: CMTime, rhs: CMTime) -> i32 {
+    let a = lhs.as_seconds();
+    let b = rhs.as_seconds();
+    // Apple documents an ordering only for valid, finite times. Treat the
+    // NaN/indefinite cases as equal so callers that sort or de-duplicate
+    // timestamps do not get an undefined comparison.
+    if a.is_nan() || b.is_nan() {
+        return 0;
+    }
+    if a < b {
+        -1
+    } else if a > b {
+        1
+    } else {
+        0
+    }
+}
+
+/// `CMTimeRange CMTimeRangeMake(CMTime start, CMTime duration)` — the
+/// 48-byte struct is returned through the caller's hidden sret pointer.
+/// <https://developer.apple.com/documentation/coremedia/cmtimerangemake(_:_:)>
+fn CMTimeRangeMake(
+    env: &mut Environment,
+    out: MutPtr<u8>,
+    start: CMTime,
+    duration: CMTime,
+) -> MutPtr<u8> {
+    write_cm_time(env, out, start);
+    write_cm_time(env, out + 24u32, duration);
+    out
+}
+
+/// `CMTimeRange CMTimeRangeFromTimeToTime(CMTime start, CMTime end)`.
+/// <https://developer.apple.com/documentation/coremedia/cmtimerangefromtimetotime(_:_:)>
+fn CMTimeRangeFromTimeToTime(
+    env: &mut Environment,
+    out: MutPtr<u8>,
+    start: CMTime,
+    end: CMTime,
+) -> MutPtr<u8> {
+    write_cm_time(env, out, start);
+    let mut duration_out = [0u8; 24];
+    // Reuse the arithmetic path by writing into a stack-like guest buffer.
+    // `MutPtr` has no stack storage, so allocate a tiny scratch block.
+    let scratch: MutPtr<u8> = env.mem.alloc(24).cast();
+    cm_time_arithmetic(env, scratch, end, start, true);
+    for i in 0..24u32 {
+        duration_out[i as usize] = env.mem.read(scratch + i);
+    }
+    env.mem.free(scratch.cast());
+    for (i, byte) in duration_out.into_iter().enumerate() {
+        env.mem.write(out + 24u32 + i as u32, byte);
+    }
+    out
+}
+
+/// Sample-buffer creation is not backed by a real media pipeline, but apps
+/// (and AVFoundation's own shims) only need a stable non-NULL handle that the
+/// other CMSampleBuffer stubs accept. Allocate a small guest block per call.
+fn CMSampleBufferCreate(
+    env: &mut Environment,
+    _allocator: MutVoidPtr,
+    _data_buffer: MutVoidPtr,
+    _data_ready: u32,
+    _make_data_ready_callback: GuestFunction,
+    _make_data_ready_refcon: MutVoidPtr,
+    _format_description: MutVoidPtr,
+    _num_samples: i32,
+    _num_sample_timing_entries: i32,
+    _sample_timing_array: ConstVoidPtr,
+    _num_sample_size_entries: i32,
+    _sample_size_array: ConstVoidPtr,
+    sample_buffer_out: MutPtr<u32>,
+) -> i32 {
+    if !sample_buffer_out.is_null() {
+        let handle: MutPtr<u8> = env.mem.alloc(16).cast();
+        env.mem.write(sample_buffer_out, handle.to_bits());
+    }
+    0
+}
+
+fn CMSampleBufferSetDataReady(_env: &mut Environment, _sample_buffer: MutVoidPtr) -> i32 {
+    0
+}
+
+fn CMSampleBufferSetDataBufferFromAudioBufferList(
+    _env: &mut Environment,
+    _sample_buffer: MutVoidPtr,
+    _block_buffer_structure_allocator: MutVoidPtr,
+    _block_buffer_block_allocator: MutVoidPtr,
+    _flags: u32,
+    _buffer_list: ConstVoidPtr,
+) -> i32 {
+    0
+}
+
+/// `OSStatus CMSampleBufferGetPresentationTimeStamp(CMTime *out,
+///     CMSampleBufferRef sbuf)` — stubs report a valid zero timestamp, which
+/// keeps AVFoundation's timeline code on the "no media yet" path.
+fn CMSampleBufferGetPresentationTimeStamp(
+    env: &mut Environment,
+    out: MutPtr<u8>,
+    _sample_buffer: MutVoidPtr,
+) -> i32 {
+    write_cm_time(env, out, CMTime::from_seconds(0));
+    0
+}
+
+fn CMAudioFormatDescriptionCreate(
+    env: &mut Environment,
+    _allocator: MutVoidPtr,
+    _asbd: ConstVoidPtr,
+    _layout_size: u32,
+    _layout: ConstVoidPtr,
+    _magic_cookie_size: u32,
+    _magic_cookie: ConstVoidPtr,
+    _extensions: MutVoidPtr,
+    format_description_out: MutPtr<u32>,
+) -> i32 {
+    if !format_description_out.is_null() {
+        let handle: MutPtr<u8> = env.mem.alloc(16).cast();
+        env.mem.write(format_description_out, handle.to_bits());
+    }
+    0
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CMTimeMake(_, _, _)),
+    export_c_func!(CMTimeAdd(_, _, _)),
+    export_c_func!(CMTimeSubtract(_, _, _)),
+    export_c_func!(CMTimeCompare(_, _)),
+    export_c_func!(CMTimeRangeMake(_, _, _)),
+    export_c_func!(CMTimeRangeFromTimeToTime(_, _, _)),
+    export_c_func!(CMSampleBufferCreate(_, _, _, _, _, _, _, _, _, _, _, _)),
+    export_c_func!(CMSampleBufferSetDataReady(_)),
+    export_c_func!(CMSampleBufferSetDataBufferFromAudioBufferList(_, _, _, _, _)),
+    export_c_func!(CMSampleBufferGetPresentationTimeStamp(_, _)),
+    export_c_func!(CMAudioFormatDescriptionCreate(_, _, _, _, _, _, _, _)),
     export_c_func!(CMTimeMakeWithSeconds(_, _, _)),
     export_c_func!(CMTimeGetSeconds(_)),
     export_c_func!(CMFormatDescriptionGetMediaType(_)),

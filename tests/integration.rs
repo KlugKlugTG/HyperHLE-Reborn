@@ -496,6 +496,15 @@ fn test_app() -> Result<(), Box<dyn Error>> {
             && stderr.contains("terminate called after throwing an instance of 'NSException'"),
         "uncaught exception failed for an unrelated reason: {stderr}"
     );
+    let termination = Command::new(binary_path)
+        .arg(tests_dir.join("TestApp.app"))
+        .args(["--headless", "--args", "--objc-terminate-probe"])
+        .output()?;
+    let stderr = String::from_utf8_lossy(&termination.stderr);
+    assert!(
+        !termination.status.success() && stderr.contains("Guest received fatal signal 6"),
+        "objc_terminate did not terminate through the guest runtime: {stderr}"
+    );
 
     run_test_app(
         &tests_dir,

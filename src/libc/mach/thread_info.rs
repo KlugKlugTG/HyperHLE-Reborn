@@ -13,7 +13,7 @@ use crate::dyld::{export_c_func, FunctionExports};
 use crate::environment::ThreadBlock;
 use crate::libc::mach::core_types::{boolean_t, integer_t, natural_t};
 use crate::libc::mach::port::{mach_port_t, MACH_PORT_DEAD, MACH_PORT_NULL};
-use crate::mem::{guest_size_of, MutPtr, SafeRead};
+use crate::mem::{guest_size_of, MutPtr, MutVoidPtr, SafeRead};
 use crate::Environment;
 
 // TODO: Move these common definitions into separate modules
@@ -463,11 +463,40 @@ fn thread_get_exception_ports(
     KERN_SUCCESS
 }
 
+/// `kern_return_t thread_swap_exception_ports(thread_act_t thread,
+///     exception_mask_t exception_mask, mach_port_t new_port,
+///     exception_behavior_t behavior, thread_state_flavor_t new_flavor,
+///     exception_mask_array_t masks, mach_port_array_t old_ports,
+///     exception_behavior_array_t behaviors,
+///     thread_state_flavor_array_t flavors,
+///     mach_msg_type_number_t *masksCnt)` — HyperHLE never delivers Mach
+///     exceptions; accept the swap and report no old handlers.
+/// <https://web.mit.edu/darwin/src/modules/xnu/osfmk/man/thread_swap_exception_ports.html>
+fn thread_swap_exception_ports(
+    env: &mut Environment,
+    _thread: u32,
+    _exception_mask: u32,
+    _new_port: u32,
+    _behavior: u32,
+    _new_flavor: u32,
+    _masks: MutVoidPtr,
+    _old_ports: MutVoidPtr,
+    _behaviors: MutVoidPtr,
+    _flavors: MutVoidPtr,
+    masks_count: MutPtr<u32>,
+) -> kern_return_t {
+    if !masks_count.is_null() {
+        env.mem.write(masks_count, 0);
+    }
+    KERN_SUCCESS
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(thread_get_exception_ports(_, _, _, _, _, _, _)),
     export_c_func!(thread_info(_, _, _, _)),
     export_c_func!(thread_policy_set(_, _, _, _)),
     export_c_func!(thread_resume(_)),
     export_c_func!(thread_set_exception_ports(_, _, _, _, _)),
+    export_c_func!(thread_swap_exception_ports(_, _, _, _, _, _, _, _, _, _)),
     export_c_func!(thread_suspend(_)),
 ];
