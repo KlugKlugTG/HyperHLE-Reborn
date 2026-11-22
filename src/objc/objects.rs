@@ -491,6 +491,7 @@ mod allocation_tests {
     fn immortal_subclass_reserves_and_zeroes_all_guest_ivars() {
         let mut objc = super::super::ObjC::new();
         let mut mem = Mem::new();
+        mem.set_null_segment_size(crate::mem::PAGE_SIZE);
         let class = Ptr::from_bits(0x2000);
         let instance_size = 60;
         let host = ClassHostObject {

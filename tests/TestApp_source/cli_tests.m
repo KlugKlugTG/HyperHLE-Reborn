@@ -66,6 +66,39 @@ int test_UITableViewCell_nib_controls(void);
 
 extern NSString *const NSDefaultRunLoopMode;
 
+@interface ApplicationStorageProbe : UIApplication {
+@public
+  void *engine;
+  unsigned long marker;
+  unsigned char bytes[48];
+}
+@end
+@implementation ApplicationStorageProbe
+@end
+
+// Even a singleton's guest subclass needs zeroed storage for its own ivars.
+// https://developer.apple.com/documentation/uikit/uiapplicationmain(_:_:_:_:)
+int test_UIApplication_subclass_storage(void) {
+  ApplicationStorageProbe *app = [ApplicationStorageProbe alloc];
+  NSObject *neighbour = [NSObject new];
+  int result = 0;
+  if (app->engine != NULL || app->marker != 0)
+    result = -1;
+  for (unsigned i = 0; i < sizeof(app->bytes); i++) {
+    if (app->bytes[i] != 0)
+      result = -2;
+  }
+  app->engine = app;
+  app->marker = 0x12345678;
+  memset(app->bytes, 0xa5, sizeof(app->bytes));
+  if ([neighbour class] != [NSObject class] || app->engine != app ||
+      app->marker != 0x12345678)
+    result = -3;
+  [neighbour release];
+  [app release];
+  return result;
+}
+
 @interface NibTopLevelProbe : NSObject
 - (id)initWithCoder:(id)coder;
 @end
@@ -7220,6 +7253,7 @@ struct {
     FUNC_DEF(test_CFStringFind),
     FUNC_DEF(test_strcspn),
     FUNC_DEF(test_mbstowcs),
+    FUNC_DEF(test_UIApplication_subclass_storage),
     FUNC_DEF(test_c_locale_codecs_and_collation),
     FUNC_DEF(test_time_format_buffer_limits),
     FUNC_DEF(test_wide_numeric_prefixes),
