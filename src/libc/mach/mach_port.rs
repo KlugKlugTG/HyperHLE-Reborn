@@ -41,7 +41,7 @@ impl Default for State {
 }
 
 impl State {
-    fn allocate(&mut self) -> Option<u32> {
+    pub(crate) fn allocate(&mut self) -> Option<u32> {
         let name = self.next_name;
         self.next_name = name.checked_add(4)?;
         self.ports.insert(name, Port::default());
@@ -140,12 +140,90 @@ fn mach_port_destroy(env: &mut Environment, task: u32, name: u32) -> kern_return
     KERN_SUCCESS
 }
 
+/// `kern_return_t mach_port_move_member(ipc_space_t task,
+///     mach_port_name_t member, mach_port_name_t after)` — moves a port into
+/// a port set. HyperHLE has no port-set membership, but accepting the move
+/// keeps code that assembles a set with a single port working.
+/// <https://web.mit.edu/darwin/src/modules/xnu/osfmk/man/mach_port_move_member.html>
+fn mach_port_move_member(
+    env: &mut Environment,
+    task: u32,
+    member: u32,
+    after: u32,
+) -> kern_return_t {
+    if task != MACH_TASK_SELF {
+        return KERN_INVALID_ARGUMENT;
+    }
+    if !env.libc_state.mach_ports.ports.contains_key(&member) {
+        return KERN_INVALID_NAME;
+    }
+    if after != 0 && !env.libc_state.mach_ports.ports.contains_key(&after) {
+        return KERN_INVALID_NAME;
+    }
+    KERN_SUCCESS
+}
+
+/// `kern_return_t mach_port_request_notification(ipc_space_t task,
+///     mach_port_name_t name, mach_msg_id_t msgid, mach_port_mscount_t zero,
+///     mach_port_t notify, mach_msg_type_name_t notifyPoly,
+///     mach_port_mscount_t *mscount)` — HyperHLE does not deliver Mach
+///     messages, so record no notification and report a zero message count.
+fn mach_port_request_notification(
+    env: &mut Environment,
+    task: u32,
+    name: u32,
+    _msgid: i32,
+    _zero: u32,
+    _notify: u32,
+    _notify_poly: u32,
+    mscount: MutPtr<u32>,
+) -> kern_return_t {
+    if task != MACH_TASK_SELF {
+        return KERN_INVALID_ARGUMENT;
+    }
+    if !env.libc_state.mach_ports.ports.contains_key(&name) {
+        return KERN_INVALID_NAME;
+    }
+    if !mscount.is_null() {
+        env.mem.write(mscount, 0);
+    }
+    KERN_SUCCESS
+}
+
+/// `kern_return_t mach_make_memory_entry_64(vm_map_t target_map,
+///     memory_object_size_t *size, memory_object_offset_t offset,
+///     vm_prot_t permission, mach_port_t *object_handle,
+///     mach_port_t parent_handle)` — HyperHLE has no memory-object server.
+///     Return a fresh, inert port name so callers that only need a non-NULL
+///     handle can continue; the mapping itself is already backed by guest
+///     memory.
+fn mach_make_memory_entry_64(
+    env: &mut Environment,
+    _target_map: u32,
+    _size: MutPtr<u64>,
+    _offset: u64,
+    _permission: i32,
+    object_handle: MutPtr<u32>,
+    _parent_handle: u32,
+) -> kern_return_t {
+    let Some(port) = env.libc_state.mach_ports.allocate() else {
+        return KERN_NO_SPACE;
+    };
+    if !object_handle.is_null() {
+        env.mem.write(object_handle, port);
+    }
+    KERN_SUCCESS
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(mach_port_allocate(_, _, _)),
     export_c_func!(mach_port_deallocate(_, _)),
     export_c_func!(mach_port_insert_right(_, _, _, _)),
     export_c_func!(mach_port_mod_refs(_, _, _, _)),
     export_c_func!(mach_port_destroy(_, _)),
+    export_c_func!(mach_port_move_member(_, _, _)),
+    export_c_func!(mach_port_request_notification(_, _, _, _, _, _, _)),
+    export_c_func!(mach_make_memory_entry_64(_, _, _, _, _, _)),
 ];
 
 #[cfg(test)]

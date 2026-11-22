@@ -993,6 +993,15 @@ fn getsectdatafromheader(
     MutVoidPtr::from_bits(header_bits.wrapping_sub(text_vmaddr).wrapping_add(addr))
 }
 
+/// `int NSVersionOfLinkTimeLibrary(const char *libraryName)` — version of
+/// the SDK library the app was linked against. HyperHLE resolves frameworks
+/// dynamically and does not record per-library link versions; 0 means
+/// "unknown", which makes callers fall back to their baseline behaviour.
+/// <https://developer.apple.com/documentation/system/1418187-nsversionoflinktimelibrary>
+fn NSVersionOfLinkTimeLibrary(_env: &mut Environment, _library_name: ConstPtr<u8>) -> i32 {
+    0
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(get_end()),
     export_c_func!(get_etext()),
@@ -1005,6 +1014,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(_dyld_get_image_header(_)),
     export_c_func!(_dyld_get_image_name(_)),
     export_c_func!(_dyld_get_image_vmaddr_slide(_)),
+    export_c_func!(NSVersionOfLinkTimeLibrary(_)),
     export_c_func!(_dyld_register_func_for_add_image(_)),
     export_c_func!(_dyld_register_func_for_remove_image(_)),
     export_c_func!(NXGetArchInfoFromCpuType(_, _)),

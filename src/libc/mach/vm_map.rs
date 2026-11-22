@@ -166,6 +166,54 @@ pub fn vm_allocate(
     KERN_SUCCESS
 }
 
+/// `kern_return_t vm_map(vm_map_t target_task, vm_address_t *address,
+///     vm_size_t size, vm_address_t mask, int flags, vm_map_t src_task,
+///     vm_address_t src_address, boolean_t copy, vm_prot_t cur_protection,
+///     vm_prot_t max_protection, vm_inherit_t inheritance)` — legacy
+///     `vm_map` maps anonymous (or copied) memory. HyperHLE backs it with the
+///     guest heap and records the region for `vm_deallocate`.
+/// <https://web.mit.edu/darwin/src/modules/xnu/osfmk/man/vm_map.html>
+fn vm_map(
+    env: &mut Environment,
+    target_task: vm_map_t,
+    address_ptr: MutPtr<mach_vm_address_t>,
+    size: mach_vm_size_t,
+    _mask: mach_vm_address_t,
+    _flags: i32,
+    _src_task: vm_map_t,
+    src_address: mach_vm_address_t,
+    copy: bool,
+    _cur_protection: vm_prot_t,
+    _max_protection: vm_prot_t,
+    _inheritance: vm_inherit_t,
+) -> kern_return_t {
+    if target_task != MACH_TASK_SELF || address_ptr.is_null() {
+        return KERN_INVALID_ARGUMENT;
+    }
+    let rounded_size = round_up_to_page(size);
+    let allocated = env.mem.alloc(rounded_size);
+    if allocated.is_null() {
+        crate::mem::log_out_of_memory("vm_map", rounded_size);
+        return KERN_NO_SPACE;
+    }
+    let address = allocated.to_bits();
+    if copy && src_address != 0 {
+        let source = env
+            .mem
+            .bytes_at(ConstPtr::from_bits(src_address), size)
+            .to_vec();
+        env.mem
+            .bytes_at_mut(allocated.cast(), size)
+            .copy_from_slice(&source);
+    }
+    env.mem.write(address_ptr, address);
+    env.libc_state
+        .mach_vm
+        .allocations
+        .insert(address, VmRegion { size, rounded_size, released: Vec::new() });
+    KERN_SUCCESS
+}
+
 fn vm_deallocate(
     env: &mut Environment,
     target_task: vm_map_t,
@@ -587,6 +635,7 @@ fn vm_region_recurse(
 
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(vm_allocate(_, _, _, _)),
+    export_c_func!(vm_map(_, _, _, _, _, _, _, _, _, _, _)),
     export_c_func!(vm_deallocate(_, _, _)),
     export_c_func!(vm_read_overwrite(_, _, _, _, _)),
     export_c_func!(vm_remap(_, _, _, _, _, _, _, _, _, _, _)),

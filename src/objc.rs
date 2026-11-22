@@ -36,7 +36,8 @@ pub(crate) mod type_encoding;
 mod weak;
 
 pub use classes::{
-    __objc_deallocOnMainThreadHelper, class_addIvar, class_addMethod, class_conformsToProtocol,
+    __objc_deallocOnMainThreadHelper, class_addIvar, class_addMethod, class_addProperty,
+    class_addProtocol, class_conformsToProtocol, class_getIvarLayout,
     class_copyIvarList, class_copyMethodList, class_copyPropertyList, class_copyProtocolList,
     class_createInstance,
     class_getClassMethod, class_getInstanceMethod, class_getInstanceSize,
@@ -50,8 +51,10 @@ pub use classes::{
     objc_autoreleaseReturnValue, objc_begin_catch, objc_classes, objc_copyClassList,
     objc_copyClassNamesForImage, objc_copyImageNames, objc_disposeClassPair, objc_end_catch,
     objc_exception_throw, objc_getClass, objc_getClassList, objc_getMetaClass, objc_getProtocol,
-    objc_getRequiredClass, objc_lookUpClass, objc_readClassPair, objc_registerClassPair,
-    objc_release, objc_retain, objc_retainAutorelease, objc_retainAutoreleaseReturnValue,
+    objc_getRequiredClass, objc_initializeClassPair, objc_lookUpClass, objc_readClassPair,
+    objc_registerClassPair, objc_release, objc_retain, objc_retainAutorelease,
+    objc_retainAutoreleaseReturnValue, objc_constructInstance, objc_exception_rethrow,
+    objc_terminate, protocol_copyMethodDescriptionList, protocol_copyProtocolList,
     objc_retainAutoreleasedReturnValue, objc_retainBlock, objc_storeStrong,
     objc_unsafeClaimAutoreleasedReturnValue, object_getClass, object_getClassName,
     object_getIndexedIvars, protocol_conformsToProtocol, protocol_getMethodDescription,
@@ -66,8 +69,9 @@ pub use objects::{
     id, impl_HostObject_with_superclass, nil, AnyHostObject, HostObject, TrivialHostObject,
 };
 pub use properties::{
-    class_getInstanceVariable, ivar_getOffset, object_getInstanceVariable, object_getIvar,
-    object_setInstanceVariable, object_setIvar, todo_objc_setter,
+    class_getInstanceVariable, ivar_getName, ivar_getOffset, object_getInstanceVariable,
+    object_getIvar, object_setInstanceVariable, object_setIvar, property_copyAttributeList,
+    todo_objc_setter,
 };
 pub use selectors::{selector, SEL};
 
@@ -441,6 +445,17 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(class_getClassMethod(_, _)),
     export_c_func!(class_respondsToSelector(_, _)),
     export_c_func!(class_addMethod(_, _, _, _)),
+    export_c_func!(class_addProtocol(_, _)),
+    export_c_func!(class_addProperty(_, _, _, _)),
+    export_c_func!(class_getIvarLayout(_)),
+    export_c_func!(ivar_getName(_)),
+    export_c_func!(property_copyAttributeList(_, _)),
+    export_c_func!(protocol_copyMethodDescriptionList(_, _, _, _)),
+    export_c_func!(protocol_copyProtocolList(_, _)),
+    export_c_func!(objc_constructInstance(_, _)),
+    export_c_func!(objc_initializeClassPair(_, _, _, _)),
+    export_c_func!(objc_exception_rethrow()),
+    export_c_func!(objc_terminate()),
     export_c_func!(class_addIvar(_, _, _, _, _)),
     export_c_func!(class_getProperty(_, _)),
     export_c_func!(property_getName(_)),
