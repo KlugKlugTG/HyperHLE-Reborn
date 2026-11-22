@@ -185,11 +185,7 @@ impl super::ObjC {
         host_object: Box<dyn AnyHostObject>,
         mem: &mut Mem,
     ) -> id {
-        let instance_size = self
-            .get_host_object(isa)
-            .and_then(|h| h.as_any().downcast_ref::<ClassHostObject>())
-            .map(|c| c.instance_size)
-            .unwrap_or(guest_size_of::<objc_object>());
+        let instance_size = self.class_instance_size(isa);
 
         self.alloc_object_inner(
             isa,
@@ -226,7 +222,11 @@ impl super::ObjC {
         host_object: Box<dyn AnyHostObject>,
         mem: &mut Mem,
     ) -> id {
-        let size = guest_size_of::<objc_object>();
+        // Immortality changes ownership, not the instance layout. In
+        // particular, UIApplication's alloc can receive a guest subclass
+        // whose ivars must not overlap the next heap allocation.
+        // https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-runtime-new.mm
+        let size = self.class_instance_size(isa);
         self.alloc_object_inner(isa, size, host_object, mem, None)
     }
 
@@ -359,10 +359,7 @@ impl super::ObjC {
     /// (object, host type) pair, `false` afterwards. Keeps the diagnostic
     /// value of the SUPER HACK warnings while preventing per-frame spam.
     fn warn_fake_borrow_once(&self, object: id, ty: std::any::TypeId) -> bool {
-        self.fake_borrow_warned
-            .lock()
-            .unwrap()
-            .insert((object, ty))
+        self.fake_borrow_warned.lock().unwrap().insert((object, ty))
     }
 
     pub fn get_refcount(&mut self, object: id) -> NonZeroU32 {
@@ -485,6 +482,57 @@ impl super::ObjC {
 #[cfg(test)]
 mod allocation_tests {
     use super::*;
+    use crate::objc::ObjC;
+
+    // UIApplicationMain supports a guest subclass as its principal class.
+    // Its immortal allocation still needs the entire subclass instance.
+    // https://developer.apple.com/documentation/uikit/uiapplicationmain(_:_:_:_:)
+    #[test]
+    fn immortal_subclass_reserves_and_zeroes_all_guest_ivars() {
+        let mut objc = super::super::ObjC::new();
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(crate::mem::PAGE_SIZE);
+        let class = Ptr::from_bits(0x2000);
+        let instance_size = 60;
+        let host = ClassHostObject {
+            name: "ApplicationSubclass".into(),
+            is_metaclass: false,
+            superclass: nil,
+            methods: Default::default(),
+            guest_method_signatures: Default::default(),
+            instance_start: 36,
+            instance_size,
+            ivars: Default::default(),
+            scalar_ivars: Default::default(),
+            properties: Default::default(),
+            protocols: Default::default(),
+            is_from_bin: true,
+            is_constructing: false,
+            is_dynamic: false,
+            dynamic_allocations: Default::default(),
+        };
+        objc.register_static_object(class, Box::new(host));
+
+        let object = objc.alloc_static_object(class, Box::new(TrivialHostObject), &mut mem);
+        let neighbour = mem.alloc(64);
+        mem.bytes_at_mut(neighbour.cast(), 64).fill(0xa5);
+
+        assert_eq!(ObjC::read_isa(object, &mem), class);
+        assert!(
+            object.to_bits() + instance_size <= neighbour.to_bits()
+                || neighbour.to_bits() + 64 <= object.to_bits()
+        );
+        assert!(mem
+            .bytes_at((object + 1).cast(), instance_size - 4)
+            .iter()
+            .all(|&byte| byte == 0));
+        mem.write(Ptr::<u32, true>::from_bits(object.to_bits() + 52), 0x1234);
+        assert!(mem
+            .bytes_at(neighbour.cast(), 64)
+            .iter()
+            .all(|&byte| byte == 0xa5));
+        assert!(objc.objects[&object].refcount.is_none());
+    }
 
     // A failed calloc must not turn NULL into a registered Objective-C object.
     // https://github.com/apple-oss-distributions/objc4/blob/objc4-779.1/runtime/objc-runtime-new.mm

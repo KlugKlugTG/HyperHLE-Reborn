@@ -2,7 +2,7 @@ name: Emulator diagnostics
 
 on:
   push:
-    branches: ["fix/minecraft-story-mode-startup", "fix/infinity-blade-display"]
+    branches: ["fix/minecraft-story-mode-startup", "fix/infinity-blade-display", "fix/general-launch-compatibility"]
   workflow_dispatch:
 
 permissions:

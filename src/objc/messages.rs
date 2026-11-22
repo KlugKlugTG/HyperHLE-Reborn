@@ -830,6 +830,19 @@ Type mismatch when sending message {} to {:?}!
                                 }
                             }
                         }
+                        if env.is_direct_guest_call() && !ultrahle_minionjump_active {
+                            // Apple's messenger jumps to the IMP with the
+                            // caller's LR and stack intact. A nested run_call
+                            // leaves a Rust frame alive when an exception
+                            // skips the method, then resumes that stale frame
+                            // after an outer method returns.
+                            // https://github.com/apple-oss-distributions/objc4/blob/objc4-551.1/runtime/Messengers.subproj/objc-msg-arm.s
+                            env.cpu.branch(guest_imp);
+                            env.note_guest_control_flow_redirect();
+                            return;
+                        }
+                        // Host callbacks and the existing post-call button
+                        // compatibility logic need the result before returning.
                         guest_imp.call_without_pushing_stack_frame(env)
                     }
                 }

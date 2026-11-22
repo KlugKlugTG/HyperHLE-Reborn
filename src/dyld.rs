@@ -1080,7 +1080,9 @@ impl Dyld {
                 .iter()
                 .find_map(|other_bin| other_bin.external_symbols.get(name))
                 .copied();
-            let target: ConstVoidPtr = if let Some(class_name) = name.strip_prefix("_OBJC_CLASS_$_")
+            let target: ConstVoidPtr = if let Some(target) = crate::objc::exceptions::link_symbol(self, objc, mem, name) {
+                target
+            } else if let Some(class_name) = name.strip_prefix("_OBJC_CLASS_$_")
             {
                 guest_external.map(Ptr::from_bits).unwrap_or_else(|| {
                     objc.link_class(class_name, /* is_metaclass: */ false, mem)
@@ -1229,19 +1231,6 @@ impl Dyld {
                 );
                 log_dbg!("Stubbed C++ typeinfo {} at {:#x}", name, ti.to_bits());
                 ti
-            } else if name == "___objc_personality_v0" {
-                // Objective-C exception personality routine. Mirrors the
-                // non-lazy stub above: a guest-code BX LR returning 0
-                // (_URC_NO_REASON) so the unwinder keeps walking instead
-                // of branching to NULL when an iOS 5+ binary places a
-                // pointer to this symbol directly into its __DATA section
-                // via an external relocation (rather than through the
-                // __nl_symbol_ptr table).
-                let fn_ptr: MutPtr<u32> = mem.alloc(8).cast();
-                mem.write(fn_ptr + 0, encode_a32_ret());
-                mem.write(fn_ptr + 1, encode_a32_trap());
-                log_dbg!("Stubbed ___objc_personality_v0 -> {:#x}", fn_ptr.to_bits());
-                fn_ptr.cast().cast_const()
             } else if name == "___cxa_terminate_handler"
                 || name == "___cxa_unexpected_handler"
                 || name == "___cxa_new_handler"
@@ -1477,39 +1466,8 @@ impl Dyld {
                 continue;
             }
 
-            // C++ / ObjC exception handling symbols. If these are
-            // NULL the C++ unwinder crashes when any @try block is
-            // entered or any ObjC exception is thrown, producing
-            // sequential NULL-page reads followed by UndefinedInst.
-            //
-            // _OBJC_EHTYPE_*: ObjC exception type-info descriptors
-            // used by @catch type matching. A dummy non-null object
-            // is enough to prevent the NULL dereference.
-            //
-            // ___objc_personality_v0: called by _Unwind_RaiseException
-            // for every frame. We install a trivial stub (BX LR) that
-            // returns 0 (_URC_NO_REASON / continue unwinding) so the
-            // unwinder keeps moving instead of branching to 0x0.
-            if symbol == "_OBJC_EHTYPE_id" || symbol == "_OBJC_EHTYPE_$_NSException" {
-                let dummy = mem.alloc(32);
-                mem.write(ptr_ptr, dummy.cast().cast_const());
-                log_dbg!(
-                    "Patched ObjC EH type descriptor {} -> {:#x}",
-                    symbol,
-                    dummy.to_bits()
-                );
-                continue;
-            }
-
-            if symbol == "___objc_personality_v0" {
-                // Minimal ARM32 function: BX LR (returns 0 in R0).
-                // Returning _URC_NO_REASON (0) for every frame tells
-                // the unwinder "no handler here, keep searching".
-                let fn_ptr: MutPtr<u32> = mem.alloc(8).cast();
-                mem.write(fn_ptr + 0, encode_a32_ret());
-                mem.write(fn_ptr + 1, encode_a32_trap());
-                mem.write(ptr_ptr, fn_ptr.cast().cast_const());
-                log_dbg!("Stubbed ___objc_personality_v0 -> {:#x}", fn_ptr.to_bits());
+            if let Some(target) = crate::objc::exceptions::link_symbol(self, objc, mem, symbol) {
+                mem.write(ptr_ptr, target);
                 continue;
             }
 
@@ -2366,7 +2324,8 @@ fn has_guest_sjlj_runtime(mut has_symbol: impl FnMut(&str) -> bool) -> bool {
 }
 
 fn is_guest_cxxabi_symbol(name: &str) -> bool {
-    name.starts_with("___cxa_")
+    name == "__ZSt9terminatev"
+        || name.starts_with("___cxa_")
         || name.starts_with("__Unwind_")
         || name.starts_with("___gxx_personality_")
         || name.starts_with("__ZTVN10__cxxabiv1")

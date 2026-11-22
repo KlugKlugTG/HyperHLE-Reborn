@@ -148,7 +148,7 @@ fn run_test_app(
             .copied()
             .filter(|a| {
                 *a != "-ObjC"
-                    && *a != "-fno-objc-exceptions"
+                    && *a != "-fobjc-exceptions"
                     && *a != "-fno-objc-arc"
                     && *a != "-fno-objc-arc-exceptions"
             })
@@ -292,7 +292,7 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         stubs_lib_search_arg.as_str(),
         stubs_frameworks_search_arg.as_str(),
         "-ObjC",
-        "-fno-objc-exceptions",
+        "-fobjc-exceptions",
         // ARC is not available until IOS 5, so it can't be used.
         "-fno-objc-arc",
         "-fno-objc-arc-exceptions",
@@ -432,6 +432,36 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         &extra_compile_args,
         &["--game-center-authenticated", "--dladdr"],
     )?;
+    // Reuse the CI-built binary with both initial status-bar states. Each
+    // process enters UIApplicationMain, checks geometry during subclass init,
+    // then changes the setting and checks it again in the launch callback.
+    for hidden in [false, true] {
+        let app = stubs_dir.join(format!("StatusBar{hidden}.app"));
+        copy_dir_all(tests_dir.join("TestApp.app"), app.clone())?;
+        let plist_path = app.join("Info.plist");
+        let mut info = plist::Value::from_file(&plist_path)?;
+        info.as_dictionary_mut().unwrap().insert(
+            "UIStatusBarHidden".to_string(),
+            plist::Value::Boolean(hidden),
+        );
+        info.to_file_binary(&plist_path)?;
+        let argument = if hidden {
+            "--status-bar-hidden-probe"
+        } else {
+            "--status-bar-visible-probe"
+        };
+        let output = Command::new(binary_path)
+            .arg(app)
+            .args(["--headless", "--args", argument])
+            .output()?;
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("Status bar launch probe: OK"),
+            "{argument} failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
     // ARM UDF and BKPT deliberately stop execution. Headless compatibility
     // recovery must never let these programs return success to the test runner.
     for (argument, error) in [
@@ -452,6 +482,30 @@ fn test_app() -> Result<(), Box<dyn Error>> {
             "{argument} failed for an unrelated reason: {stderr}"
         );
     }
+    let uncaught = Command::new(binary_path)
+        .arg(tests_dir.join("TestApp.app"))
+        .args(["--headless", "--args", "--objc-exception-probe"])
+        .output()?;
+    let stderr = String::from_utf8_lossy(&uncaught.stderr);
+    assert!(
+        !uncaught.status.success(),
+        "uncaught exception was recovered: {stderr}"
+    );
+    assert!(
+        stderr.contains("Guest received fatal signal 6")
+            && stderr.contains("terminate called after throwing an instance of 'NSException'"),
+        "uncaught exception failed for an unrelated reason: {stderr}"
+    );
+    let termination = Command::new(binary_path)
+        .arg(tests_dir.join("TestApp.app"))
+        .args(["--headless", "--args", "--objc-terminate-probe"])
+        .output()?;
+    let stderr = String::from_utf8_lossy(&termination.stderr);
+    assert!(
+        !termination.status.success() && stderr.contains("Guest received fatal signal 6"),
+        "objc_terminate did not terminate through the guest runtime: {stderr}"
+    );
+
     run_test_app(
         &tests_dir,
         "AudioUnitThread",

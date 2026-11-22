@@ -761,7 +761,7 @@ fn strptime(
     }
 }
 
-fn strftime(
+pub(super) fn strftime(
     env: &mut Environment,
     s: MutPtr<u8>,
     max_size: GuestUSize,
@@ -845,7 +845,11 @@ fn strftime(
                 // tm_gmtoff like the %Z handler above; with the epoch-relative
                 // clock this is +0000 (UTC).
                 let gmtoff: i32 = time_val.tm_gmtoff;
-                let (sign, abs) = if gmtoff < 0 { ('-', -gmtoff) } else { ('+', gmtoff) };
+                let (sign, abs) = if gmtoff < 0 {
+                    ('-', -gmtoff)
+                } else {
+                    ('+', gmtoff)
+                };
                 let hh = abs / 3600;
                 let mm = (abs % 3600) / 60;
                 res.extend_from_slice(format!("{}{:02}{:02}", sign, hh, mm).as_bytes());
@@ -871,7 +875,9 @@ fn strftime(
                 let hour = time_val.tm_hour.clamp(0, 23);
                 let minute = time_val.tm_min.clamp(0, 59);
                 let second = time_val.tm_sec.clamp(0, 60);
-                res.extend_from_slice(format!("{:02}:{:02}:{:02}", hour, minute, second).as_bytes());
+                res.extend_from_slice(
+                    format!("{:02}:{:02}:{:02}", hour, minute, second).as_bytes(),
+                );
             }
             b'x' => {
                 // %x is the locale's date representation; in the C locale
@@ -969,18 +975,16 @@ fn strftime(
         return 0;
     }
 
-    let middle = if ((max_size - 1) as usize) < res.len() {
-        &res[..(max_size - 1) as usize]
-    } else {
-        &res[..]
-    };
-
-    let dest_slice = env.mem.bytes_at_mut(s, max_size);
-    for (i, &byte) in middle.iter().chain(b"\0".iter()).enumerate() {
-        dest_slice[i] = byte;
+    // strftime returns zero if the result including NUL does not fit.
+    // Returning the untruncated length lets callers read beyond the buffer.
+    // https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/strftime.3.html
+    if res.len() >= max_size as usize {
+        return 0;
     }
-
-    res.len().try_into().unwrap_or(GuestUSize::MAX)
+    let len = res.len() as GuestUSize;
+    env.mem.bytes_at_mut(s, len).copy_from_slice(&res);
+    env.mem.write(s + len, 0);
+    len
 }
 
 /// Size of the buffer returned by `asctime`/`ctime`. The C standard output is

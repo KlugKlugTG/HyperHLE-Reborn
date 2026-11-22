@@ -12,7 +12,7 @@ use super::cf_allocator::{kCFAllocatorDefault, CFAllocatorRef};
 use super::{CFComparisonResult, CFIndex, CFTypeRef};
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::foundation::ns_value::is_conversion_lossless;
-use crate::mem::{ConstVoidPtr, MutVoidPtr};
+use crate::mem::{ConstPtr, ConstVoidPtr, MutVoidPtr};
 use crate::objc::{id, msg, msg_class};
 use crate::Environment;
 
@@ -173,6 +173,41 @@ fn CFNumberCompare(
         log!("Warning: CFNumberCompare: context must be NULL; ignoring.");
     }
     msg![env; num1 compare:num2]
+}
+
+// CFNumber and NSNumber share storage. Report the canonical CF type of the
+// bridged number's objCType, respecting guest NSNumber subclass overrides.
+// CF does not promise to preserve the type alias used at creation time.
+// https://developer.apple.com/documentation/corefoundation/cfnumbergettype(_:)
+// https://github.com/apple-oss-distributions/CF/blob/main/CFNumber.c
+fn CFNumberGetType(env: &mut Environment, number: CFNumberRef) -> CFNumberType {
+    let encoding: ConstPtr<u8> = msg![env; number objCType];
+    match env.mem.read(encoding) {
+        b'c' | b'C' | b'B' => kCFNumberSInt8Type,
+        b's' | b'S' => kCFNumberSInt16Type,
+        b'i' | b'I' | b'l' | b'L' => kCFNumberSInt32Type,
+        b'q' | b'Q' => kCFNumberSInt64Type,
+        b'f' => kCFNumberFloat32Type,
+        b'd' => kCFNumberFloat64Type,
+        _ => 0,
+    }
+}
+
+fn CFNumberGetByteSize(env: &mut Environment, number: CFNumberRef) -> CFIndex {
+    match CFNumberGetType(env, number) {
+        kCFNumberSInt8Type => 1,
+        kCFNumberSInt16Type => 2,
+        kCFNumberSInt32Type | kCFNumberFloat32Type => 4,
+        kCFNumberSInt64Type | kCFNumberFloat64Type => 8,
+        _ => 0,
+    }
+}
+
+fn CFNumberIsFloatType(env: &mut Environment, number: CFNumberRef) -> bool {
+    matches!(
+        CFNumberGetType(env, number),
+        kCFNumberFloat32Type | kCFNumberFloat64Type
+    )
 }
 
 fn CFBooleanGetValue(env: &mut Environment, boolean: CFBooleanRef) -> bool {
@@ -337,5 +372,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFNumberCreate(_, _, _)),
     export_c_func!(CFNumberGetValue(_, _, _)),
     export_c_func!(CFNumberCompare(_, _, _)),
+    export_c_func!(CFNumberGetType(_)),
+    export_c_func!(CFNumberGetByteSize(_)),
+    export_c_func!(CFNumberIsFloatType(_)),
     export_c_func!(CFBooleanGetValue(_)),
 ];

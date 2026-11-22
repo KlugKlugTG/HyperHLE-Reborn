@@ -26,6 +26,7 @@ use crate::fastmap::{FxHashMap, FxHashSet};
 use crate::MutexId;
 
 mod classes;
+pub(crate) mod exceptions;
 mod messages;
 mod methods;
 mod objects;
@@ -37,10 +38,9 @@ mod weak;
 
 pub use classes::{
     __objc_deallocOnMainThreadHelper, class_addIvar, class_addMethod, class_addProperty,
-    class_addProtocol, class_conformsToProtocol, class_getIvarLayout,
-    class_copyIvarList, class_copyMethodList, class_copyPropertyList, class_copyProtocolList,
-    class_createInstance,
-    class_getClassMethod, class_getInstanceMethod, class_getInstanceSize,
+    class_addProtocol, class_conformsToProtocol, class_copyIvarList, class_copyMethodList,
+    class_copyPropertyList, class_copyProtocolList, class_createInstance, class_getClassMethod,
+    class_getInstanceMethod, class_getInstanceSize, class_getIvarLayout,
     class_getMethodImplementation, class_getMethodImplementation_stret, class_getName,
     class_getProperty, class_getSuperclass, class_isMetaClass, class_replaceMethod,
     class_respondsToSelector, class_setSuperclass, method_copyArgumentType, method_copyReturnType,
@@ -48,17 +48,20 @@ pub use classes::{
     method_getName, method_getNumberOfArguments, method_getReturnType, method_getTypeEncoding,
     method_setImplementation, objc_alloc, objc_allocWithZone, objc_allocateClassPair,
     objc_autorelease, objc_autoreleasePoolPop, objc_autoreleasePoolPush,
-    objc_autoreleaseReturnValue, objc_begin_catch, objc_classes, objc_copyClassList,
-    objc_copyClassNamesForImage, objc_copyImageNames, objc_disposeClassPair, objc_end_catch,
-    objc_exception_throw, objc_getClass, objc_getClassList, objc_getMetaClass, objc_getProtocol,
-    objc_getRequiredClass, objc_initializeClassPair, objc_lookUpClass, objc_readClassPair,
-    objc_registerClassPair, objc_release, objc_retain, objc_retainAutorelease,
-    objc_retainAutoreleaseReturnValue, objc_constructInstance, objc_exception_rethrow,
-    objc_terminate, protocol_copyMethodDescriptionList, protocol_copyProtocolList,
-    objc_retainAutoreleasedReturnValue, objc_retainBlock, objc_storeStrong,
+    objc_autoreleaseReturnValue, objc_classes, objc_constructInstance, objc_copyClassList,
+    objc_copyClassNamesForImage, objc_copyImageNames, objc_disposeClassPair, objc_getClass,
+    objc_getClassList, objc_getMetaClass, objc_getProtocol, objc_getRequiredClass,
+    objc_initializeClassPair, objc_lookUpClass, objc_readClassPair, objc_registerClassPair,
+    objc_release, objc_retain, objc_retainAutorelease, objc_retainAutoreleaseReturnValue,
+    objc_retainAutoreleasedReturnValue, objc_retainBlock, objc_storeStrong, objc_terminate,
     objc_unsafeClaimAutoreleasedReturnValue, object_getClass, object_getClassName,
-    object_getIndexedIvars, protocol_conformsToProtocol, protocol_getMethodDescription,
-    protocol_getName, swift_getInitializedObjCClass, Class, ClassExports, ClassTemplate,
+    object_getIndexedIvars, protocol_conformsToProtocol, protocol_copyMethodDescriptionList,
+    protocol_copyProtocolList, protocol_getMethodDescription, protocol_getName,
+    swift_getInitializedObjCClass, Class, ClassExports, ClassTemplate,
+};
+pub use exceptions::{
+    __objc_personality_v0, objc_begin_catch, objc_end_catch, objc_exception_rethrow,
+    objc_exception_throw,
 };
 pub use messages::{
     autorelease, msg, msg_class, msg_send, msg_send_no_initialize, msg_send_no_type_checking,
@@ -75,11 +78,11 @@ pub use properties::{
 };
 pub use selectors::{selector, SEL};
 
-use crate::objc::classes::___objc_personality_v0;
 use crate::objc::classes::imp_implementationWithBlock;
 use crate::objc::classes::{objc_msgForward, objc_msgForward_stret};
 use crate::Environment;
 use classes::{ClassHostObject, FakeClass, UnimplementedClass};
+use exceptions::__objc_personality_v0 as ___objc_personality_v0;
 use messages::{
     objc_enumerationMutation, objc_msgSendSuper, objc_msgSendSuper2, objc_msgSendSuper2_stret,
     objc_msgSendSuper_stret, objc_msgSend_stret, MsgSendSignature, MsgSendSuperSignature,
@@ -221,6 +224,7 @@ pub struct ObjC {
     /// `method_getImplementation(m) == method_getImplementation(m)` holds,
     /// matching Apple's behaviour.
     pub(super) host_imp_tokens: FxHashMap<usize, crate::mem::MutVoidPtr>,
+    exceptions: exceptions::State,
 }
 
 impl ObjC {
@@ -239,6 +243,7 @@ impl ObjC {
             method_handles: FxHashMap::default(),
             imp_tokens: FxHashMap::default(),
             host_imp_tokens: FxHashMap::default(),
+            exceptions: Default::default(),
         }
     }
 
@@ -377,8 +382,42 @@ const CONSTANTS: ConstantExports = &[
     // and avoids a linker error for the integration tests.
     ("__objc_empty_vtable", HostConstant::NullPtr),
     ("__objc_empty_cache", HostConstant::NullPtr),
-    ("_OBJC_EHTYPE_$_NSException", HostConstant::NullPtr),
-    ("_OBJC_EHTYPE_id", HostConstant::NullPtr),
+    (
+        "_OBJC_EHTYPE_$_NSException",
+        HostConstant::Custom(|env| {
+            exceptions::link_symbol(
+                &mut env.dyld,
+                &mut env.objc,
+                &mut env.mem,
+                "_OBJC_EHTYPE_$_NSException",
+            )
+            .unwrap()
+        }),
+    ),
+    (
+        "_OBJC_EHTYPE_id",
+        HostConstant::Custom(|env| {
+            exceptions::link_symbol(
+                &mut env.dyld,
+                &mut env.objc,
+                &mut env.mem,
+                "_OBJC_EHTYPE_id",
+            )
+            .unwrap()
+        }),
+    ),
+    (
+        "_objc_ehtype_vtable",
+        HostConstant::Custom(|env| {
+            exceptions::link_symbol(
+                &mut env.dyld,
+                &mut env.objc,
+                &mut env.mem,
+                "_objc_ehtype_vtable",
+            )
+            .unwrap()
+        }),
+    ),
     // `NSObject`'s only ivar (`isa`) lives at offset 0 in the object layout
     // on 32-bit iOS, so resolving the ivar-offset symbol to a 4-byte zero
     // gives any binary that does `obj + _OBJC_IVAR_$_NSObject.isa` the
@@ -430,7 +469,9 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_setProperty_nonatomic(_, _, _, _)),
     export_c_func!(objc_exception_throw(_)),
     export_c_func!(objc_begin_catch(_)),
-    export_c_func!(objc_end_catch(_)),
+    export_c_func!(objc_end_catch()),
+    export_c_func!(objc_exception_rethrow()),
+    export_c_func!(__objc_personality_v0(_, _, _, _, _)),
     export_c_func!(class_getSuperclass(_)),
     export_c_func!(class_getInstanceSize(_)),
     export_c_func!(class_createInstance(_, _)),
@@ -454,7 +495,6 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(protocol_copyProtocolList(_, _)),
     export_c_func!(objc_constructInstance(_, _)),
     export_c_func!(objc_initializeClassPair(_, _, _, _)),
-    export_c_func!(objc_exception_rethrow()),
     export_c_func!(objc_terminate()),
     export_c_func!(class_addIvar(_, _, _, _, _)),
     export_c_func!(class_getProperty(_, _)),

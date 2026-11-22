@@ -900,7 +900,6 @@ impl ObjC {
                 "Warning: register_bin_classes: {garbage_entries} of {total_entries} ObjC class entries were garbage (truncated/zero-filled binary — the .ipa is likely damaged); the app may fail to start or misbehave."
             );
         }
-
     }
 
     pub(crate) fn reconcile_bin_class_ivars(&mut self, mem: &mut Mem) {
@@ -1414,66 +1413,6 @@ impl ObjC {
 }
 
 pub fn objc_getClass(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
-}
-
-pub fn objc_begin_catch(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
-}
-
-pub fn objc_end_catch(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
-    if name.is_null() {
-        return nil;
-    }
-
-    let name_str = match env.mem.cstr_at_utf8(name) {
-        Ok(s) => s.to_string(),
-        Err(_) => return nil,
-    };
-    if let Some(class) = env.objc.get_class(&name_str, false, &env.mem) {
-        return class;
-    }
-
-    if ObjC::find_template(&name_str).is_some() {
-        return env.objc.link_class(&name_str, false, &mut env.mem);
-    }
-
-    nil
-}
-
-pub fn objc_exception_throw(env: &mut crate::Environment, name: ConstPtr<u8>) -> Class {
     if name.is_null() {
         return nil;
     }
@@ -2292,27 +2231,6 @@ pub fn __objc_deallocOnMainThreadHelper(env: &mut crate::Environment, context: M
     if !obj.is_null() {
         crate::objc::release(env, obj);
     }
-}
-
-pub fn ___objc_personality_v0(
-    _env: &mut crate::Environment,
-    version: i32,
-    actions: i32,
-    exception_class: u64,
-    exception_object: MutVoidPtr,
-    context: MutVoidPtr,
-) -> i32 {
-    log!(
-        "___objc_personality_v0 called! Exception handling is not fully implemented in touchHLE.\n\
-        version: {}, actions: {}, class: {:x}, object: {:?}, context: {:?}",
-        version,
-        actions,
-        exception_class,
-        exception_object,
-        context
-    );
-    // _URC_FATAL_PHASE1_ERROR
-    3
 }
 
 /// `_objc_msgForward` — the ObjC runtime's message forwarding trampoline.
@@ -3686,11 +3604,7 @@ pub fn protocol_copyProtocolList(
 /// (the host side needs a host-object record), so allocate a fresh instance
 /// with the same class; the guest-visible isa and ivar offsets are identical.
 /// <https://developer.apple.com/documentation/objectivec/1418643-objc_constructinstance>
-pub fn objc_constructInstance(
-    env: &mut crate::Environment,
-    cls: Class,
-    bytes: MutVoidPtr,
-) -> id {
+pub fn objc_constructInstance(env: &mut crate::Environment, cls: Class, bytes: MutVoidPtr) -> id {
     if cls.is_null() {
         return nil;
     }
@@ -3728,18 +3642,16 @@ pub fn objc_initializeClassPair(
     allocated
 }
 
-/// `void objc_exception_rethrow(void)` — resumes propagation of the current
-/// exception. HyperHLE does not model a runtime exception stack; keep the
-/// guest alive rather than terminating the emulator.
-pub fn objc_exception_rethrow(_env: &mut crate::Environment) {
-    log_dbg!("objc_exception_rethrow called; exception state is not modelled");
-}
-
-/// `void objc_terminate(void)` — called by the runtime when an exception is
-/// uncaught and no terminate handler is installed. Keep the emulator alive;
-/// the guest's own abort/exit logic is handled elsewhere.
-pub fn objc_terminate(_env: &mut crate::Environment) {
-    log!("Warning: objc_terminate called (uncaught Objective-C exception); continuing");
+/// Termination must use the guest C++ handler and must never return normally.
+/// https://github.com/apple-oss-distributions/objc4/blob/main/runtime/objc-exception.mm
+pub fn objc_terminate(env: &mut crate::Environment) {
+    let address = env
+        .dyld
+        .guest_cxxabi_export("__ZSt9terminatev")
+        .expect("objc_terminate requires the guest C++ termination handler");
+    env.cpu
+        .branch(crate::abi::GuestFunction::from_addr_with_thumb_bit(address));
+    env.note_guest_control_flow_redirect();
 }
 
 #[cfg(test)]

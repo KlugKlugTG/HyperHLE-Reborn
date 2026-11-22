@@ -10,13 +10,8 @@
 //! `description`, copy semantics, and the uncaught-exception handler stub.
 //!
 //! ### On `raise`
-//! In real Objective-C, `-[NSException raise]` unwinds the call stack via
-//! C++ exceptions.  touchHLE does not emulate ObjC exception unwinding, so we
-//! instead call `panic!` which terminates the guest with a clear diagnostic.
-//! This is the same behaviour as the original touchHLE approach for unhandled
-//! guest panics, and is far better than silently continuing past a `raise`
-//! (which produces mysterious NULL-deref crashes later, as seen in the
-//! KamiChallenge log).
+//! `-[NSException raise]` uses the Objective-C exception bridge, allowing the
+//! guest C++ SjLj runtime to run catch blocks and cleanup handlers.
 
 use crate::abi::VaList;
 use crate::dyld::{ConstantExports, FunctionExports, HostConstant};
@@ -172,25 +167,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - raise
 
 - (())raise {
-    let name   = env.objc.borrow::<NSExceptionHostObject>(this).name;
-    let reason = env.objc.borrow::<NSExceptionHostObject>(this).reason;
-
-    let name_s   = objc_str(env, name,   "<unnamed exception>");
-    let reason_s = objc_str(env, reason, "<no reason>");
-
-    // Log the exception details clearly for debugging
-    log!("GUEST NSException raised (Continuing without panic):");
-    log!("  Name:   {}", name_s);
-    log!("  Reason: {}", reason_s);
-
-    // If there is userInfo, log it too (useful for network errors)
-    let user_info = env.objc.borrow::<NSExceptionHostObject>(this).user_info;
-    if user_info != nil {
-        log!("  UserInfo: <present>");
-    }
-
-    // We return () to the guest.
-    // The guest will now continue execution.
+    crate::objc::objc_exception_throw(env, this);
 }
 
 // MARK: - NSCopying

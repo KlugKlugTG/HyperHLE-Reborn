@@ -8,13 +8,16 @@ that frames keep being presented and the process stays alive.
 Usage:
     python dev-scripts/ai-tap-sequence.py APP [--exe PATH] [--cwd DIR] [--out DIR]
         [--step "WAIT:X,Y[*N]"]... [--final-wait SECONDS]
-        [--require-touch-delivery] [-- extra emulator args]
+        [--require-touch-delivery] [--require-nonblack-frame]
+        [-- extra emulator args]
 
 Each --step waits WAIT seconds, takes a screenshot, then taps at (X, Y),
 where X and Y are fractions (0..1) of the window's client area. Use "-" for
 X,Y to take a screenshot without tapping. Append `*N` for N rapid taps, e.g.
 `--step "4:0.5,0.5*2"` for a double tap. `--require-touch-delivery` requires
 UIKit to report normal begin/end events for each tap, up to its 12-event log cap.
+`--require-nonblack-frame` rejects a black final screenshot even if the
+compositor reports FPS. Disable emulator overlays when using this check.
 
 Windows requires Pillow and pywin32. Linux/X11 requires xdotool, xwininfo,
 and ImageMagick's import.
@@ -140,6 +143,19 @@ def screenshot(hwnd, path):
         )
 
 
+def has_nonblack_pixels(path):
+    if sys.platform == "win32":
+        from PIL import Image
+
+        with Image.open(path) as frame:
+            return frame.convert("RGB").getextrema() != ((0, 0), (0, 0), (0, 0))
+    result = subprocess.run(
+        ["identify", "-format", "%[fx:maxima]", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return float(result.stdout) > 0
+
+
 def wait_for_process(proc, seconds):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -167,6 +183,7 @@ def main():
     p.add_argument("--step", action="append", default=[])
     p.add_argument("--final-wait", type=float, default=10.0)
     p.add_argument("--require-touch-delivery", action="store_true")
+    p.add_argument("--require-nonblack-frame", action="store_true")
     args = p.parse_args(argv)
     if sys.platform not in ("win32", "linux"):
         p.error("This script supports Windows and Linux/X11 hosts.")
@@ -276,6 +293,9 @@ def main():
             elif time.time() - fps_samples[-1][0] > 3.0:
                 print("FAIL: frame counter stopped updating before the final check")
                 ok = False
+            if args.require_nonblack_frame and not has_nonblack_pixels(out / "final.png"):
+                print("FAIL: final frame is black despite compositor activity")
+                ok = False
     if proc.poll() is None:
         proc.kill()
     proc.wait()
@@ -289,6 +309,7 @@ def main():
         r"PANIC in thread",
         r"thread .* panicked",
         r"FATAL SIGNAL",
+        r"Ignored UndefinedInstruction",
     )
     failures = [
         line for line in log_text.splitlines()

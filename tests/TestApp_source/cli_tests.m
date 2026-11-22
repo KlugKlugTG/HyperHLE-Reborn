@@ -48,6 +48,8 @@
 #import "SyncTester.h"
 
 int test_UITableViewCell_nib_controls(void);
+int test_ObjC_exception_catch_rethrow_cleanup(void);
+int test_ObjC_exception_nested_message_dispatch(void);
 
 @interface NSObject (PerformSelectorOnMainThreadTest)
 - (void)performSelectorOnMainThread:(SEL)selector
@@ -65,6 +67,39 @@ int test_UITableViewCell_nib_controls(void);
 @end
 
 extern NSString *const NSDefaultRunLoopMode;
+
+@interface ApplicationStorageProbe : UIApplication {
+@public
+  void *engine;
+  unsigned long marker;
+  unsigned char bytes[48];
+}
+@end
+@implementation ApplicationStorageProbe
+@end
+
+// Even a singleton's guest subclass needs zeroed storage for its own ivars.
+// https://developer.apple.com/documentation/uikit/uiapplicationmain(_:_:_:_:)
+int test_UIApplication_subclass_storage(void) {
+  ApplicationStorageProbe *app = [ApplicationStorageProbe alloc];
+  NSObject *neighbour = [NSObject new];
+  int result = 0;
+  if (app->engine != NULL || app->marker != 0)
+    result = -1;
+  for (unsigned i = 0; i < sizeof(app->bytes); i++) {
+    if (app->bytes[i] != 0)
+      result = -2;
+  }
+  app->engine = app;
+  app->marker = 0x12345678;
+  memset(app->bytes, 0xa5, sizeof(app->bytes));
+  if ([neighbour class] != [NSObject class] || app->engine != app ||
+      app->marker != 0x12345678)
+    result = -3;
+  [neighbour release];
+  [app release];
+  return result;
+}
 
 @interface NibTopLevelProbe : NSObject
 - (id)initWithCoder:(id)coder;
@@ -3788,6 +3823,113 @@ int test_mbstowcs() {
   return 0;
 }
 
+// The C++ libraries in old iPhone OS apps import both ordinary and xlocale
+// functions. Test the public ABI, size queries, partial conversion and errors.
+// https://github.com/apple-oss-distributions/Libc/blob/main/locale/FreeBSD/none.c
+int test_c_locale_codecs_and_collation(void) {
+  setlocale(LC_ALL, "C");
+  mbstate_t state = {0};
+  wchar_t wc = 123;
+  char byte = '?';
+  if (mbrtowc(&wc, "A", 0, &state) != (size_t)-2 || wc != 123)
+    return -1;
+  if (mbrtowc(&wc, NULL, 0, &state) != 0 || wc != 123)
+    return -2;
+  if (mbrtowc(&wc, "\xff", 1, &state) != 1 || wc != 255)
+    return -3;
+  if (wcrtomb(&byte, wc, &state) != 1 || (unsigned char)byte != 255)
+    return -4;
+  if (mbrlen("A", 1, &state) != 1 || mbrlen("", 1, &state) != 0 ||
+      !mbsinit(&state) || !mbsinit(NULL))
+    return -5;
+  byte = '?';
+  errno = 0;
+  if (wcrtomb(&byte, 256, &state) != (size_t)-1 || errno != EILSEQ ||
+      byte != '?')
+    return -6;
+  if (wcrtomb(NULL, -1, &state) != 1 || btowc(255) != 255 ||
+      btowc(256) != WEOF || wctob(255) != 255 || wctob(256) != EOF)
+    return -7;
+
+  const char *narrow = "abc";
+  const char *narrowStart = narrow;
+  wchar_t wideBuffer[8] = {99, 99, 99, 99, 99, 99, 99, 99};
+  if (mbsrtowcs(NULL, &narrow, 0, &state) != 3 || narrow != narrowStart)
+    return -8;
+  if (mbsrtowcs(wideBuffer, &narrow, 2, &state) != 2 ||
+      narrow != narrowStart + 2 || wideBuffer[0] != L'a' ||
+      wideBuffer[1] != L'b' || wideBuffer[2] != 99)
+    return -9;
+  if (mbsrtowcs(wideBuffer + 2, &narrow, 2, &state) != 1 || narrow != NULL ||
+      wcscmp(wideBuffer, L"abc") != 0)
+    return -10;
+
+  const wchar_t *wide = L"abc";
+  const wchar_t *wideStart = wide;
+  char narrowBuffer[8] = {'?', '?', '?', '?', '?', '?', '?', '?'};
+  if (wcsrtombs(NULL, &wide, 0, &state) != 3 || wide != wideStart)
+    return -11;
+  if (wcsrtombs(narrowBuffer, &wide, 2, &state) != 2 || wide != wideStart + 2 ||
+      narrowBuffer[2] != '?')
+    return -12;
+  if (wcsrtombs(narrowBuffer + 2, &wide, 2, &state) != 1 || wide != NULL ||
+      strcmp(narrowBuffer, "abc") != 0)
+    return -13;
+  const wchar_t invalid[] = {L'a', 256, 0};
+  wide = invalid;
+  errno = 0;
+  if (wcsrtombs(narrowBuffer, &wide, sizeof(narrowBuffer), &state) !=
+          (size_t)-1 ||
+      wide != invalid + 1 || errno != EILSEQ)
+    return -14;
+
+  if (strcoll("a", "b") >= 0 || strcoll("same", "same") != 0 ||
+      wcscoll(L"a", L"b") >= 0 || wcscoll(L"same", L"same") != 0)
+    return -15;
+  if (strxfrm(NULL, "abc", 0) != 3 || wcsxfrm(NULL, L"abc", 0) != 3)
+    return -16;
+  if (strxfrm(narrowBuffer, "abc", sizeof(narrowBuffer)) != 3 ||
+      strcmp(narrowBuffer, "abc") != 0 || wcsxfrm(wideBuffer, L"abc", 8) != 3 ||
+      wcscmp(wideBuffer, L"abc") != 0)
+    return -17;
+  if (mbstowcs(NULL, "abc", 0) != 3 || wcstombs(NULL, L"abc", 0) != 3)
+    return -18;
+  const wchar_t extended[] = {255, 0};
+  if (wcstombs(narrowBuffer, extended, 2) != 1 ||
+      (unsigned char)narrowBuffer[0] != 255 || narrowBuffer[1] != 0)
+    return -19;
+  errno = 0;
+  if (wcstombs(narrowBuffer, invalid, sizeof(narrowBuffer)) != (size_t)-1 ||
+      errno != EILSEQ)
+    return -20;
+  return 0;
+}
+
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/strftime.3.html
+int test_time_format_buffer_limits(void) {
+  struct tm tm = {0};
+  tm.tm_year = 108;
+  char narrow[8];
+  wchar_t wide[8];
+  memset(narrow, '?', sizeof(narrow));
+  if (strftime(narrow, 0, "%Y", &tm) != 0 || narrow[0] != '?')
+    return -1;
+  if (strftime(narrow, 4, "%Y", &tm) != 0 || narrow[4] != '?')
+    return -2;
+  if (strftime(narrow, 5, "%Y", &tm) != 4 || strcmp(narrow, "2008") != 0 ||
+      narrow[5] != '?')
+    return -3;
+  wmemset(wide, L'?', 8);
+  if (wcsftime(wide, 0, L"%Y", &tm) != 0 || wide[0] != L'?')
+    return -4;
+  if (wcsftime(wide, 4, L"%Y", &tm) != 0 || wide[4] != L'?')
+    return -5;
+  if (wcsftime(wide, 5, L"%Y", &tm) != 4 || wcscmp(wide, L"2008") != 0 ||
+      wide[5] != L'?')
+    return -6;
+  return 0;
+}
+
 int test_CFMutableString() {
   CFMutableStringRef mut_str = CFStringCreateMutable(NULL, 0);
   CFStringRef fmt = CFStringCreateWithCString(NULL, "%d %.2f", 0x0600);
@@ -5292,6 +5434,50 @@ int test_CFNumberCompare_simple() {
   return 0;
 }
 
+// CFNumber's type queries describe the stored number, including its bridge
+// to NSNumber, and never return a platform-width type alias.
+// https://developer.apple.com/documentation/corefoundation/cfnumbergettype(_:)
+@interface NSNumber (CFNumberTypeQueryTest)
++ (NSNumber *)numberWithDouble:(double)value;
+@end
+
+int test_CFNumber_type_queries(void) {
+  const struct {
+    CFNumberType requested;
+    CFNumberType canonical;
+    CFIndex bytes;
+    Boolean floating;
+  } cases[] = {
+      {kCFNumberCharType, kCFNumberSInt8Type, 1, false},
+      {kCFNumberShortType, kCFNumberSInt16Type, 2, false},
+      {kCFNumberIntType, kCFNumberSInt32Type, 4, false},
+      {kCFNumberLongType, kCFNumberSInt32Type, 4, false},
+      {kCFNumberCFIndexType, kCFNumberSInt32Type, 4, false},
+      {kCFNumberLongLongType, kCFNumberSInt64Type, 8, false},
+      {kCFNumberFloatType, kCFNumberFloat32Type, 4, true},
+      {kCFNumberDoubleType, kCFNumberFloat64Type, 8, true},
+  };
+  const uint64_t zero = 0;
+  for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    CFNumberRef number = CFNumberCreate(NULL, cases[i].requested, &zero);
+    if (CFNumberGetType(number) != cases[i].canonical ||
+        CFNumberGetByteSize(number) != cases[i].bytes ||
+        CFNumberIsFloatType(number) != cases[i].floating) {
+      CFRelease(number);
+      return -(int)i - 1;
+    }
+    CFRelease(number);
+  }
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  CFNumberRef bridged = (CFNumberRef)[NSNumber numberWithDouble:1.5];
+  int result = CFNumberGetType(bridged) == kCFNumberFloat64Type &&
+                       CFNumberGetByteSize(bridged) == 8 &&
+                       CFNumberIsFloatType(bridged)
+                   ? 0
+                   : -9;
+  [pool drain];
+  return result;
+}
 #ifndef kCFNumberSInt8Type
 #define kCFNumberSInt8Type 1
 #define kCFNumberSInt16Type 2
@@ -7123,6 +7309,9 @@ struct {
     FUNC_DEF(test_CFStringFind),
     FUNC_DEF(test_strcspn),
     FUNC_DEF(test_mbstowcs),
+    FUNC_DEF(test_UIApplication_subclass_storage),
+    FUNC_DEF(test_c_locale_codecs_and_collation),
+    FUNC_DEF(test_time_format_buffer_limits),
     FUNC_DEF(test_wide_numeric_prefixes),
     FUNC_DEF(test_CFMutableString),
     FUNC_DEF(test_fwrite),
@@ -7159,6 +7348,9 @@ struct {
     FUNC_DEF(test_inet_pton),
     FUNC_DEF(test_CFURL),
     FUNC_DEF(test_CFNumberCompare_simple),
+    FUNC_DEF(test_CFNumber_type_queries),
+    FUNC_DEF(test_ObjC_exception_catch_rethrow_cleanup),
+    FUNC_DEF(test_ObjC_exception_nested_message_dispatch),
     XFUNC_DEF(test_CFNumberCompare_extended),
     FUNC_DEF(test_memset_pattern),
     FUNC_DEF(test_CGGeometry),

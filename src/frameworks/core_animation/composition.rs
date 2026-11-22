@@ -75,6 +75,19 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         return None;
     }
 
+    // Run loops may poll much faster than the display refresh rate. Avoid
+    // guest isHidden messages, image animation updates and a layer-tree
+    // search when this iteration cannot present anything yet. Forced draws
+    // still process changes immediately.
+    // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/CoreAnimation_guide/Introduction/Introduction.html
+    if !force {
+        if let Some(next) = env.framework_state.core_animation.composition.recomposite_next {
+            if next > Instant::now() {
+                return Some(next);
+            }
+        }
+    }
+
     let mut animation_state = animation::State::default();
     let window_count = env.framework_state.uikit.ui_view.ui_window.windows.len();
     let mut has_visible_window = false;
@@ -118,7 +131,11 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             // layer) in between every GPU-presented game frame, which shows
             // up as constant black flicker.
             log_dbg!("Using CAEAGLLayer fast path, skipping composition");
-            return None;
+            // Recheck UIKit overlays at the display rate instead of walking
+            // the entire layer tree on every run-loop poll during gameplay.
+            let next = Instant::now() + Duration::from_secs_f64(1.0 / 60.0);
+            env.framework_state.core_animation.composition.recomposite_next = Some(next);
+            return Some(next);
         }
     }
 

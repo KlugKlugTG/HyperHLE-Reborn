@@ -915,6 +915,13 @@ pub(super) fn UIApplicationMain(
     principal_class_name: id, // NSString*
     delegate_class_name: id,  // NSString*
 ) {
+    // This is initial launch state, so it must be available to the principal
+    // class's initializer and to objects decoded from the main nib. Applying
+    // it afterward gives applicationFrame the wrong status-bar inset and
+    // overwrites changes made by the app during initialization.
+    // https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/iPhoneOSKeys.html#//apple_ref/doc/uid/TP40009252-SW20
+    env.framework_state.uikit.ui_application.status_bar_hidden = env.bundle.status_bar_hidden();
+
     let ui_application = {
         let pool: id = msg_class![env; NSAutoreleasePool new];
 
@@ -944,10 +951,6 @@ pub(super) fn UIApplicationMain(
             } else {
                 log!("Warning: couldn't load main nib file.");
             }
-        }
-
-        if env.bundle.status_bar_hidden() {
-            let _: () = msg![env; ui_application setStatusBarHidden:true];
         }
 
         let delegate: id = msg![env; ui_application delegate];
