@@ -837,7 +837,7 @@ Type mismatch when sending message {} to {:?}!
                             // skips the method, then resumes that stale frame
                             // after an outer method returns.
                             // https://github.com/apple-oss-distributions/objc4/blob/objc4-551.1/runtime/Messengers.subproj/objc-msg-arm.s
-                            env.cpu.branch(guest_imp);
+                            env.cpu.branch(*guest_imp);
                             env.note_guest_control_flow_redirect();
                             return;
                         }
