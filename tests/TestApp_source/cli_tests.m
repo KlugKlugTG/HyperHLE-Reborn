@@ -3890,6 +3890,16 @@ int test_c_locale_codecs_and_collation(void) {
       strcmp(narrowBuffer, "abc") != 0 || wcsxfrm(wideBuffer, L"abc", 8) != 3 ||
       wcscmp(wideBuffer, L"abc") != 0)
     return -17;
+  if (mbstowcs(NULL, "abc", 0) != 3 || wcstombs(NULL, L"abc", 0) != 3)
+    return -18;
+  const wchar_t extended[] = {255, 0};
+  if (wcstombs(narrowBuffer, extended, 2) != 1 ||
+      (unsigned char)narrowBuffer[0] != 255 || narrowBuffer[1] != 0)
+    return -19;
+  errno = 0;
+  if (wcstombs(narrowBuffer, invalid, sizeof(narrowBuffer)) != (size_t)-1 ||
+      errno != EILSEQ)
+    return -20;
   return 0;
 }
 
@@ -5422,6 +5432,50 @@ int test_CFNumberCompare_simple() {
   return 0;
 }
 
+// CFNumber's type queries describe the stored number, including its bridge
+// to NSNumber, and never return a platform-width type alias.
+// https://developer.apple.com/documentation/corefoundation/cfnumbergettype(_:)
+@interface NSNumber (CFNumberTypeQueryTest)
++ (NSNumber *)numberWithDouble:(double)value;
+@end
+
+int test_CFNumber_type_queries(void) {
+  const struct {
+    CFNumberType requested;
+    CFNumberType canonical;
+    CFIndex bytes;
+    Boolean floating;
+  } cases[] = {
+      {kCFNumberCharType, kCFNumberSInt8Type, 1, false},
+      {kCFNumberShortType, kCFNumberSInt16Type, 2, false},
+      {kCFNumberIntType, kCFNumberSInt32Type, 4, false},
+      {kCFNumberLongType, kCFNumberSInt32Type, 4, false},
+      {kCFNumberCFIndexType, kCFNumberSInt32Type, 4, false},
+      {kCFNumberLongLongType, kCFNumberSInt64Type, 8, false},
+      {kCFNumberFloatType, kCFNumberFloat32Type, 4, true},
+      {kCFNumberDoubleType, kCFNumberFloat64Type, 8, true},
+  };
+  const uint64_t zero = 0;
+  for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    CFNumberRef number = CFNumberCreate(NULL, cases[i].requested, &zero);
+    if (CFNumberGetType(number) != cases[i].canonical ||
+        CFNumberGetByteSize(number) != cases[i].bytes ||
+        CFNumberIsFloatType(number) != cases[i].floating) {
+      CFRelease(number);
+      return -(int)i - 1;
+    }
+    CFRelease(number);
+  }
+  NSAutoreleasePool *pool = [NSAutoreleasePool new];
+  CFNumberRef bridged = (CFNumberRef)[NSNumber numberWithDouble:1.5];
+  int result = CFNumberGetType(bridged) == kCFNumberFloat64Type &&
+                       CFNumberGetByteSize(bridged) == 8 &&
+                       CFNumberIsFloatType(bridged)
+                   ? 0
+                   : -9;
+  [pool drain];
+  return result;
+}
 #ifndef kCFNumberSInt8Type
 #define kCFNumberSInt8Type 1
 #define kCFNumberSInt16Type 2
@@ -7292,6 +7346,7 @@ struct {
     FUNC_DEF(test_inet_pton),
     FUNC_DEF(test_CFURL),
     FUNC_DEF(test_CFNumberCompare_simple),
+    FUNC_DEF(test_CFNumber_type_queries),
     XFUNC_DEF(test_CFNumberCompare_extended),
     FUNC_DEF(test_memset_pattern),
     FUNC_DEF(test_CGGeometry),

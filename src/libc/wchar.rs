@@ -425,11 +425,9 @@ fn mbstowcs(
     n: GuestUSize,
 ) -> GuestUSize {
     let mut i: GuestUSize = 0;
-    loop {
+    let limit = if dest.is_null() { GuestUSize::MAX } else { n };
+    while i < limit {
         let byte = env.mem.read(src + i);
-        if i == n {
-            break;
-        }
         if !dest.is_null() {
             env.mem.write(dest + i, byte as wchar_t);
         }
@@ -449,16 +447,13 @@ fn wcstombs(
     n: GuestUSize,
 ) -> GuestUSize {
     let mut i: GuestUSize = 0;
-    loop {
+    let limit = if dest.is_null() { GuestUSize::MAX } else { n };
+    while i < limit {
         let wc = env.mem.read(src + i);
-        if i == n {
-            break;
-        }
-        if !(0..=0x7F).contains(&wc) {
+        let Ok(byte) = u8::try_from(wc) else {
+            super::errno::set_errno(env, super::errno::EILSEQ);
             return GuestUSize::MAX;
-            // encoding error
-        }
-        let byte = wc as u8;
+        };
         if !dest.is_null() {
             env.mem.write(dest + i, byte);
         }
