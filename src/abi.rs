@@ -261,7 +261,11 @@ macro_rules! impl_CallFromHost {
                 );
 
                 $(write_next_arg::<$P>(&mut reg_offset, regs, &mut env.mem, args.$p);)*
+                // A host caller needs the method's result synchronously.
+                // Nested guest SVCs establish their own origin on this thread.
+                let previous_origin = env.replace_direct_guest_call(false);
                 self.call_from_guest(env);
+                env.replace_direct_guest_call(previous_origin);
 
                 let regs = env.cpu.regs_mut(); // reborrow
                 regs[Cpu::SP] = old_sp;

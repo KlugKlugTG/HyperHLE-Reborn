@@ -2324,7 +2324,8 @@ fn has_guest_sjlj_runtime(mut has_symbol: impl FnMut(&str) -> bool) -> bool {
 }
 
 fn is_guest_cxxabi_symbol(name: &str) -> bool {
-    name.starts_with("___cxa_")
+    name == "__ZSt9terminatev"
+        || name.starts_with("___cxa_")
         || name.starts_with("__Unwind_")
         || name.starts_with("___gxx_personality_")
         || name.starts_with("__ZTVN10__cxxabiv1")
