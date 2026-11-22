@@ -432,6 +432,36 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         &extra_compile_args,
         &["--game-center-authenticated", "--dladdr"],
     )?;
+    // Reuse the CI-built binary with both initial status-bar states. Each
+    // process enters UIApplicationMain, checks geometry during subclass init,
+    // then changes the setting and checks it again in the launch callback.
+    for hidden in [false, true] {
+        let app = stubs_dir.join(format!("StatusBar{hidden}.app"));
+        copy_dir_all(tests_dir.join("TestApp.app"), app.clone())?;
+        let plist_path = app.join("Info.plist");
+        let mut info = plist::Value::from_file(&plist_path)?;
+        info.as_dictionary_mut().unwrap().insert(
+            "UIStatusBarHidden".to_string(),
+            plist::Value::Boolean(hidden),
+        );
+        info.to_file_binary(&plist_path)?;
+        let argument = if hidden {
+            "--status-bar-hidden-probe"
+        } else {
+            "--status-bar-visible-probe"
+        };
+        let output = Command::new(binary_path)
+            .arg(app)
+            .args(["--headless", "--args", argument])
+            .output()?;
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("Status bar launch probe: OK"),
+            "{argument} failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
     // ARM UDF and BKPT deliberately stop execution. Headless compatibility
     // recovery must never let these programs return success to the test runner.
     for (argument, error) in [
