@@ -535,6 +535,20 @@ pub const CLASSES: ClassExports = objc_classes! {
         "Warning: -[NSDictionary init] called on the abstract base class; \
          returning empty dictionary."
     );
+    // Guest class clusters (JSONKit's JKDictionary is a common example) can
+    // allocate an instance through their own guest-side allocator and then
+    // call `[super init]` on raw guest storage. Such an object has no host
+    // record yet, so `borrow_mut` used to fall through to the phantom-object
+    // path and print "SUPER HACK! Faking borrow_mut for missing object".
+    // Register a real static host object for the receiver first; the object
+    // is guest-owned, so no refcount is attached (matching the allocator's
+    // ownership).
+    if env.objc.get_host_object(this).is_none() {
+        env.objc.register_static_object(
+            this,
+            Box::<DictionaryHostObject>::default(),
+        );
+    }
     *env.objc.borrow_mut(this) = <DictionaryHostObject as Default>::default();
     this
 }
