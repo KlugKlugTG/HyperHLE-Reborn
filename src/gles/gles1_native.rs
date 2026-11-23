@@ -107,6 +107,71 @@ fn fix_texture_min_filter_enabled() -> bool {
     })
 }
 
+// Texture-object state must be queried through GetTexParameteriv, not
+// GetIntegerv. The latter rejects TEXTURE_MIN_FILTER with INVALID_ENUM.
+// https://registry.khronos.org/OpenGL-Refpages/es1.1/xhtml/glGetTexParameter.xml
+unsafe fn replace_npot_mipmap_filter(gles: &mut dyn GLES, target: GLenum) -> Option<(GLint, GLint)> {
+    let target = if (0x8515..=0x851A).contains(&target) { 0x8513 } else { target };
+    let mut filter = 0;
+    gles.GetTexParameteriv(target, gles11::TEXTURE_MIN_FILTER, &mut filter);
+    let replacement = match filter {
+        0x2700 | 0x2702 => gles11::NEAREST as GLint,
+        0x2701 | 0x2703 => gles11::LINEAR as GLint,
+        _ => return None,
+    };
+    gles.TexParameteri(target, gles11::TEXTURE_MIN_FILTER, replacement);
+    Some((filter, replacement))
+}
+
+#[cfg(test)]
+mod npot_filter_tests {
+    use super::*;
+    struct TextureState {
+        filter: GLint,
+        queried_target: GLenum,
+        written: Option<(GLenum, GLint)>,
+    }
+    #[allow(non_snake_case)]
+    impl GLES for TextureState {
+        unsafe fn GetTexParameteriv(&mut self, target: GLenum, pname: GLenum, value: *mut GLint) {
+            assert_eq!(pname, gles11::TEXTURE_MIN_FILTER);
+            self.queried_target = target;
+            *value = self.filter;
+        }
+        unsafe fn TexParameteri(&mut self, target: GLenum, pname: GLenum, value: GLint) {
+            assert_eq!(pname, gles11::TEXTURE_MIN_FILTER);
+            self.written = Some((target, value));
+        }
+    }
+    #[test]
+    fn mipmap_repair_queries_texture_state_and_preserves_filter_intent() {
+        for (filter, expected) in [(0x2700, gles11::NEAREST), (0x2701, gles11::LINEAR),
+                                   (0x2702, gles11::NEAREST), (0x2703, gles11::LINEAR)] {
+            let mut state = TextureState { filter, queried_target: 0, written: None };
+            let result = unsafe { replace_npot_mipmap_filter(&mut state, gles11::TEXTURE_2D) };
+            assert_eq!(result, Some((filter, expected as GLint)));
+            assert_eq!(state.queried_target, gles11::TEXTURE_2D);
+            assert_eq!(state.written, Some((gles11::TEXTURE_2D, expected as GLint)));
+            // A GetIntegerv call hits the default backend's unsupported path.
+        }
+    }
+    #[test]
+    fn valid_base_level_filters_are_not_changed() {
+        for filter in [gles11::NEAREST as GLint, gles11::LINEAR as GLint] {
+            let mut state = TextureState { filter, queried_target: 0, written: None };
+            assert_eq!(unsafe { replace_npot_mipmap_filter(&mut state, gles11::TEXTURE_2D) }, None);
+            assert_eq!(state.written, None);
+        }
+    }
+    #[test]
+    fn cube_faces_query_the_cube_texture_object() {
+        let mut state = TextureState { filter: 0x2703, queried_target: 0, written: None };
+        unsafe { replace_npot_mipmap_filter(&mut state, 0x8515); }
+        assert_eq!(state.queried_target, 0x8513);
+        assert_eq!(state.written, Some((0x8513, gles11::LINEAR as GLint)));
+    }
+}
+
 impl GLESContext for GLES1NativeContext {
     fn description() -> &'static str {
         "Native OpenGL ES 1.1"
@@ -1763,26 +1828,12 @@ impl GLES1Native<'_> {
         )
     }
     unsafe fn fix_mipmap_min_filter(&mut self, target: GLenum) {
-        let mut min_filter: GLint = 0;
-        gles11::GetIntegerv(gles11::TEXTURE_MIN_FILTER, &mut min_filter);
-        // 0x2700 NEAREST_MIPMAP_NEAREST, 0x2701 LINEAR_MIPMAP_NEAREST,
-        // 0x2702 NEAREST_MIPMAP_LINEAR, 0x2703 LINEAR_MIPMAP_LINEAR
-        let replacement: GLint = match min_filter {
-            0x2700 | 0x2702 => gles11::NEAREST as GLint,
-            0x2701 | 0x2703 => gles11::LINEAR as GLint,
-            _ => return,
-        };
-        let p_target = if (0x8515..=0x851A).contains(&target) {
-            0x8513
-        } else {
-            target
-        };
-        gles11::TexParameteri(p_target, gles11::TEXTURE_MIN_FILTER, replacement as _);
-        log_dbg!(
-            "GLES1Native: mipmapped TEXTURE_MIN_FILTER {min_filter:#x} on a \
-             non-power-of-two level-0 texture replaced with {replacement:#x} \
-             [incomplete-texture workaround for strict drivers]"
-        );
+        if let Some((min_filter, replacement)) = replace_npot_mipmap_filter(self, target) {
+            log_dbg!(
+                "GLES1Native: mipmapped TEXTURE_MIN_FILTER {min_filter:#x} on a \
+                 non-power-of-two level-0 texture replaced with {replacement:#x}"
+            );
+        }
     }
     unsafe fn compressed_tex_image_2d_inner(
         &mut self,
