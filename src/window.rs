@@ -84,17 +84,38 @@ mod swap_interval_tests {
     }
 }
 
+/// Why ANGLE must not be used on this host, or `None` if it may be used.
+/// The decision is based on the `GL_VERSION / GL_VENDOR / GL_RENDERER`
+/// string captured at context creation; callers treat `Some(_)` exactly like
+/// a failed ANGLE startup and fall back to the native OpenGL ES driver.
 #[cfg(any(target_os = "android", test))]
-fn angle_backend_unsafe_on_power_vr_bxm_8_256(description: &str) -> bool {
+fn angle_backend_unsafe(description: &str) -> Option<&'static str> {
     let description = description.to_ascii_lowercase();
-    description.contains("angle")
-        && description.contains("vulkan")
-        && description.contains("bxm-8-256")
+    if !description.contains("angle") {
+        return None;
+    }
+    if description.contains("vulkan") && description.contains("bxm-8-256") {
+        // Startup crash on this part, observed with ANGLE's Vulkan backend.
+        return Some(
+            "ANGLE's Vulkan backend is disabled for PowerVR BXM-8-256 after its startup crash",
+        );
+    }
+    // Adreno 610 (e.g. "OpenGL ES 1.1 (ANGLE 2.1.1 git hash: 4a5ccd7b61e6) /
+    // Google Inc. (Qualcomm) / ANGLE (Qualcomm, Vulkan 1.1.87 (Adreno (TM)
+    // 610 (0x06010000)), Qualcomm-512.378.0)"): ANGLE is not to be used on
+    // this GPU; the native OpenGL ES driver is preferred instead. The
+    // "adreno" requirement keeps Mali-G610+ANGLE configurations unaffected.
+    if description.contains("adreno") && description.contains("610") {
+        return Some(
+            "ANGLE is disabled for Adreno 610 in favor of the native OpenGL ES driver",
+        );
+    }
+    None
 }
 
 #[cfg(test)]
 mod android_angle_fallback_tests {
-    use super::angle_backend_unsafe_on_power_vr_bxm_8_256;
+    use super::angle_backend_unsafe;
 
     #[test]
     fn rejects_power_vr_bxm_8_256_vulkan_angle() {
@@ -102,28 +123,67 @@ mod android_angle_fallback_tests {
             "OpenGL ES 1.1 (ANGLE) / Google Inc. (Imagination Technologies) / ",
             "ANGLE (Vulkan 1.1.170 (PowerVR BXM-8-256 (0x35010101)))",
         );
-        assert!(angle_backend_unsafe_on_power_vr_bxm_8_256(renderer));
+        assert!(angle_backend_unsafe(renderer).is_some());
+    }
+
+    #[test]
+    fn rejects_adreno_610_angle() {
+        // Verbatim GL strings reported by a device whose Adreno 610 ANGLE
+        // backend (Vulkan 1.1.87, Qualcomm-512.378.0) is disabled.
+        let renderer = concat!(
+            "OpenGL ES 1.1 (ANGLE 2.1.1 git hash: 4a5ccd7b61e6) / Google Inc. (Qualcomm) / ",
+            "ANGLE (Qualcomm, Vulkan 1.1.87 (Adreno (TM) 610 (0x06010000)), Qualcomm-512.378.0)",
+        );
+        assert!(angle_backend_unsafe(renderer).is_some());
+    }
+
+    #[test]
+    fn accepts_angle_on_other_adreno() {
+        assert!(angle_backend_unsafe(
+            "OpenGL ES 3.2 (ANGLE) / Google Inc. (Qualcomm) / ANGLE (Vulkan 1.3 (Adreno (TM) 740))"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn accepts_mali_g610_angle() {
+        // "610" shows up here too, but this is not an Adreno part.
+        assert!(angle_backend_unsafe(
+            "OpenGL ES 3.2 (ANGLE) / Google Inc. (ARM) / ANGLE (Vulkan 1.1 (Mali-G610 MC4))"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn accepts_native_adreno_610_renderer() {
+        assert!(angle_backend_unsafe(
+            "OpenGL ES 3.2 / Qualcomm / Adreno (TM) 610"
+        )
+        .is_none());
     }
 
     #[test]
     fn accepts_other_angle_renderers() {
-        assert!(!angle_backend_unsafe_on_power_vr_bxm_8_256(
+        assert!(angle_backend_unsafe(
             "OpenGL ES 3.2 (ANGLE) / Google Inc. (Qualcomm) / ANGLE (Vulkan 1.3 (Adreno))"
-        ));
+        )
+        .is_none());
     }
 
     #[test]
     fn accepts_other_power_vr_vulkan_renderers() {
-        assert!(!angle_backend_unsafe_on_power_vr_bxm_8_256(
+        assert!(angle_backend_unsafe(
             "OpenGL ES 3.2 (ANGLE) / Google Inc. (Imagination Technologies) / ANGLE (Vulkan 1.1 (PowerVR Rogue GE8320))"
-        ));
+        )
+        .is_none());
     }
 
     #[test]
     fn accepts_native_power_vr_bxm_8_256_renderer() {
-        assert!(!angle_backend_unsafe_on_power_vr_bxm_8_256(
+        assert!(angle_backend_unsafe(
             "OpenGL ES 3.2 / Imagination Technologies / PowerVR BXM-8-256"
-        ));
+        )
+        .is_none());
     }
 }
 
@@ -1470,10 +1530,10 @@ impl Window {
         window.internal_gl_ins = Some(gl_ins);
 
         #[cfg(target_os = "android")]
-        if angle_backend_unsafe_on_power_vr_bxm_8_256(&window.gl_driver_description) {
+        if let Some(reason) = angle_backend_unsafe(&window.gl_driver_description) {
             return Err(format!(
-                "ANGLE's Vulkan backend is disabled for PowerVR BXM-8-256 after its startup crash: {}",
-                window.gl_driver_description
+                "{}: {}",
+                reason, window.gl_driver_description
             ));
         }
 
@@ -1545,8 +1605,9 @@ impl Window {
             } else {
                 log!(
                     "GPU backend: Qualcomm Adreno native OpenGL ES driver. \
-                     Bundled ANGLE could not be loaded; the native ES 1.1 path \
-                     can render some early iPhone OS games as a black screen. \
+                     Bundled ANGLE is not in use here (unavailable, or disabled \
+                     for this GPU); the native ES 1.1 path can render some \
+                     early iPhone OS games as a black screen. \
                      Adreno rendering workarounds (--fix-texture-min-filter) \
                      are auto-enabled to mitigate this."
                 );
