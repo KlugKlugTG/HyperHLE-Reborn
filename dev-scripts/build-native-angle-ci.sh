@@ -34,7 +34,7 @@ python3 build/util/lastchange.py -o build/util/LASTCHANGE
 python3 - <<'PYFIX'
 from pathlib import Path
 p = Path('third_party/wayland/wayland_protocol.gni')
-s = p.read_text().replace('deps = [ ":$action_name" ]', 'public_deps = [ ":$action_name" ]')
+s = p.read_text().replace('    deps = [\n      ":$action_name",', '    public_deps = [ ":$action_name" ]\n    deps = [')
 p.write_text(s)
 p = Path('third_party/wayland/BUILD.gn')
 s = p.read_text().replace('  deps = [\n    ":wayland_dtd_h",', '  public_deps = [ ":wayland_dtd_h" ]\n  deps = [')
