@@ -702,6 +702,7 @@ int test_dispatch_background_serial(void);    // DispatchMainQueue.m
 int test_dispatch_background_deadline(void);  // DispatchMainQueue.m
 int test_dispatch_background_group(void);     // DispatchMainQueue.m
 int test_dispatch_background_barrier(void);   // DispatchMainQueue.m
+int test_CADisplayLink_refresh_clock(void);    // DispatchMainQueue.m
 
 #ifndef DEFINE_ME_WHEN_BUILDING_ON_MACOS
 int test_cpp_virtual_inheritance(void); // CppVirtualInheritance.cpp
@@ -7552,6 +7553,7 @@ struct {
     FUNC_DEF(test_dispatch_background_deadline),
     FUNC_DEF(test_dispatch_background_group),
     FUNC_DEF(test_dispatch_background_barrier),
+    FUNC_DEF(test_CADisplayLink_refresh_clock),
     FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
     FUNC_DEF(test_dlsym_executable_exports),

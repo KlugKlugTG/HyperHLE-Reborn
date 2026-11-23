@@ -484,3 +484,54 @@ int test_dispatch_background_barrier(void) {
   return probe.calls == 3 && probe.order[0] == 1 && probe.order[1] == 2 &&
                  probe.order[2] == 3 ? 0 : -1;
 }
+
+@interface CADisplayLink : NSObject
++ (id)displayLinkWithTarget:(id)target selector:(SEL)selector;
+- (void)setFrameInterval:(NSInteger)interval;
+- (void)addToRunLoop:(id)runLoop forMode:(id)mode;
+- (double)timestamp;
+- (double)duration;
+- (void)invalidate;
+@end
+
+@interface DisplayLinkTimingProbe : NSObject {
+@public
+  int calls;
+  int error;
+}
+- (void)frame:(CADisplayLink *)link;
+@end
+
+@implementation DisplayLinkTimingProbe
+- (void)frame:(CADisplayLink *)link {
+  double timestamp = [link timestamp];
+  usleep(1000);
+  if ([link timestamp] != timestamp || timestamp <= 0)
+    error = -2;
+  double refresh = [link duration];
+  if (refresh < 0.01666666666 || refresh > 0.01666666667)
+    error = -3;
+  calls++;
+}
+@end
+
+// The timestamp remains stable for a frame, and firing every two refreshes
+// does not double the duration of the physical display's refresh cycle.
+// https://developer.apple.com/documentation/quartzcore/cadisplaylink/duration
+// https://developer.apple.com/documentation/quartzcore/cadisplaylink/timestamp
+int test_CADisplayLink_refresh_clock(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  DisplayLinkTimingProbe *probe = [[DisplayLinkTimingProbe alloc] init];
+  CADisplayLink *link = [[CADisplayLink displayLinkWithTarget:probe
+                              selector:@selector(frame:)] retain];
+  [link setFrameInterval:2];
+  [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSDefaultRunLoopMode];
+  for (int i = 0; i < 100 && !probe->calls; i++)
+    pump_dispatch_main_loop();
+  int result = probe->calls ? probe->error : -1;
+  [link invalidate];
+  [link release];
+  [probe release];
+  [pool drain];
+  return result;
+}

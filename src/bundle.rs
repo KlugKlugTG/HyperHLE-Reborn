@@ -22,6 +22,9 @@ use std::io::Cursor;
 pub struct Bundle {
     path: GuestPathBuf,
     plist: Dictionary,
+    /// Immutable metadata used at every guest/JIT dispatch boundary. Avoid
+    /// hashing the Info.plist dictionary for a value that never changes.
+    identifier: String,
 }
 
 impl Bundle {
@@ -47,13 +50,14 @@ impl Bundle {
                 bundle_data.bundle_name()
             }
         );
-        let bundle_id = plist["CFBundleIdentifier"].as_string().unwrap();
+        let bundle_id = plist["CFBundleIdentifier"].as_string().unwrap().to_owned();
 
-        let (fs, guest_path) = Fs::new(bundle_data, bundle_name, bundle_id, read_only_mode);
+        let (fs, guest_path) = Fs::new(bundle_data, bundle_name, &bundle_id, read_only_mode);
 
         let bundle = Bundle {
             path: guest_path,
             plist,
+            identifier: bundle_id,
         };
 
         Ok((bundle, fs))
@@ -64,6 +68,7 @@ impl Bundle {
         Bundle {
             path: GuestPathBuf::from(String::new()),
             plist: Dictionary::new(),
+            identifier: "org.touchhle.app-picker".to_owned(),
         }
     }
 
@@ -72,10 +77,7 @@ impl Bundle {
     }
 
     pub fn bundle_identifier(&self) -> &str {
-        self.plist
-            .get("CFBundleIdentifier")
-            .and_then(|v| v.as_string())
-            .unwrap_or("org.touchhle.app-picker")
+        &self.identifier
     }
 
     pub fn bundle_version(&self) -> &str {

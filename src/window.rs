@@ -2835,6 +2835,7 @@ impl Window {
     /// presented.
     pub fn swap_window(&mut self) {
         self.window.gl_swap_window();
+        crate::gles::present::note_window_swap();
         self.perf_hints.frame_presented();
         crate::gles::perf_overlay::record_host_present();
 

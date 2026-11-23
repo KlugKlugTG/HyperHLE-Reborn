@@ -49,6 +49,9 @@ struct CADisplayLinkHostObject {
     /// and the value must be `>= 1`.
     /// <https://developer.apple.com/documentation/quartzcore/cadisplaylink/1648526-frameinterval>
     frame_interval: NSInteger,
+    /// Constant during a notification, even if the target yields or reads
+    /// it repeatedly. `timestamp` describes the last frame, not read time.
+    timestamp: f64,
 }
 impl HostObject for CADisplayLinkHostObject {}
 
@@ -95,27 +98,22 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // The time value associated with the last displayed frame.
 // Per Apple docs, this is a CFTimeInterval (f64) measuring seconds since
-// the system started. We return CACurrentMediaTime() as a best-effort
-// approximation so that apps computing dt = (timestamp - lastTimestamp)
-// get a plausible positive value rather than 0 or NaN.
+// the system started. Cache it at notification time so repeated reads
+// describe the same frame even when the callback does other work.
 // <https://developer.apple.com/documentation/quartzcore/cadisplaylink/1648478-timestamp>
 - (f64)timestamp {
-    crate::frameworks::core_animation::CACurrentMediaTime(env)
+    env.objc.borrow::<CADisplayLinkHostObject>(this).timestamp
 }
 
 // The time interval between screen refresh updates.
 // Per Apple docs: "The time interval between screen refresh updates. The
 // value of this property is undefined until the timer has fired at least
 // once."
-// We derive it from the underlying NSTimer interval so that changes to
-// frameInterval are reflected here.
+// This is the refresh period, independent of frameInterval: a link firing
+// every other refresh still reports the display's 1/60-second duration.
 // <https://developer.apple.com/documentation/quartzcore/cadisplaylink/1648422-duration>
 - (f64)duration {
-    let ns_timer = env.objc.borrow::<CADisplayLinkHostObject>(this).ns_timer;
-    if ns_timer == nil {
-        return 1.0 / 60.0;
-    }
-    msg![env; ns_timer timeInterval]
+    1.0 / 60.0
 }
 
 // frameInterval: the number of display refreshes between notifications.
@@ -131,6 +129,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     // Apple docs state the value must be >= 1; clamp to keep guests alive
     // rather than raising NSInvalidArgumentException.
     let safe_interval = frameInterval.max(1);
+    if crate::env_flag_cached!("TOUCHHLE_FRAME_TIMES") {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static REPORTED: AtomicU32 = AtomicU32::new(0);
+        if REPORTED.fetch_add(1, Ordering::Relaxed) < 16 {
+            log!("DISPLAY-LINK frame_interval={} target_fps={:.2}", safe_interval, 60.0 / safe_interval as f64);
+        }
+    }
     env.objc.borrow_mut::<CADisplayLinkHostObject>(this).frame_interval = safe_interval;
     let interval = safe_interval as f64 / 60.0;
 
@@ -216,6 +221,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         // but just not passing the actual call.
         return;
     }
+    let timestamp = crate::frameworks::core_animation::CACurrentMediaTime(env);
+    env.objc.borrow_mut::<CADisplayLinkHostObject>(this).timestamp = timestamp;
     // Signature is `- (void) selector:(CADisplayLink *)sender;`
     () = msg_send(env, (target, selector.unwrap(), this));
 }

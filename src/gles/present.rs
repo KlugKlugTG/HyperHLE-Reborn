@@ -18,8 +18,8 @@ pub struct FpsCounter {
     frames: u32,
 }
 
-// DIAG (TOUCHHLE_STALL_DIAG): epoch-millis of the last presented frame, updated
-// at the top of present_frame. The main run loop reads this to detect a guest
+// DIAG (TOUCHHLE_STALL_DIAG): epoch-millis of the last window swap. The
+// main run loop reads this to detect a guest
 // hang (frames stop being presented while the guest keeps burning CPU) and dump
 // the spinning thread's stack. 0 = nothing presented yet.
 static LAST_PRESENT_MS: AtomicU64 = AtomicU64::new(0);
@@ -29,6 +29,14 @@ fn epoch_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Track every presentation backend, including the direct GLES2 path that
+/// does not use `present_frame`. Keep clock reads out of normal runs.
+pub fn note_window_swap() {
+    if crate::env_flag_cached!("TOUCHHLE_STALL_DIAG") {
+        LAST_PRESENT_MS.store(epoch_ms(), Ordering::Relaxed);
+    }
 }
 
 /// Milliseconds since the last presented frame, or `None` if no frame has been
@@ -93,9 +101,6 @@ pub unsafe fn present_frame(
     // so these need to be updated in tandem.
 
     use gles11::types::*;
-
-    // DIAG: record that a frame reached the present path.
-    LAST_PRESENT_MS.store(epoch_ms(), Ordering::Relaxed);
 
     // Draw the quad
     gles.Viewport(
