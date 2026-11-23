@@ -18,7 +18,7 @@ permissions:
 jobs:
   native-presentation:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -33,7 +33,6 @@ jobs:
       SDL_VIDEO_X11_FORCE_EGL: "1"
       MESA_VK_WSI_DEBUG: sw,noshm
       TOUCHHLE_FRAME_TIMES: "1"
-      TOUCHHLE_NO_PRESENT_FINISH: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Install runtime tools
@@ -44,11 +43,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EMULATOR_RUN: ${{ inputs.emulator_run_id }}
-        run: gh run watch "${EMULATOR_RUN:-45231626187}" --repo "$GITHUB_REPOSITORY" --exit-status --interval 15
+        run: |
+          if [ -z "$EMULATOR_RUN" ]; then
+            for attempt in $(seq 1 30); do
+              EMULATOR_RUN=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow minecraft-diagnostic.yml --commit "$GITHUB_SHA" --json databaseId --jq '.[0].databaseId // empty')
+              if [ -n "$EMULATOR_RUN" ]; then break; fi
+              sleep 2
+            done
+          fi
+          test -n "$EMULATOR_RUN"
+          echo "ANGLE_EMULATOR_RUN=$EMULATOR_RUN" >> "$GITHUB_ENV"
+          gh run watch "$EMULATOR_RUN" --repo "$GITHUB_REPOSITORY" --exit-status --interval 15
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.emulator_run_id || '45231626187' }}
+          run-id: ${{ env.ANGLE_EMULATOR_RUN }}
           name: HyperHLE_Linux_ARM64_diagnostic
           path: emulator
       - uses: actions/download-artifact@v4

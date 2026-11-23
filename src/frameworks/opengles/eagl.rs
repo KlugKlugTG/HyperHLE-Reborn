@@ -38,6 +38,7 @@ struct EaglPresentOptions {
     trace_gl_errors: bool,
     present_mode: PresentMode,
     present_finish: bool,
+    angle_backend: bool,
     /// The framebuffer that draws to the window. This is 0 everywhere except
     /// iOS, where SDL2 renders the window through a framebuffer object of its
     /// own (see `EAGLContextHostObject::drawable_framebuffer`).
@@ -1275,6 +1276,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // Unclear from documentation if this method requires the context to be
     // current, but it would be weird if it didn't?
+    let host_uses_angle = env.window.as_ref().is_some_and(|window| window.is_angle_backend());
     let Some(window) = env.window.as_mut() else {
         log_dbg!(
             "[EAGLContext presentRenderbuffer:{:#x}] ignored in headless mode",
@@ -1399,11 +1401,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         // stall plus two full-frame copies per frame — very slow, but it
         // never touches the app's GL state).
         //
-        // The readback route used to be the default for every native ES 1.1
-        // backend, i.e. for every ES 1.1 game on Android, where it was by far
-        // the biggest per-frame cost. It's now an explicit choice
-        // (--present-mode=readback) or an automatic fallback when the GPU
-        // route demonstrably produces black frames on this driver.
+        // ANGLE's native ES1 path preserves guest state and copies on the GPU.
+        // Keep RAM readback for the translator and vendor ES1 drivers whose
+        // presentation path has not been validated, or if the probe fails.
         let use_readback = match env.options.present_mode {
             PresentMode::Readback => {
                 if backend_is_es2 && !backend_is_translator {
@@ -1423,16 +1423,9 @@ pub const CLASSES: ClassExports = objc_classes! {
             // (its glDrawArrays is the fixed-function emulation itself), so
             // it keeps using readback unless explicitly overridden.
             PresentMode::Auto => {
-                // Native ES 1.1 games keep the readback presenter by default.
-                // The GPU-copy path changes guest-visible fixed-function state
-                // in ways 2D engines (cocos2d etc.) notice — sprite
-                // blending/tinting breaks even though the frame is not black,
-                // so the automatic black-frame fallback never triggers. ES 2.0
-                // backends keep the fast GPU path (its save/restore is exact,
-                // and that is where the 3D games live).
                 backend_is_translator
-                    || backend_is_native_es1
-                    || (backend_is_es2 && direct_present_is_broken())
+                    || (backend_is_native_es1 && !host_uses_angle)
+                    || ((backend_is_native_es1 || backend_is_es2) && direct_present_is_broken())
             }
         };
         {
@@ -1474,6 +1467,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                 trace_gl_errors: env.options.trace_gl_errors,
                 present_mode: env.options.present_mode,
                 present_finish: env.options.present_finish,
+                angle_backend: host_uses_angle,
                 window_framebuffer: env
                     .objc
                     .borrow::<EAGLContextHostObject>(this)
@@ -3420,36 +3414,15 @@ unsafe fn present_renderbuffer(
             );
             (texture, false)
         };
-    // glCopyTex(Sub)Image2D from the bound framebuffer is ordered after the
-    // app's draws into it by the driver; that's what the spec guarantees and
-    // what every driver we've seen honours. We used to glFinish() here
-    // regardless, on the suspicion that a Mali-G57 r32p1 "title menu renders
-    // as a uniform colour" bug was a missing tile resolve — it turned out to
-    // be mipmap-incomplete textures (see fix_texture_min_filter). A full
-    // pipeline drain every frame is the single most expensive thing a
-    // presenter can do on a tile-based GPU (it serialises CPU and GPU and
-    // defeats the driver's frame pipelining), so it is opt-in now:
-    // --present-finish / TOUCHHLE_PRESENT_FINISH=1.
-    // Tile-based GPUs resolve the app's draws to the renderbuffer's main
-    // memory at well-defined sync points. CopyTex(Sub)Image2D is spec-ordered
-    // after the app's draws, but real ES 1.1 surfaces (Adreno/Mali, native or
-    // over ANGLE) have historically needed an explicit drain for alpha-blended
-    // 2D scenes (many small quads): without it, the copy can race the tile
-    // resolve and produce partially-drawn / garbled frames, while 3D scenes
-    // (few big depth-tested draws) usually happen to be fine. Keep the full
-    // drain as the default on native ES 1.1 backends (it was unconditional
-    // before the GPU-present rework); on ES 2.0 shader backends the resolve
-    // is reliable, so it stays opt-in there.
-    let native_es1 = gles.is_native_es1();
+    // Copies are ordered after draws. ANGLE's Vulkan path explicitly records
+    // source transfer reads and destination writes and closes the render pass;
+    // it needs no CPU/GPU pipeline drain. Retain the vendor-native ES1 option
+    // for older drivers, and the user's explicit --present-finish override.
+    // https://github.com/google/angle/blob/b7a90a6cc08e52857a6addc2bc2e569b7b01e9df/src/libANGLE/renderer/vulkan/TextureVk.cpp
     let finish_before_copy = options.present_finish
-        || (native_es1 && !crate::env_flag_cached!("TOUCHHLE_NO_PRESENT_FINISH"));
-    if finish_before_copy && !options.present_finish {
-        log_once!(
-            "EAGL presenter: native ES1.1 backend - forcing glFinish before the \
-             renderbuffer copy (tile-resolve safety for 2D alpha-blended games; \
-             opt out with TOUCHHLE_NO_PRESENT_FINISH=1)."
-        );
-    }
+        || (gles.is_native_es1()
+            && !options.angle_backend
+            && !crate::env_flag_cached!("TOUCHHLE_NO_PRESENT_FINISH"));
     if finish_before_copy {
         gles.Finish();
     }

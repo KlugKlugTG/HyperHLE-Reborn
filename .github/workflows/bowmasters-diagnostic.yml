@@ -9,11 +9,10 @@ on:
       emulator_run_id:
         description: Successful Linux emulator build to test
         type: string
-        default: "45215523820"
       tap_sequence:
         description: Space-separated WAIT:X,Y steps
         type: string
-        default: "1:- 10:- 20:- 30:-"
+        default: "1:- 12:0.5,0.5 10:0.5,0.9 4:0.5,0.87 4:0.5,0.5>0.15,0.75@0.7 15:-"
 
 permissions:
   contents: read
@@ -22,7 +21,7 @@ permissions:
 jobs:
   bowmasters:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       contents: write # Read the private draft fixture; never publish it.
       actions: read
@@ -31,8 +30,8 @@ jobs:
       ALSOFT_DRIVERS: "null"
       TOUCHHLE_STALL_DIAG: "1"
       TOUCHHLE_FRAME_TIMES: "1"
-      BOWMASTERS_BUILD_RUN: ${{ inputs.emulator_run_id || '45215523820' }}
-      BOWMASTERS_TAPS: ${{ inputs.tap_sequence || '1:- 10:- 20:- 30:-' }}
+      BOWMASTERS_BUILD_RUN: ${{ inputs.emulator_run_id }}
+      BOWMASTERS_TAPS: ${{ inputs.tap_sequence || '1:- 12:0.5,0.5 10:0.5,0.9 4:0.5,0.87 4:0.5,0.5>0.15,0.75@0.7 15:-' }}
     steps:
       - uses: actions/checkout@v4
       - name: Install runtime and profiling tools
@@ -42,11 +41,21 @@ jobs:
       - name: Require successful build and tests
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh run watch "$BOWMASTERS_BUILD_RUN" --repo "$GITHUB_REPOSITORY" --exit-status --interval 15
+        run: |
+          if [ -z "$BOWMASTERS_BUILD_RUN" ]; then
+            for attempt in $(seq 1 30); do
+              BOWMASTERS_BUILD_RUN=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow minecraft-diagnostic.yml --commit "$GITHUB_SHA" --json databaseId --jq '.[0].databaseId // empty')
+              if [ -n "$BOWMASTERS_BUILD_RUN" ]; then break; fi
+              sleep 2
+            done
+          fi
+          test -n "$BOWMASTERS_BUILD_RUN"
+          echo "BOWMASTERS_BUILD_RUN=$BOWMASTERS_BUILD_RUN" >> "$GITHUB_ENV"
+          gh run watch "$BOWMASTERS_BUILD_RUN" --repo "$GITHUB_REPOSITORY" --exit-status --interval 15
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.emulator_run_id || '45215523820' }}
+          run-id: ${{ env.BOWMASTERS_BUILD_RUN }}
           name: HyperHLE_Linux_ARM64_diagnostic
           path: emulator
       - name: Download private game fixture
@@ -89,6 +98,8 @@ jobs:
               sleep 0.5
             done
             test -n "$game_pid"
+            # Measure tutorial/gameplay after startup shader compilation.
+            sleep 15
             perf_exe=$(rg --files -L /usr/lib/linux-tools* | rg '/perf$' | head -n 1)
             test -n "$perf_exe" || { echo 'No installed perf executable found' >&2; exit 1; }
             echo "Profiling PID $game_pid with $perf_exe"
