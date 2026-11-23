@@ -54,7 +54,10 @@ fn mach_absolute_time(env: &mut Environment) -> u64 {
 /// tight loop to pace their frame rate or poll loop. A return-0 stub makes
 /// them busy-spin, hammering the host CPU and starving other guest
 /// threads, and was observed right before a SIGSEGV in Bioshock.
-fn mach_wait_until(env: &mut Environment, deadline: u64) {
+// https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/mach_time.h
+// This returns kern_return_t: leaving r0 untouched exposes the deadline's
+// low word as a spurious error to engines that check the wait result.
+fn mach_wait_until(env: &mut Environment, deadline: u64) -> kern_return_t {
     let now = env.guest_clock.now();
     let now_nanos: u64 = now
         .duration_since(env.startup_time)
@@ -64,6 +67,7 @@ fn mach_wait_until(env: &mut Environment, deadline: u64) {
     if deadline > now_nanos {
         env.sleep_guest(Duration::from_nanos(deadline - now_nanos));
     }
+    KERN_SUCCESS
 }
 
 pub const FUNCTIONS: FunctionExports = &[

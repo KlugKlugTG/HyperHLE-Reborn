@@ -26,6 +26,7 @@
 #include <limits.h>
 #include <locale.h>
 #include <mach/kern_return.h>
+#include <mach/mach_time.h>
 #include <mach/thread_info.h>
 #include <math.h>
 #include <pthread.h>
@@ -5244,6 +5245,39 @@ int test_frexp() {
   return 0;
 }
 
+// https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/mach_time.h
+int test_mach_wait_until_result() {
+  mach_timebase_info_data_t timebase;
+  if (mach_timebase_info(&timebase) != KERN_SUCCESS)
+    return -1;
+  uint64_t start = mach_absolute_time();
+  // Past deadlines also return success, regardless of their low bits.
+  if (mach_wait_until(start ? start - 1 : 0) != KERN_SUCCESS)
+    return -2;
+  uint64_t ticks = 1000000ULL * timebase.denom / timebase.numer + 1;
+  uint64_t deadline = mach_absolute_time() + ticks;
+  if (mach_wait_until(deadline) != KERN_SUCCESS)
+    return -3;
+  return mach_absolute_time() >= deadline ? 0 : -4;
+}
+
+// Invalid intervals must report EINVAL; a zero sleep succeeds without
+// overwriting errno. Signal interruption is tested separately when supported.
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/nanosleep.2.html
+int test_nanosleep_intervals() {
+  struct timespec invalid[] = {{-1, 0}, {0, -1}, {0, 1000000000}};
+  for (unsigned int i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+    errno = 0;
+    if (nanosleep(&invalid[i], NULL) != -1 || errno != EINVAL)
+      return -1;
+  }
+  struct timespec zero = {0, 0};
+  errno = EDOM;
+  if (nanosleep(&zero, NULL) != 0 || errno != EDOM)
+    return -2;
+  return 0;
+}
+
 void jmpfunction(jmp_buf env_buf) { longjmp(env_buf, 432); }
 
 int test_setjmp() {
@@ -7398,6 +7432,8 @@ struct {
     FUNC_DEF(test_maskrune),
     FUNC_DEF(test_frexpf),
     FUNC_DEF(test_frexp),
+    FUNC_DEF(test_mach_wait_until_result),
+    FUNC_DEF(test_nanosleep_intervals),
     FUNC_DEF(test_setjmp),
     FUNC_DEF(test_longjmp_zero_and_negative),
     FUNC_DEF(test_setjmp_vfp_preserved),
