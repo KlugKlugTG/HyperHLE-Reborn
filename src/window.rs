@@ -961,6 +961,9 @@ pub struct Window {
     host_screen_size: Option<(u32, u32)>,
     internal_gl_ins: Option<Box<dyn GLESContext>>,
     perf_context_token: usize,
+    /// Host window damage and input can change emulator overlays even when
+    /// UIKit's layer tree and the guest's last EAGL frame stay unchanged.
+    presentation_revision: u64,
     /// Cached `GL_VERSION / GL_VENDOR / GL_RENDERER` string of the internal
     /// OpenGL ES context, captured at window creation. Used to detect the host
     /// GLES driver (e.g. whether we are running through ANGLE or on a vendor's
@@ -1383,6 +1386,7 @@ impl Window {
             host_screen_size,
             internal_gl_ins: None,
             perf_context_token: crate::gles::perf_overlay::allocate_context_token(),
+            presentation_revision: 0,
             gl_driver_description: String::new(),
             host_framebuffer: 0,
             splash_image,
@@ -1722,6 +1726,20 @@ impl Window {
             } else {
                 break;
             };
+
+            // SDL may discard the front buffer on expose/restore, and host
+            // menus react to input before UIKit sees it. Invalidate cached
+            // composition without tying redraws to sensor event frequency.
+            // https://wiki.libsdl.org/SDL2/SDL_WindowEventID
+            if matches!(&event,
+                E::Window { .. } | E::AppDidEnterForeground { .. }
+                | E::MouseButtonDown { .. } | E::MouseButtonUp { .. }
+                | E::MouseMotion { .. } | E::FingerDown { .. }
+                | E::FingerUp { .. } | E::FingerMotion { .. }
+                | E::KeyDown { .. } | E::KeyUp { .. }
+                | E::ControllerButtonDown { .. } | E::ControllerButtonUp { .. }) {
+                self.presentation_revision = self.presentation_revision.wrapping_add(1);
+            }
 
             // Virtual accelerometer
             match event {
@@ -2993,6 +3011,10 @@ impl Window {
 
     pub fn host_framebuffer(&self) -> u32 {
         self.host_framebuffer
+    }
+
+    pub(crate) fn presentation_revision(&self) -> u64 {
+        self.presentation_revision
     }
 
     pub(crate) fn perf_context_token(&self) -> usize {

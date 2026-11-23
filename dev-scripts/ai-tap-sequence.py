@@ -8,7 +8,7 @@ that frames keep being presented and the process stays alive.
 Usage:
     python dev-scripts/ai-tap-sequence.py APP [--exe PATH] [--cwd DIR] [--out DIR]
         [--step "WAIT:X,Y[*N]"]... [--final-wait SECONDS]
-        [--require-touch-delivery] [--require-nonblack-frame]
+        [--require-touch-delivery] [--require-nonblack-frame] [--require-frame-change]
         [-- extra emulator args]
 
 Each --step waits WAIT seconds, takes a screenshot, then taps at (X, Y),
@@ -17,7 +17,11 @@ X,Y to take a screenshot without tapping. Append `*N` for N rapid taps, e.g.
 `--step "4:0.5,0.5*2"` for a double tap. `--require-touch-delivery` requires
 UIKit to report normal begin/end events for each tap, up to its 12-event log cap.
 `--require-nonblack-frame` rejects a black final screenshot even if the
-compositor reports FPS. Disable emulator overlays when using this check.
+compositor reports FPS. `--require-frame-change` requires the final screenshot
+to differ from the first step screenshot, catching an unchanged splash
+even when frames are still being presented. Use an early screenshot step
+and disable emulator overlays and cursor effects with these image checks.
+A changing image alone does not prove that a game reached its menu.
 
 Windows requires Pillow and pywin32. Linux/X11 requires xdotool, xwininfo,
 and ImageMagick's import.
@@ -156,6 +160,25 @@ def has_nonblack_pixels(path):
     return float(result.stdout) > 0
 
 
+def frames_differ(first, final):
+    if sys.platform == "win32":
+        from PIL import Image, ImageChops
+
+        with Image.open(first) as a, Image.open(final) as b:
+            if a.size != b.size:
+                return True
+            return ImageChops.difference(a.convert("RGB"), b.convert("RGB")).getbbox() is not None
+    # ImageMagick returns 0 for identical images, 1 for differing images,
+    # and 2 for a failure (which must not be treated as visual progress).
+    result = subprocess.run(
+        ["compare", "-metric", "AE", str(first), str(final), "null:"],
+        capture_output=True, text=True,
+    )
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f"could not compare screenshots: {result.stderr.strip()}")
+    return result.returncode == 1
+
+
 def wait_for_process(proc, seconds):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -184,9 +207,13 @@ def main():
     p.add_argument("--final-wait", type=float, default=10.0)
     p.add_argument("--require-touch-delivery", action="store_true")
     p.add_argument("--require-nonblack-frame", action="store_true")
+    p.add_argument("--require-frame-change", action="store_true")
     args = p.parse_args(argv)
     if sys.platform not in ("win32", "linux"):
         p.error("This script supports Windows and Linux/X11 hosts.")
+
+    if args.require_frame_change and not args.step:
+        p.error("--require-frame-change needs at least one --step screenshot")
 
     out = Path(args.out).expanduser().resolve()
     cwd = Path(args.cwd).expanduser().resolve()
@@ -253,6 +280,7 @@ def main():
         return 1
 
     ok = True
+    first_shot = None
     for n, step in enumerate(args.step):
         wait, _, pos = step.partition(":")
         position, tap_count = parse_step_position(pos) if pos != "-" else ("-", 0)
@@ -266,7 +294,8 @@ def main():
             break
         shot = out / f"step{n:02d}.png"
         screenshot(hwnd, shot)
-        before = len(fps_samples)
+        if first_shot is None:
+            first_shot = shot
         if position != "-":
             fx, fy = (float(v) for v in position.split(","))
             tap(hwnd, fx, fy, tap_count)
@@ -296,6 +325,18 @@ def main():
             if args.require_nonblack_frame and not has_nonblack_pixels(out / "final.png"):
                 print("FAIL: final frame is black despite compositor activity")
                 ok = False
+            if args.require_frame_change:
+                try:
+                    changed = frames_differ(first_shot, out / "final.png")
+                except RuntimeError as error:
+                    print(f"FAIL: {error}")
+                    ok = False
+                else:
+                    if not changed:
+                        print("FAIL: final frame is unchanged from the first screenshot")
+                        ok = False
+                    else:
+                        print("Visual progress: final frame differs from the first screenshot")
     if proc.poll() is None:
         proc.kill()
     proc.wait()

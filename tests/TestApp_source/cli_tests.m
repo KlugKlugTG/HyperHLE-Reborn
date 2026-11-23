@@ -26,6 +26,7 @@
 #include <limits.h>
 #include <locale.h>
 #include <mach/kern_return.h>
+#include <mach/mach_time.h>
 #include <mach/thread_info.h>
 #include <math.h>
 #include <pthread.h>
@@ -5244,6 +5245,39 @@ int test_frexp() {
   return 0;
 }
 
+// https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/mach_time.h
+int test_mach_wait_until_result() {
+  mach_timebase_info_data_t timebase;
+  if (mach_timebase_info(&timebase) != KERN_SUCCESS)
+    return -1;
+  uint64_t start = mach_absolute_time();
+  // Past deadlines also return success, regardless of their low bits.
+  if (mach_wait_until(start ? start - 1 : 0) != KERN_SUCCESS)
+    return -2;
+  uint64_t ticks = 1000000ULL * timebase.denom / timebase.numer + 1;
+  uint64_t deadline = mach_absolute_time() + ticks;
+  if (mach_wait_until(deadline) != KERN_SUCCESS)
+    return -3;
+  return mach_absolute_time() >= deadline ? 0 : -4;
+}
+
+// Invalid intervals must report EINVAL; a zero sleep succeeds without
+// overwriting errno. Signal interruption is tested separately when supported.
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/nanosleep.2.html
+int test_nanosleep_intervals() {
+  struct timespec invalid[] = {{-1, 0}, {0, -1}, {0, 1000000000}};
+  for (unsigned int i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+    errno = 0;
+    if (nanosleep(&invalid[i], NULL) != -1 || errno != EINVAL)
+      return -1;
+  }
+  struct timespec zero = {0, 0};
+  errno = EDOM;
+  if (nanosleep(&zero, NULL) != 0 || errno != EDOM)
+    return -2;
+  return 0;
+}
+
 void jmpfunction(jmp_buf env_buf) { longjmp(env_buf, 432); }
 
 int test_setjmp() {
@@ -5260,6 +5294,62 @@ int test_setjmp() {
   jmpfunction(env_buffer);
 
   return -1;
+}
+
+// longjmp(0) must return 1, rather than re-entering initialization forever.
+// https://github.com/apple-oss-distributions/Libc/blob/Libc-594.1.4/arm/sys/_longjmp.s
+int test_longjmp_zero_and_negative() {
+  jmp_buf buffer;
+  volatile int attempts = 0;
+  int status = setjmp(buffer);
+  if (status == 0) {
+    if (++attempts > 1)
+      return -1;
+    longjmp(buffer, 0);
+  }
+  if (status != 1)
+    return -2;
+  status = _setjmp(buffer);
+  if (status == 0)
+    _longjmp(buffer, -123);
+  return status == -123 ? 0 : -3;
+}
+
+// Inspect the actual ARM save area as well as restoring d8-d15. Games and
+// bundled runtimes can mix their own save/restore code with libc calls.
+// https://github.com/apple-oss-distributions/Libc/blob/Libc-594.1.4/arm/sys/_setjmp.s
+int test_setjmp_vfp_preserved() {
+  jmp_buf buffer;
+  unsigned int original[16], actual[16];
+  const unsigned int expected[16] = {
+      0x00000000, 0x3ff00000, 0x00000000, 0x40000000,
+      0x00000000, 0x40080000, 0x00000000, 0x40100000,
+      0x00000000, 0x40140000, 0x00000000, 0x40180000,
+      0x00000000, 0x401c0000, 0x00000000, 0x40200000};
+  const unsigned int cleared[16] = {0};
+  int result = 0;
+  __asm__ volatile("vstmia %0, {d8-d15}" : : "r"(original) : "memory");
+  __asm__ volatile("vldmia %0, {d8-d15}"
+                   : : "r"(expected)
+                   : "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15");
+  if (setjmp(buffer) == 0) {
+    if (memcmp((char *)buffer + 0x24, expected, sizeof(expected)) != 0) {
+      result = -1;
+    } else {
+      __asm__ volatile("vldmia %0, {d8-d15}"
+                       : : "r"(cleared)
+                       : "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15");
+      longjmp(buffer, 1);
+    }
+  } else {
+    __asm__ volatile("vstmia %0, {d8-d15}" : : "r"(actual) : "memory");
+    if (memcmp(actual, expected, sizeof(expected)) != 0)
+      result = -2;
+  }
+  __asm__ volatile("vldmia %0, {d8-d15}"
+                   : : "r"(original)
+                   : "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15");
+  return result;
 }
 
 int test_inet_addr() {
@@ -7342,7 +7432,11 @@ struct {
     FUNC_DEF(test_maskrune),
     FUNC_DEF(test_frexpf),
     FUNC_DEF(test_frexp),
+    FUNC_DEF(test_mach_wait_until_result),
+    FUNC_DEF(test_nanosleep_intervals),
     FUNC_DEF(test_setjmp),
+    FUNC_DEF(test_longjmp_zero_and_negative),
+    FUNC_DEF(test_setjmp_vfp_preserved),
     FUNC_DEF(test_inet_addr),
     FUNC_DEF(test_inet_ntop),
     FUNC_DEF(test_inet_pton),

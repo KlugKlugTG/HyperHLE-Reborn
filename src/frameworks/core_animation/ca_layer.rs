@@ -37,7 +37,7 @@ use crate::objc::{
 use crate::Environment;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub(crate) struct CALayerHostObject {
     // CAMetalLayer storage (Metal presentation path). Kept on the layer host
     // object so CALayer subclasses keep working with the CoreAnimation
@@ -134,6 +134,19 @@ pub(crate) struct CALayerHostObject {
 impl HostObject for CALayerHostObject {}
 
 impl CALayerHostObject {
+    /// Snapshot render state without copying an entire EAGL readback frame.
+    /// Pixel uploads invalidate gles_texture_is_up_to_date; forced EAGL
+    /// presentations always draw, even when the geometry stays the same.
+    pub(super) fn composition_snapshot(&mut self) -> Self {
+        let pixels = self.presented_pixels.take();
+        let mut snapshot = self.clone();
+        if let Some((_, width, height)) = &pixels {
+            snapshot.presented_pixels = Some((Vec::new(), *width, *height));
+        }
+        self.presented_pixels = pixels;
+        snapshot
+    }
+
     pub(super) fn delegate_for_debug(&self) -> id {
         self.delegate
     }

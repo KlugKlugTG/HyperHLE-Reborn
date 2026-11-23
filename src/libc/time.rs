@@ -7,7 +7,7 @@
 
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::libc::clocale::{setlocale, LC_CTYPE};
-use crate::libc::errno::set_errno;
+use crate::libc::errno::{set_errno, EFAULT, EINVAL};
 use crate::libc::stdio::printf::{isspace, isspace_inner};
 use crate::mem::{guest_size_of, ConstPtr, GuestUSize, MutPtr, Ptr, SafeRead};
 use crate::Environment;
@@ -617,18 +617,20 @@ fn gettimeofday(
 }
 
 fn nanosleep(env: &mut Environment, rqtp: ConstPtr<timespec>, _rmtp: MutPtr<timespec>) -> i32 {
-    set_errno(env, 0);
-
+    // https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/nanosleep.2.html
+    // Invalid intervals must fail, not turn into a successful zero sleep
+    // or normalize an out-of-range nanosecond value.
+    if rqtp.is_null() {
+        set_errno(env, EFAULT);
+        return -1;
+    }
     let t = env.mem.read(rqtp);
-    // ИСПРАВЛЕНИЕ: Исключаем панику при отрицательном времени.
-    // Функция `try_into().unwrap()` скрашилась бы с `TryFromIntError` при
-    // отрицательных значениях от плохих игр.
-    // Защищаем Rust-составляющую, ограничивая минимальное время нулем.
-    let tv_sec = t.tv_sec.max(0) as u64;
-    let tv_nsec = t.tv_nsec.max(0) as u64;
-    log_dbg!("nanosleep {} {}", tv_sec, tv_nsec);
-
-    let total_sleep = Duration::from_secs(tv_sec) + Duration::from_nanos(tv_nsec);
+    let tv_nsec = t.tv_nsec;
+    if t.tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
+        set_errno(env, EINVAL);
+        return -1;
+    }
+    let total_sleep = Duration::new(t.tv_sec as u64, tv_nsec as u32);
     env.sleep_guest(total_sleep);
 
     0
