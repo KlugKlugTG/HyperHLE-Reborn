@@ -37,6 +37,35 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::sync::{Mutex, OnceLock};
 
+// GLES BGRA extensions accept BGRA storage; desktop GL accepts BGRA only
+// as the input channel order. Use RGBA storage without changing those bytes.
+// https://registry.khronos.org/OpenGL/extensions/EXT/EXT_texture_format_BGRA8888.txt
+// https://github.com/google/angle/blob/main/src/libANGLE/renderer/gl/formatutilsgl.cpp
+fn desktop_texture_formats(internal: GLint, external: GLenum) -> (GLint, GLenum) {
+    let internal = if internal as GLenum == gl21::BGRA {
+        gl21::RGBA as GLint
+    } else {
+        internal
+    };
+    (internal, external)
+}
+
+#[cfg(test)]
+#[test]
+fn bgra_texture_upload_preserves_input_channel_order() {
+    assert_eq!(
+        desktop_texture_formats(gl21::BGRA as GLint, gl21::BGRA),
+        (gl21::RGBA as GLint, gl21::BGRA),
+    );
+    assert_eq!(
+        desktop_texture_formats(gl21::RGBA as GLint, gl21::BGRA),
+        (gl21::RGBA as GLint, gl21::BGRA),
+    );
+    for format in [gl21::RGB, gl21::RGBA, gl21::ALPHA, gl21::LUMINANCE, gl21::LUMINANCE_ALPHA] {
+        assert_eq!(desktop_texture_formats(format as GLint, format), (format as GLint, format));
+    }
+}
+
 /// List of capabilities shared by OpenGL ES 1.1 and OpenGL 2.1.
 ///
 /// Note: There can be arbitrarily many lights or clip planes, depending on
@@ -2543,11 +2572,7 @@ impl GLES for GLES1OnGL2<'_> {
     ) {
         assert!(target == gl21::TEXTURE_2D);
         assert!(level >= 0);
-        let internalformat = if format == gl21::BGRA {
-            gl21::BGRA as GLint
-        } else {
-            internalformat
-        };
+        let (internalformat, format) = desktop_texture_formats(internalformat, format);
         assert!(
             internalformat as GLenum == gl21::ALPHA
                 || internalformat as GLenum == gl21::RGB
