@@ -76,6 +76,16 @@ jobs:
           cp xvfb.log native-game-results/ 2>/dev/null || true
           cp zenonia-runtime/HyperHLE_log.txt native-game-results/zenonia-detailed.log 2>/dev/null || true
           cp spiderman-runtime/HyperHLE_log.txt native-game-results/spiderman-detailed.log 2>/dev/null || true
+      - name: Spider-Man native direct presentation comparison
+        if: success() || failure()
+        run: |
+          cp -a native-emulator spiderman-direct-runtime
+          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/spiderman.ipa" --exe "$GITHUB_WORKSPACE/native-emulator/touchHLE" --cwd "$GITHUB_WORKSPACE/spiderman-direct-runtime" --out native-game-results/spiderman-direct --step '1:-' --step '60:-' --step '20:0.5,0.5' --final-wait 25 --require-nonblack-frame --require-frame-change --require-touch-delivery -- --gles1=gles1_native --device-family=iphone-4s --present-mode=direct --overlay=off --fix-texture-min-filter --trace-gl-errors
+      - name: Preserve the direct comparison log
+        if: always()
+        run: |
+          mkdir -p native-game-results
+          cp spiderman-direct-runtime/HyperHLE_log.txt native-game-results/spiderman-direct-detailed.log 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
