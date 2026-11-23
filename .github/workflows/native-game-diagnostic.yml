@@ -24,6 +24,7 @@ jobs:
       MESA_VK_WSI_DEBUG: sw,noshm
       SDL_VIDEO_X11_FORCE_EGL: "1"
       TOUCHHLE_FIX_TEXTURE_MIN_FILTER: "1"
+      TOUCHHLE_TRACE_NATIVE_GL_STATE: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Install prebuilt runtime packages
@@ -33,7 +34,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
-          run-id: 45154298498
+          run-id: 45159326291
           name: HyperHLE_Linux_ARM64_diagnostic
           path: native-emulator
       - uses: actions/download-artifact@v4
