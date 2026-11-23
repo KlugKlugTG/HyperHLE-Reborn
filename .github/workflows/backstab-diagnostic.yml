@@ -1,0 +1,81 @@
+name: BackStab menu-to-gameplay diagnostics
+
+on:
+  push:
+    branches: ["fix/backstab-gameplay"]
+    paths: [.github/workflows/backstab-diagnostic.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  backstab:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    permissions:
+      contents: write # Read the private draft input; never publish it.
+      actions: read
+    env:
+      DISPLAY: ":99"
+      ALSOFT_DRIVERS: "null"
+      ANGLE_DEFAULT_PLATFORM: vulkan
+      SDL_VIDEO_X11_FORCE_EGL: "1"
+      TOUCHHLE_FIX_TEXTURE_MIN_FILTER: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install prebuilt runtime packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ripgrep xvfb xdotool x11-utils imagemagick python3 libsndio-dev libstdc++6 libgl1 libegl1 libgles1 libvulkan1 mesa-vulkan-drivers
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45159326291
+          name: HyperHLE_Linux_ARM64_diagnostic
+          path: native-emulator
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45154298497
+          name: ANGLE_Linux_ARM64_GLES1
+          path: native-angle
+      - name: Download the private BackStab input
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          fixture_ready=0
+          for attempt in $(seq 1 60); do
+            fixture_ready=$(gh api "repos/$GITHUB_REPOSITORY/releases/455271225" --jq '[.assets[] | select(.name == "backstab.ipa" and .state == "uploaded")] | length')
+            if [ "$fixture_ready" = 1 ]; then break; fi
+            sleep 10
+          done
+          test "$fixture_ready" = 1
+          gh release download ci-private-native-games-20261123 --repo "$GITHUB_REPOSITORY" --pattern backstab.ipa --dir private-inputs
+          test -s private-inputs/backstab.ipa
+      - name: Start the native graphics runtime
+        run: |
+          chmod +x native-emulator/touchHLE
+          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/native-angle" >> "$GITHUB_ENV"
+          echo "SDL_VIDEO_EGL_DRIVER=$GITHUB_WORKSPACE/native-angle/libEGL.so" >> "$GITHUB_ENV"
+          echo "SDL_VIDEO_GL_DRIVER=$GITHUB_WORKSPACE/native-angle/libGLESv1_CM.so" >> "$GITHUB_ENV"
+          native_icd=$(rg --files /usr/share/vulkan/icd.d | rg '/lvp.*\.json$' | head -n 1)
+          test -n "$native_icd"
+          echo "VK_DRIVER_FILES=$native_icd" >> "$GITHUB_ENV"
+          Xvfb :99 -screen 0 1280x960x24 -ac > xvfb.log 2>&1 &
+          sleep 2
+      - name: BackStab title, menu and game-start interaction
+        run: |
+          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/backstab.ipa" --exe "$GITHUB_WORKSPACE/native-emulator/touchHLE" --cwd "$GITHUB_WORKSPACE/native-emulator" --out backstab-results --step '1:-' --step '50:0.5,0.83' --step '10:-' --step '5:0.2,0.36' --step '20:-' --step '30:-' --final-wait 15 --require-nonblack-frame --require-frame-change --require-touch-delivery -- --gles1=gles1_native --device-family=iphone-3gs --overlay=off --fix-texture-min-filter --trace-gl-errors
+      - name: Preserve diagnostic logs
+        if: always()
+        run: |
+          mkdir -p backstab-results
+          cp xvfb.log backstab-results/ 2>/dev/null || true
+          cp native-emulator/HyperHLE_log.txt backstab-results/detailed.log 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: BackStab_gameplay_diagnostics
+          path: backstab-results/
