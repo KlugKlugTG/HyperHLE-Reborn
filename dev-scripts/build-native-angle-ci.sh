@@ -29,6 +29,17 @@ sed -i -e "/'third_party\/dawn'\: /,+3d" -e "/'third_party\/llvm\/src'\: /,+3d" 
 # ARM runner's compiler and GN/Ninja; these libraries do not need Rust.
 gclient sync --nohooks --no-history -f -D -R
 python3 build/util/lastchange.py -o build/util/LASTCHANGE
+# Modern GN requires actions that generate public headers to be public
+# dependencies. Correct those declarations in the pinned Wayland files.
+python3 - <<'PYFIX'
+from pathlib import Path
+p = Path('third_party/wayland/wayland_protocol.gni')
+s = p.read_text().replace('deps = [ ":$action_name" ]', 'public_deps = [ ":$action_name" ]')
+p.write_text(s)
+p = Path('third_party/wayland/BUILD.gn')
+s = p.read_text().replace('  deps = [\n    ":wayland_dtd_h",', '  public_deps = [ ":wayland_dtd_h" ]\n  deps = [')
+p.write_text(s)
+PYFIX
 mkdir -p out/NativeGLES
 cat > out/NativeGLES/args.gn <<'EOF'
 target_os = "linux"
@@ -42,7 +53,6 @@ angle_build_tests = false
 angle_enable_gl = true
 angle_enable_vulkan = true
 angle_enable_swiftshader = false
-angle_enable_d3d9 = false
 angle_enable_d3d11 = false
 angle_enable_metal = false
 angle_enable_wgpu = false
