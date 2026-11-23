@@ -36,6 +36,146 @@ pub(super) struct State {
     recomposite_next: Option<Instant>,
     fps_counter: Option<FpsCounter>,
     misc_gl_objects: Option<MiscGlObjects>,
+    last_scene: Option<CompositedScene>,
+}
+
+#[derive(PartialEq)]
+struct CompositedScene {
+    layers: Vec<(id, CALayerHostObject)>,
+    viewport: (u32, u32, u32, u32),
+    rotation: Matrix<2>,
+    cursor: Option<(f32, f32, bool)>,
+    scale: (u32, u32),
+    framebuffer: u32,
+}
+
+// A composited EAGL frame only needs another draw when its layer tree or
+// host presentation changes. Core Animation retains backing stores between
+// commits; it does not rasterize unchanged layers on every run-loop poll.
+// https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/CoreAnimation_guide/CoreAnimationBasics/CoreAnimationBasics.html
+fn snapshot_layers(objc: &mut ObjC, roots: &[id]) -> Option<Vec<(id, CALayerHostObject)>> {
+    fn visit(
+        objc: &mut ObjC,
+        layer: id,
+        depth: usize,
+        layers: &mut Vec<(id, CALayerHostObject)>,
+        has_readback: &mut bool,
+    ) -> bool {
+        if depth >= 128 {
+            return false;
+        }
+        let snapshot = objc
+            .borrow_mut::<CALayerHostObject>(layer)
+            .composition_snapshot();
+        if !snapshot.hidden {
+            // Animation values are calculated during composition; never
+            // reuse a scene while an animation or bitmap redraw is pending.
+            if snapshot.needs_display
+                || !snapshot.animations.is_empty()
+                || !snapshot.anonymous_animations.is_empty()
+            {
+                return false;
+            }
+            *has_readback |= snapshot.presented_pixels.is_some();
+        }
+        let children = if snapshot.hidden {
+            Vec::new()
+        } else {
+            snapshot.sublayers.clone()
+        };
+        layers.push((layer, snapshot));
+        for child in children {
+            if !visit(objc, child, depth + 1, layers, has_readback) {
+                return false;
+            }
+        }
+        true
+    }
+    let mut layers = Vec::new();
+    let mut has_readback = false;
+    for &root in roots {
+        if !visit(objc, root, 0, &mut layers, &mut has_readback) {
+            return None;
+        }
+    }
+    // Keep the existing periodic compositor for apps with UIKit-only UI.
+    has_readback.then_some(layers)
+}
+
+fn snapshot_scene(env: &mut Environment) -> Option<CompositedScene> {
+    if crate::frameworks::media_player::has_active_video(env) {
+        return None;
+    }
+    let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+    let roots: Vec<id> = windows
+        .into_iter()
+        .map(|window| msg![env; window layer])
+        .collect();
+    let layers = snapshot_layers(&mut env.objc, &roots)?;
+    let window = env.window.as_ref()?;
+    Some(CompositedScene {
+        layers,
+        viewport: window.viewport(),
+        rotation: window.rotation_matrix(),
+        cursor: window.virtual_cursor_visible_at(),
+        scale: (env.options.scale_hack.get(), env.options.ui_scale.get()),
+        framebuffer: window.host_framebuffer(),
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn compositor_reuse_observes_ui_changes_and_pending_animation() {
+    let mut mem = crate::mem::Mem::new();
+    mem.set_null_segment_size(0x1000);
+    let mut objc = ObjC::new();
+    objc.register_host_selectors(&mut mem);
+    let class = objc.get_known_class("CALayer", &mut mem);
+    let root = objc.alloc_object(
+        class,
+        Box::new(CALayerHostObject {
+            opacity: 1.0,
+            ..Default::default()
+        }),
+        &mut mem,
+    );
+    let child = objc.alloc_object(
+        class,
+        Box::new(CALayerHostObject {
+            opacity: 1.0,
+            presented_pixels: Some((vec![255; 4], 1, 1)),
+            gles_texture_is_up_to_date: true,
+            ..Default::default()
+        }),
+        &mut mem,
+    );
+    objc.borrow_mut::<CALayerHostObject>(root)
+        .sublayers
+        .push(child);
+    let first = snapshot_layers(&mut objc, &[root]).unwrap();
+    assert!(snapshot_layers(&mut objc, &[root]).unwrap() == first);
+    assert_eq!(
+        objc.borrow::<CALayerHostObject>(child)
+            .presented_pixels
+            .as_ref()
+            .unwrap()
+            .0,
+        vec![255; 4]
+    );
+    // Moving a UIKit overlay must invalidate an otherwise identical frame.
+    objc.borrow_mut::<CALayerHostObject>(child).position.x = 5.0;
+    assert!(snapshot_layers(&mut objc, &[root]).unwrap() != first);
+    objc.borrow_mut::<CALayerHostObject>(child).position.x = 0.0;
+    objc.borrow_mut::<CALayerHostObject>(child)
+        .gles_texture_is_up_to_date = false;
+    assert!(snapshot_layers(&mut objc, &[root]).unwrap() != first);
+    objc.borrow_mut::<CALayerHostObject>(child).needs_display = true;
+    assert!(snapshot_layers(&mut objc, &[root]).is_none());
+    objc.borrow_mut::<CALayerHostObject>(child).needs_display = false;
+    objc.borrow_mut::<CALayerHostObject>(child)
+        .animations
+        .insert("opacity".into(), nil);
+    assert!(snapshot_layers(&mut objc, &[root]).is_none());
 }
 
 struct MiscGlObjects {
@@ -181,6 +321,24 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
                 .composition
                 .recomposite_next = Some(next);
             return Some(next);
+        }
+    }
+
+    if !force {
+        if let Some(scene) = snapshot_scene(env) {
+            if env
+                .framework_state
+                .core_animation
+                .composition
+                .last_scene
+                .as_ref()
+                == Some(&scene)
+            {
+                let state = &mut env.framework_state.core_animation.composition;
+                let next = composition_deadline(state.recomposite_next, Instant::now());
+                state.recomposite_next = Some(next);
+                return Some(next);
+            }
         }
     }
 
@@ -651,6 +809,8 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     window.swap_window();
 
     animation_state.update_started_and_finished_animations(env);
+    let scene = snapshot_scene(env);
+    env.framework_state.core_animation.composition.last_scene = scene;
 
     // A readback/composition can exceed one display interval. Schedule
     // against completion so NSRunLoop does not immediately redraw the same
