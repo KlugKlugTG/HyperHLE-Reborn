@@ -64,7 +64,7 @@ impl GLESContext for GLES2OnGL3Context {
     fn make_current<'gl_ctx, 'win: 'gl_ctx>(
         &'gl_ctx mut self,
         window: &'win mut Window,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         // Delegate verbatim to the GL 3.3 Core backend. The `advertise_es3`
         // flag stored inside `inner` is what gives the resulting trait object
         // its OpenGL ES 2.0 identity (see [`GLES::is_es3`]).
@@ -75,7 +75,7 @@ impl GLESContext for GLES2OnGL3Context {
         &'gl_ctx mut self,
         make_current_fn: &mut dyn FnMut(&crate::window::GLContext),
         loader_fn: &mut dyn FnMut(&'static str) -> *const std::ffi::c_void,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         self.inner
             .make_current_unchecked_for_window(make_current_fn, loader_fn)
     }

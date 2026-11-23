@@ -590,9 +590,9 @@ impl GLESContext for GLES1OnGL2Context {
     fn make_current<'gl_ctx, 'win: 'gl_ctx>(
         &'gl_ctx mut self,
         window: &'win mut Window,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if self.gl_ctx.is_current() && self.is_loaded {
-            return Box::new(GLES1OnGL2 {
+            return crate::gles::CurrentGLES::ES1OnGL2(GLES1OnGL2 {
                 state: &mut self.state,
             });
         }
@@ -603,7 +603,7 @@ impl GLESContext for GLES1OnGL2Context {
         gl21::load_with(|s| window.gl_get_proc_address(s));
         self.is_loaded = true;
 
-        Box::new(GLES1OnGL2 {
+        crate::gles::CurrentGLES::ES1OnGL2(GLES1OnGL2 {
             state: &mut self.state,
         })
     }
@@ -612,9 +612,9 @@ impl GLESContext for GLES1OnGL2Context {
         &'gl_ctx mut self,
         make_current_fn: &mut dyn FnMut(&GLContext),
         loader_fn: &mut dyn FnMut(&'static str) -> *const std::ffi::c_void,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if self.gl_ctx.is_current() && self.is_loaded {
-            return Box::new(GLES1OnGL2 {
+            return crate::gles::CurrentGLES::ES1OnGL2(GLES1OnGL2 {
                 state: &mut self.state,
             });
         }
@@ -623,7 +623,7 @@ impl GLESContext for GLES1OnGL2Context {
         gl21::load_with(loader_fn);
         self.is_loaded = true;
 
-        Box::new(GLES1OnGL2 {
+        crate::gles::CurrentGLES::ES1OnGL2(GLES1OnGL2 {
             state: &mut self.state,
         })
     }

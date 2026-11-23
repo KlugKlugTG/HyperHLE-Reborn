@@ -191,9 +191,9 @@ impl GLESContext for GLES1NativeContext {
     fn make_current<'gl_ctx, 'win: 'gl_ctx>(
         &'gl_ctx mut self,
         window: &'win mut Window,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if self.gl_ctx.is_current() && self.is_loaded {
-            return Box::new(GLES1Native {
+            return crate::gles::CurrentGLES::NativeES1(GLES1Native {
                 _gl_lifetime: PhantomData,
                 pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
                 pvrtc_native: self.pvrtc_native,
@@ -227,7 +227,7 @@ impl GLESContext for GLES1NativeContext {
                 },
             );
         }
-        Box::new(GLES1Native {
+        crate::gles::CurrentGLES::NativeES1(GLES1Native {
             _gl_lifetime: PhantomData,
             pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
             pvrtc_native: self.pvrtc_native,
@@ -239,9 +239,9 @@ impl GLESContext for GLES1NativeContext {
         &'gl_ctx mut self,
         make_current_fn: &mut dyn FnMut(&GLContext),
         loader_fn: &mut dyn FnMut(&'static str) -> *const std::ffi::c_void,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if self.gl_ctx.is_current() && self.is_loaded {
-            return Box::new(GLES1Native {
+            return crate::gles::CurrentGLES::NativeES1(GLES1Native {
                 _gl_lifetime: PhantomData,
                 pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
                 pvrtc_native: self.pvrtc_native,
@@ -258,7 +258,7 @@ impl GLESContext for GLES1NativeContext {
             self.discard_ext_checked = true;
             self.pvrtc_native_checked = true;
         }
-        Box::new(GLES1Native {
+        crate::gles::CurrentGLES::NativeES1(GLES1Native {
             _gl_lifetime: PhantomData,
             pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
             pvrtc_native: self.pvrtc_native,
