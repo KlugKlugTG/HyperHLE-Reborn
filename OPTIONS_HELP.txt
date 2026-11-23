@@ -581,6 +581,12 @@ Other options:
         ANGLE's stricter shader validation, which breaks some apps (e.g.
         Gangstar), but it differs a lot between devices, so it is opt-in.
 
+        ANGLE is never used on some known-bad configurations regardless of
+        this option: PowerVR BXM-8-256 (ANGLE startup crash) and Qualcomm
+        Adreno 610 (e.g. the Snapdragon 665-class parts). On those devices
+        the native OpenGL ES driver is used instead, and the "GLES Native"
+        switch is disabled in the picker.
+
     --fix-texture-min-filter
         Workaround for apps that rely on the default ES 1.1
         GL_TEXTURE_MIN_FILTER (GL_NEAREST_MIPMAP_LINEAR) being usable
