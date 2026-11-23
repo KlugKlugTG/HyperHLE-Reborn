@@ -470,6 +470,46 @@ int test_dispatch_background_group(void) {
 
 static void barrier_finish(void *context) { (void)context; }
 
+static int deferred_queue_key;
+static void deferred_queue_callback(void *context) {
+  struct BackgroundQueueProbe *probe = context;
+  if (dispatch_get_current_queue() != probe->queue ||
+      dispatch_get_specific(&deferred_queue_key) != probe)
+    probe->error = -2;
+  probe->calls++;
+}
+
+// Deferred submission retains its destination queue. Releasing the caller's
+// reference must not destroy queue-specific state before the callback runs.
+// https://github.com/apple-oss-distributions/libdispatch/blob/main/man/dispatch_after.3
+// https://github.com/apple-oss-distributions/libdispatch/blob/main/man/dispatch_group_create.3
+int test_dispatch_deferred_queue_lifetime(void) {
+  for (int notification = 0; notification < 2; notification++) {
+    struct BackgroundQueueProbe probe = {0};
+    probe.queue = dispatch_queue_create("TestApp.deferred-lifetime", NULL);
+    dispatch_queue_set_specific(probe.queue, &deferred_queue_key, &probe, NULL);
+    if (notification) {
+      dispatch_group_t group = dispatch_group_create();
+      dispatch_group_enter(group);
+      dispatch_group_notify_f(group, probe.queue, &probe, deferred_queue_callback);
+      dispatch_release(probe.queue);
+      dispatch_group_leave(group);
+      dispatch_release(group);
+    } else {
+      dispatch_after_f(dispatch_time(0, 20000000), probe.queue, &probe,
+                       deferred_queue_callback);
+      dispatch_release(probe.queue);
+    }
+    for (int i = 0; i < 1000 && !probe.calls; i++)
+      usleep(1000);
+    if (probe.calls != 1 || probe.error)
+      return probe.error ? probe.error : -1;
+    // Let worker completion release the queue before reusing the stack.
+    usleep(1000);
+  }
+  return 0;
+}
+
 // Ordinary dispatch_sync must wait behind earlier barriers on concurrent
 // queues; the inline fast path must not bypass pending work.
 // https://developer.apple.com/documentation/dispatch/1452797-dispatch_barrier_async

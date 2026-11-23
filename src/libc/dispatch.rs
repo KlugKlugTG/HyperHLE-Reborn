@@ -161,6 +161,7 @@ pub(crate) fn ensure_worker_capacity(env: &mut Environment) {
         }
         for (queue, task) in get_state(env).delayed.remove(&due).unwrap() {
             queues::enqueue(env, queue, task);
+            dispatch_release(env, queue);
         }
     }
     queues::ensure_capacity(env);
@@ -648,6 +649,7 @@ fn schedule_after(env: &mut Environment, when: u64, queue: dispatch_queue_t, wor
     // https://github.com/apple-oss-distributions/libdispatch/blob/main/man/dispatch_after.3
     let due =
         env.guest_clock.now() + std::time::Duration::from_secs_f64(dispatch_after_delay_secs(when));
+    dispatch_retain(env, queue);
     get_state(env).delayed.entry(due).or_default().push((
         queue,
         MainQueueTask {
@@ -791,6 +793,7 @@ fn dispatch_group_leave(env: &mut Environment, group: dispatch_group_t) {
     }
     for (queue, task) in notifications {
         queues::enqueue(env, queue, task);
+        dispatch_release(env, queue);
         dispatch_release(env, handle);
     }
 }
@@ -861,12 +864,14 @@ fn group_notify(
         group: None,
         barrier: false,
     };
+    dispatch_retain(env, queue);
     let group = get_state(env)
         .groups
         .get_mut(&group.to_bits())
         .expect("invalid dispatch group");
     if group.pending == 0 {
         queues::enqueue(env, queue, task);
+        dispatch_release(env, queue);
     } else {
         group.references = group
             .references

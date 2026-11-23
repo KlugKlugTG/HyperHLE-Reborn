@@ -703,6 +703,7 @@ int test_dispatch_background_deadline(void);  // DispatchMainQueue.m
 int test_dispatch_background_group(void);     // DispatchMainQueue.m
 int test_dispatch_background_barrier(void);   // DispatchMainQueue.m
 int test_dispatch_sync_after_barrier(void);   // DispatchMainQueue.m
+int test_dispatch_deferred_queue_lifetime(void); // DispatchMainQueue.m
 int test_CADisplayLink_refresh_clock(void);    // DispatchMainQueue.m
 int test_NSLock_deadlines(void);              // LockDeadlines.m
 
@@ -7556,6 +7557,7 @@ struct {
     FUNC_DEF(test_dispatch_background_group),
     FUNC_DEF(test_dispatch_background_barrier),
     FUNC_DEF(test_dispatch_sync_after_barrier),
+    FUNC_DEF(test_dispatch_deferred_queue_lifetime),
     FUNC_DEF(test_CADisplayLink_refresh_clock),
     FUNC_DEF(test_NSLock_deadlines),
     FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
