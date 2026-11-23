@@ -7333,6 +7333,65 @@ int test_NSUserDefaults_persistentDomain(void) {
   return result;
 }
 
+@interface NSScanner : NSObject
++ (id)scannerWithString:(NSString *)string;
+- (BOOL)caseSensitive;
+- (void)setCaseSensitive:(BOOL)sensitive;
+- (NSUInteger)scanLocation;
+- (void)setScanLocation:(NSUInteger)location;
+- (BOOL)scanString:(NSString *)string intoString:(NSString **)result;
+- (BOOL)scanUpToString:(NSString *)string intoString:(NSString **)result;
+- (BOOL)scanInt:(int *)result;
+@end
+
+// https://developer.apple.com/documentation/foundation/scanner/casesensitive
+// https://github.com/swiftlang/swift-corelibs-foundation/blob/main/Sources/Foundation/Scanner.swift
+int test_NSScanner_case_sensitivity(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  NSScanner *scanner = [NSScanner scannerWithString:@"AbC 42 END Tail"];
+  NSString *out = @"unchanged";
+  int number = 0;
+  int result = 0;
+  if ([scanner caseSensitive] || ![scanner scanString:@"abc" intoString:&out] ||
+      ![out isEqualToString:@"AbC"] || [scanner scanLocation] != 3)
+    result = -1;
+  [scanner setScanLocation:0];
+  [scanner setCaseSensitive:YES];
+  out = @"unchanged";
+  if (![scanner caseSensitive] || [scanner scanString:@"abc" intoString:&out] ||
+      [scanner scanLocation] != 0 || ![out isEqualToString:@"unchanged"])
+    result = -2;
+  if (![scanner scanString:@"AbC" intoString:NULL] ||
+      ![scanner scanInt:&number] || number != 42 || ![scanner caseSensitive])
+    result = -3;
+  if (![scanner scanUpToString:@"end" intoString:&out] ||
+      ![out isEqualToString:@"END Tail"] || ![scanner caseSensitive])
+    result = -4;
+  [scanner setScanLocation:3];
+  [scanner setCaseSensitive:NO];
+  if (![scanner scanUpToString:@"end" intoString:&out] ||
+      ![out isEqualToString:@"42 "] || [scanner scanLocation] != 7 ||
+      [scanner caseSensitive])
+    result = -5;
+  if (![scanner scanString:@"end" intoString:&out] ||
+      ![out isEqualToString:@"END"] || [scanner scanLocation] != 10)
+    result = -6;
+  // A string scan matches at the current location, never farther ahead.
+  [scanner setScanLocation:0];
+  if ([scanner scanString:@"42" intoString:NULL] || [scanner scanLocation] != 0)
+    result = -7;
+  NSScanner *unicode = [NSScanner scannerWithString:@"\u00c9lan!"];
+  if (![unicode scanString:@"\u00e9LAN" intoString:&out] ||
+      ![out isEqualToString:@"\u00c9lan"] || [unicode scanLocation] != 4)
+    result = -8;
+  NSScanner *empty = [NSScanner scannerWithString:@""];
+  if ([empty scanString:@"" intoString:NULL] || [empty scanUpToString:@"x"
+                                                           intoString:NULL])
+    result = -9;
+  [pool drain];
+  return result;
+}
+
 int test_objc_struct_return_imp(void);
 int test_objc_struct_return_super(void);
 int test_NSProcessInfo_allocated_instance(void);
@@ -7353,6 +7412,7 @@ struct {
   const char *name;
   int known_fail;
 } test_func_array[] = {
+    FUNC_DEF(test_NSScanner_case_sensitivity),
     FUNC_DEF(test_NSProcessInfo_allocated_instance),
     FUNC_DEF(test_objc_struct_return_imp),
     FUNC_DEF(test_objc_struct_return_imp_initialization),

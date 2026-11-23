@@ -574,6 +574,22 @@ fn log_fix_min_filter_status(enabled: bool) {
     }
 }
 
+// Resolve both halves of the existing single-drawable compatibility route.
+// Keeping the driver's depth-RB name after selecting the colour drawable
+// made every presenter copy depth storage instead of the rendered image.
+fn resolve_presented_renderbuffer(
+    bindings: &HashMap<GLuint, id>,
+    reported: GLuint,
+) -> Option<(GLuint, id)> {
+    if let Some(&drawable) = bindings.get(&reported) {
+        Some((reported, drawable))
+    } else if bindings.len() == 1 {
+        bindings.iter().next().map(|(&rb, &drawable)| (rb, drawable))
+    } else {
+        None
+    }
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -1251,7 +1267,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         return false;
     };
 
-    let (renderbuffer, backend_is_translator, backend_is_native_es1, backend_is_es2) = unsafe {
+    let (reported_renderbuffer, backend_is_translator, backend_is_native_es1, backend_is_es2) = unsafe {
         let mut renderbuffer = 0;
         gles.GetIntegerv(gles11::RENDERBUFFER_BINDING_OES, &mut renderbuffer);
         (
@@ -1270,49 +1286,31 @@ pub const CLASSES: ClassExports = objc_classes! {
         .renderbuffer_drawable_bindings
         .borrow();
 
-    // The renderbuffer reported by the driver must be the drawable's colour
-    // renderbuffer, and that is what gets keyed in the map. Some engines
-    // (cocos2d 2.x, e.g. Geometry Dash) leave a different binding current
-    // around presentRenderbuffer:, which makes the driver-reported id miss
-    // the map — on iOS the renderbuffer attached to the drawable is still
-    // presented, so fall back to the single registered binding instead of
-    // silently dropping the frame (the silent drop manifests as a permanent
-    // black screen).
-    let drawable = match bindings.get(&renderbuffer) {
-        Some(&drawable) => drawable,
-        None => {
-            if bindings.len() == 1 {
-                let (&rb, &drawable) = bindings.iter().next().unwrap();
-                {
-                    static MISMATCH_LOGGED: std::sync::Once = std::sync::Once::new();
-                    MISMATCH_LOGGED.call_once(|| {
-                        log!(
-                            "[EAGLContext presentRenderbuffer:] renderbuffer binding \
-                             mismatch: driver reports {:#x}, drawable is bound to \
-                             {:#x}; presenting the bound drawable anyway. \
-                             [this log will only be shown once]",
-                            renderbuffer,
-                            rb
-                        );
-                    });
-                }
-                drawable
-            } else {
-                log!(
-                    "Warning: can't present a renderbuffer {:#x} not bound to a \
-                     drawable ({} bound renderbuffer(s): {:?}) - frame skipped.",
-                    renderbuffer,
-                    bindings.len(),
-                    bindings.keys().copied().collect::<Vec<_>>(),
-                );
-                drop(bindings);
-                if let Some(frame_due) = frame_due {
-                    pace_frame(env, frame_due);
-                }
-                return false;
-            }
+    let Some((renderbuffer, drawable)) =
+        resolve_presented_renderbuffer(&bindings, reported_renderbuffer)
+    else {
+        log!(
+            "Warning: can't present renderbuffer {:#x} not bound to a drawable \
+             ({} bound renderbuffer(s)) - frame skipped.",
+            reported_renderbuffer,
+            bindings.len(),
+        );
+        drop(bindings);
+        if let Some(frame_due) = frame_due {
+            pace_frame(env, frame_due);
         }
+        return false;
     };
+    if renderbuffer != reported_renderbuffer {
+        static MISMATCH_LOGGED: std::sync::Once = std::sync::Once::new();
+        MISMATCH_LOGGED.call_once(|| {
+            log!(
+                "EAGL presentation binding mismatch: driver bound {:#x}; copying \
+                 registered colour renderbuffer {:#x} for drawable {:?}.",
+                reported_renderbuffer, renderbuffer, drawable
+            );
+        });
+    }
     drop(bindings);
     if fullscreen_layer != drawable && attach_orphaned_eagl_view_to_root(env, drawable) {
         fullscreen_layer = find_fullscreen_eagl_layer(env);
@@ -1814,7 +1812,103 @@ unsafe fn get_floats<const N: usize>(gles: &mut dyn GLES, pname: GLenum) -> [GLf
     gles.GetFloatv(pname, res.as_mut_ptr());
     res
 }
-unsafe fn get_renderbuffer_size(gles: &mut dyn GLES) -> (GLsizei, GLsizei) {
+#[cfg(test)]
+mod presentation_buffer_tests {
+    use super::*;
+
+    struct ReadbackBackend {
+        renderbuffer: GLuint,
+        framebuffer: GLuint,
+        fail_read: bool,
+    }
+
+    #[allow(non_snake_case)]
+    impl GLES for ReadbackBackend {
+        unsafe fn GetIntegerv(&mut self, pname: GLenum, value: *mut GLint) {
+            *value = match pname {
+                gles11::RENDERBUFFER_BINDING_OES => self.renderbuffer as GLint,
+                gles11::FRAMEBUFFER_BINDING_OES => self.framebuffer as GLint,
+                _ => panic!("unexpected query {pname:#x}"),
+            };
+        }
+        unsafe fn BindRenderbufferOES(&mut self, target: GLenum, rb: GLuint) {
+            assert_eq!(target, gles11::RENDERBUFFER_OES);
+            self.renderbuffer = rb;
+        }
+        unsafe fn GetRenderbufferParameterivOES(&mut self, _target: GLenum, pname: GLenum, value: *mut GLint) {
+            let (width, height) = if self.renderbuffer == 1 { (2, 1) } else { (8, 4) };
+            *value = match pname {
+                gles11::RENDERBUFFER_WIDTH_OES => width,
+                gles11::RENDERBUFFER_HEIGHT_OES => height,
+                _ => panic!("unexpected size query {pname:#x}"),
+            };
+        }
+        unsafe fn GetFramebufferAttachmentParameterivOES(
+            &mut self, _target: GLenum, attachment: GLenum, _pname: GLenum, value: *mut GLint,
+        ) {
+            assert_eq!(self.framebuffer, 10);
+            assert_eq!(attachment, gles11::COLOR_ATTACHMENT0_OES);
+            *value = 1;
+        }
+        unsafe fn CheckFramebufferStatusOES(&mut self, _target: GLenum) -> GLenum {
+            gles11::FRAMEBUFFER_COMPLETE_OES
+        }
+        unsafe fn Finish(&mut self) {}
+        unsafe fn ReadPixels(&mut self, _x: GLint, _y: GLint, width: GLsizei, height: GLsizei,
+                            format: GLenum, type_: GLenum, pixels: *mut GLvoid) {
+            assert_eq!((width, height), (2, 1));
+            assert_eq!(self.framebuffer, 10);
+            assert_eq!((format, type_), (gles11::RGBA, gles11::UNSIGNED_BYTE));
+            if !self.fail_read {
+                let colours = [255u8, 0, 0, 255, 0, 255, 0, 255];
+                std::ptr::copy_nonoverlapping(colours.as_ptr(), pixels.cast(), colours.len());
+            }
+        }
+    }
+
+    // A depth binding must not replace either the colour image or its size.
+    // https://registry.khronos.org/OpenGL/extensions/OES/OES_framebuffer_object.txt
+    #[test]
+    fn colour_readback_keeps_guest_depth_binding_and_framebuffer() {
+        let drawable: id = crate::mem::Ptr::from_bits(0x1234);
+        let bindings = HashMap::from([(1, drawable)]);
+        let (rb, selected) = resolve_presented_renderbuffer(&bindings, 2).unwrap();
+        assert_eq!((rb, selected), (1, drawable));
+        let mut backend = ReadbackBackend { renderbuffer: 2, framebuffer: 10, fail_read: false };
+        let (pixels, width, height) = unsafe { read_renderbuffer(&mut backend, rb, Vec::new()) };
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(pixels, [255, 0, 0, 255, 0, 255, 0, 255]);
+        assert_eq!((backend.renderbuffer, backend.framebuffer), (2, 10));
+        // The default backend methods panic if a temporary FBO is created:
+        // the real application's colour attachment must remain the source.
+    }
+
+    #[test]
+    fn multiple_drawables_require_an_explicit_binding() {
+        let first: id = crate::mem::Ptr::from_bits(0x1234);
+        let second: id = crate::mem::Ptr::from_bits(0x5678);
+        let bindings = HashMap::from([(1, first), (3, second)]);
+        assert_eq!(resolve_presented_renderbuffer(&bindings, 3), Some((3, second)));
+        assert_eq!(resolve_presented_renderbuffer(&bindings, 2), None);
+        assert_eq!(resolve_presented_renderbuffer(&HashMap::new(), 2), None);
+    }
+
+    #[test]
+    fn failed_readback_does_not_expose_old_or_uninitialized_pixels() {
+        let mut backend = ReadbackBackend { renderbuffer: 2, framebuffer: 10, fail_read: true };
+        let (pixels, _, _) = unsafe { read_renderbuffer(&mut backend, 1, vec![0xaa; 8]) };
+        assert_eq!(pixels, [0; 8]);
+    }
+}
+
+// Size queries address the bound RB, not a framebuffer's colour attachment.
+// Select the requested object temporarily and preserve the guest binding.
+// https://registry.khronos.org/OpenGL/extensions/OES/OES_framebuffer_object.txt
+unsafe fn get_renderbuffer_size(gles: &mut dyn GLES, renderbuffer: GLuint) -> (GLsizei, GLsizei) {
+    let old_renderbuffer = get_int(gles, gles11::RENDERBUFFER_BINDING_OES) as GLuint;
+    if old_renderbuffer != renderbuffer {
+        gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, renderbuffer);
+    }
     let mut width: GLint = 0;
     let mut height: GLint = 0;
     gles.GetRenderbufferParameterivOES(
@@ -1827,20 +1921,22 @@ unsafe fn get_renderbuffer_size(gles: &mut dyn GLES) -> (GLsizei, GLsizei) {
         gles11::RENDERBUFFER_HEIGHT_OES,
         &mut height,
     );
+    if old_renderbuffer != renderbuffer {
+        gles.BindRenderbufferOES(gles11::RENDERBUFFER_OES, old_renderbuffer);
+    }
     (width, height)
 }
 
-/// Copies the pixels in a renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES`
-/// (which should be provided by the app) to a provided [Vec], trying to avoid
+/// Copies the selected colour renderbuffer to a provided [Vec], trying to avoid
 /// noticeably modifying OpenGL ES state while doing so.
 ///
 /// This uses `glReadPixels()`, with all the associated performance risks. Any
-/// existing content in the [Vec] will bereplaced. The format is RGBA8.
+/// existing content in the [Vec] will be replaced. The format is RGBA8.
 /// The returned values are the [Vec], the width and height.
 ///
 /// The provided context must be current.
 unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel_buffer: Vec<u8>) -> (Vec<u8>, u32, u32) {
-    let (width, height) = get_renderbuffer_size(gles);
+    let (width, height) = get_renderbuffer_size(gles, renderbuffer);
     let width_u32: u32 = width.try_into().unwrap();
     let height_u32: u32 = height.try_into().unwrap();
 
@@ -1902,8 +1998,10 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
         .unwrap()
         .checked_mul(4)
         .unwrap();
+    // ReadPixels can fail without writing anything (e.g. an incomplete
+    // framebuffer). Never expose uninitialized allocation bytes as a frame.
     pixel_buffer.clear();
-    pixel_buffer.reserve_exact(size);
+    pixel_buffer.resize(size, 0);
     let before = Instant::now();
     gles.ReadPixels(
         0,
@@ -1920,7 +2018,23 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
         height,
         Instant::now().saturating_duration_since(before)
     );
-    pixel_buffer.set_len(size);
+
+    if gles.is_native_es1() {
+        static READBACK_FRAMES: AtomicU32 = AtomicU32::new(0);
+        let frame = READBACK_FRAMES.fetch_add(1, Ordering::Relaxed);
+        if matches!(frame, 0 | 60 | 300 | 600 | 1800 | 3600) {
+            let step = (pixel_buffer.len() / 4 / 256).max(1);
+            let colour_samples = pixel_buffer.chunks_exact(4).step_by(step)
+                .filter(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0).count();
+            log!(
+                "Native ES1 readback #{}: rb={:#x} {}x{}, guest_fbo={:#x}, \
+                 colour_attachment={:#x}, status={:#x}, app_fbo={}, \
+                 nonblack_samples={}",
+                frame, renderbuffer, width, height, old_framebuffer,
+                attached_renderbuffer, framebuffer_status, use_bound_framebuffer, colour_samples
+            );
+        }
+    }
 
     if !use_bound_framebuffer {
         gles.DeleteFramebuffersOES(1, &src_framebuffer);
@@ -1986,13 +2100,7 @@ unsafe fn present_renderbuffer_es2(
     // Resolve the renderbuffer supplied by `-presentRenderbuffer:` into a
     // texture with cached ES 2.0 objects. Passing this explicit object avoids
     // trusting a guest's later renderbuffer binding.
-    let (width, height) = {
-        let mut w: GLint = 0;
-        let mut h: GLint = 0;
-        gles.GetRenderbufferParameteriv(gles2::RENDERBUFFER, gles2::RENDERBUFFER_WIDTH, &mut w);
-        gles.GetRenderbufferParameteriv(gles2::RENDERBUFFER, gles2::RENDERBUFFER_HEIGHT, &mut h);
-        (w, h)
-    };
+    let (width, height) = get_renderbuffer_size(gles, renderbuffer);
 
     let present_objects = ensure_present_objects(gles);
     if width > 0 && height > 0 {
@@ -3011,7 +3119,7 @@ unsafe fn present_renderbuffer(
     // draw to the default framebuffer via a textured quad, which can be
     // rotated, scaled or letterboxed as appropriate.
 
-    let (width, height) = get_renderbuffer_size(gles);
+    let (width, height) = get_renderbuffer_size(gles, renderbuffer);
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
