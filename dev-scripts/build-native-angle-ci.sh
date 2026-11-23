@@ -10,6 +10,12 @@ angle_commit=b7a90a6cc08e52857a6addc2bc2e569b7b01e9df
 git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git native-depot-tools
 export PATH="$PWD/native-depot-tools:$PATH"
 export VPYTHON_BYPASS="manually managed python not supported by chrome operations"
+# Use a current prebuilt ARM GN; Ubuntu's package predates allowlists.
+curl -fsSL https://chrome-infra-packages.appspot.com/dl/gn/gn/linux-arm64/+/latest -o native-gn.zip
+mkdir native-gn
+unzip -q native-gn.zip -d native-gn
+chmod +x native-gn/gn
+export PATH="$PWD/native-gn:$PATH"
 mkdir native-angle
 cd native-angle
 git init -q
@@ -53,7 +59,7 @@ use_thin_lto = false
 enable_rust = false
 treat_warnings_as_errors = false
 EOF
-/usr/bin/gn gen out/NativeGLES
+gn gen out/NativeGLES
 /usr/bin/ninja -C out/NativeGLES libEGL libGLESv2 libGLESv1_CM
 mkdir -p ../native-angle-bundle
 cp out/NativeGLES/libEGL.so out/NativeGLES/libGLESv2.so out/NativeGLES/libGLESv1_CM.so ../native-angle-bundle/
