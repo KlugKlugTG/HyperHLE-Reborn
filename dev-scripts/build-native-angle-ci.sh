@@ -10,6 +10,11 @@ angle_commit=b7a90a6cc08e52857a6addc2bc2e569b7b01e9df
 git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git native-depot-tools
 export PATH="$PWD/native-depot-tools:$PATH"
 export VPYTHON_BYPASS="manually managed python not supported by chrome operations"
+# Chromium's C23 flag requires GCC 14 rather than Ubuntu's default GCC 13.
+mkdir native-compilers
+ln -s /usr/bin/gcc-14 native-compilers/aarch64-linux-gnu-gcc
+ln -s /usr/bin/g++-14 native-compilers/aarch64-linux-gnu-g++
+export PATH="$PWD/native-compilers:$PATH"
 # Use a current prebuilt ARM GN; Ubuntu's package predates allowlists.
 curl -fsSL https://chrome-infra-packages.appspot.com/dl/gn/gn/linux-arm64/+/latest -o native-gn.zip
 mkdir native-gn
