@@ -23,6 +23,9 @@ jobs:
       ANGLE_DEFAULT_PLATFORM: vulkan
       SDL_VIDEO_X11_FORCE_EGL: "1"
       TOUCHHLE_FIX_TEXTURE_MIN_FILTER: "1"
+      TOUCHHLE_TRACE_TOUCHES: "1"
+      TOUCHHLE_TRACE_TOUCH_REMAP: "1"
+      TOUCHHLE_DUMP_LAYER_TREE: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Install prebuilt runtime packages
