@@ -1,0 +1,84 @@
+name: Bowmasters startup and performance diagnostics
+
+on:
+  push:
+    branches: ["fix/bowmasters-startup"]
+    paths: [.github/workflows/bowmasters-diagnostic.yml]
+  workflow_dispatch:
+    inputs:
+      emulator_run_id:
+        description: Successful Linux emulator build to test
+        type: string
+        default: "45187891750"
+      tap_sequence:
+        description: Space-separated WAIT:X,Y steps
+        type: string
+        default: "1:- 10:- 20:- 30:-"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  bowmasters:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # Read the private draft fixture; never publish it.
+      actions: read
+    env:
+      DISPLAY: ":99"
+      ALSOFT_DRIVERS: "null"
+      BOWMASTERS_BUILD_RUN: ${{ inputs.emulator_run_id || '45187891750' }}
+      BOWMASTERS_TAPS: ${{ inputs.tap_sequence || '1:- 10:- 20:- 30:-' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install runtime and profiling tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ripgrep xvfb xdotool x11-utils imagemagick python3 libsndio7.0 libgl1 libegl1 mesa-utils sysstat linux-tools-generic
+      - name: Require successful build and tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run watch "$BOWMASTERS_BUILD_RUN" --repo "$GITHUB_REPOSITORY" --exit-status --interval 15
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.emulator_run_id || '45187891750' }}
+          name: HyperHLE_Linux_x86_64
+          path: emulator
+      - name: Download private game fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(gh release view ci-private-native-games-20261123 --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          gh release download ci-private-native-games-20261123 --repo "$GITHUB_REPOSITORY" --pattern bowmasters.ipa --dir private-inputs
+      - name: Record available hardware and start display
+        run: |
+          mkdir -p results
+          lscpu > results/cpu.txt
+          free -h > results/memory.txt
+          ls -l /dev/dri > results/gpu-devices.txt 2>&1 || true
+          Xvfb :99 -screen 0 1280x960x24 -ac > results/xvfb.log 2>&1 &
+          sleep 2
+          glxinfo -B > results/renderer.txt
+          emulator_exe=$(find "$GITHUB_WORKSPACE/emulator" -type f -name touchHLE | head -n 1)
+          test -n "$emulator_exe"
+          chmod +x "$emulator_exe"
+          echo "BOWMASTERS_EXE=$emulator_exe" >> "$GITHUB_ENV"
+          echo "BOWMASTERS_CWD=$(dirname "$emulator_exe")" >> "$GITHUB_ENV"
+      - name: Capture startup, screenshots and process utilization
+        run: |
+          read -r -a taps <<< "$BOWMASTERS_TAPS"
+          tap_args=()
+          for tap in "${taps[@]}"; do tap_args+=(--step "$tap"); done
+          pidstat -h -r -u -w -t -C touchHLE 1 > results/pidstat.txt &
+          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/bowmasters.ipa" --exe "$BOWMASTERS_EXE" --cwd "$BOWMASTERS_CWD" --out results/startup "${tap_args[@]}" --final-wait 10 --require-nonblack-frame --require-frame-change -- --overlay=off --device-family=iphone-4s
+      - name: Preserve emulator log
+        if: always()
+        run: cp "$BOWMASTERS_CWD/HyperHLE_log.txt" results/detailed.log 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Bowmasters_startup_diagnostics
+          path: results/
