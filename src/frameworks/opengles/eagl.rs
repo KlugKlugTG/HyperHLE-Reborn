@@ -53,6 +53,20 @@ struct EaglPresentOptions {
     layer_rotation: f32,
 }
 
+// EAGL drawables belong to the Core Animation layer tree. A movie layer
+// above the drawable must be composited with it, even if the game keeps
+// presenting or has enabled the iOS ES2 direct-presentation workaround.
+// https://developer.apple.com/documentation/quartzcore/caeagllayer
+fn can_present_without_composition(
+    drawable: id,
+    fullscreen_layer: id,
+    ios_es2_direct: bool,
+    video_overlay_active: bool,
+) -> bool {
+    !video_overlay_active
+        && (drawable == fullscreen_layer || fullscreen_layer != nil || ios_es2_direct)
+}
+
 // These are used by the EAGLDrawable protocol implemented by CAEAGLayer.
 // Since these have the ABI of constant symbols rather than literal constants,
 // the values shouldn't matter, and haven't been checked against real iPhone OS.
@@ -1237,6 +1251,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             .count_frame(format_args!("EAGLContext {this:?}"), env.options.print_fps);
     }
 
+    let video_overlay_active = crate::frameworks::media_player::has_active_video(env);
     let mut fullscreen_layer = find_fullscreen_eagl_layer(env);
 
     // Unclear from documentation if this method requires the context to be
@@ -1312,7 +1327,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         });
     }
     drop(bindings);
-    if fullscreen_layer != drawable && attach_orphaned_eagl_view_to_root(env, drawable) {
+    if !video_overlay_active
+        && fullscreen_layer != drawable
+        && attach_orphaned_eagl_view_to_root(env, drawable)
+    {
         fullscreen_layer = find_fullscreen_eagl_layer(env);
     }
 
@@ -1334,11 +1352,28 @@ pub const CLASSES: ClassExports = objc_classes! {
         && env.options.ios_es2_direct_present
         && fullscreen_layer == nil
         && env.objc.borrow::<EAGLContextHostObject>(this).api == kEAGLRenderingAPIOpenGLES2;
-    if use_ios_es2_direct_path {
+    if use_ios_es2_direct_path && !video_overlay_active {
         log_once!("Using the iOS ES2 direct presenter for a non-fullscreen CAEAGLLayer.");
     }
 
-    if drawable == fullscreen_layer || fullscreen_layer != nil || use_ios_es2_direct_path {
+    let bypass_composition = can_present_without_composition(
+        drawable,
+        fullscreen_layer,
+        use_ios_es2_direct_path,
+        video_overlay_active,
+    );
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_PRESENT_ROUTE") {
+        static ROUTE_SAMPLES: AtomicU32 = AtomicU32::new(0);
+        let sample = ROUTE_SAMPLES.fetch_add(1, Ordering::Relaxed);
+        if sample < 8 || sample % 60 == 0 {
+            log!(
+                "PRESENT-ROUTE video_active={} bypass_composition={} drawable={:?}",
+                video_overlay_active, bypass_composition, drawable
+            );
+        }
+    }
+
+    if bypass_composition {
         // Decide between presenting on the GPU (copy the renderbuffer into a
         // texture and draw it into the window — cheap) and reading the frame
         // back to RAM and pushing it through the compositor (a full pipeline
@@ -1444,7 +1479,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             }
         }
     } else {
-        if fullscreen_layer != nil {
+        if fullscreen_layer != nil && !video_overlay_active {
             // If there's a single layer that covers the screen, and this isn't
             // it, there's no point in presenting the output because it won't be
             // seen. Using a noisy log because it's a weird scenario and might
@@ -1815,6 +1850,33 @@ unsafe fn get_floats<const N: usize>(gles: &mut dyn GLES, pname: GLenum) -> [GLf
 #[cfg(test)]
 mod presentation_buffer_tests {
     use super::*;
+
+    // BackStab keeps its ES2 render loop alive underneath MPMoviePlayer.
+    // A game-only swap must yield to the movie compositor, then resume once
+    // playback ends. Also cover the forced iOS presenter and a second layer.
+    #[test]
+    fn movie_overlay_prevents_game_only_swaps_and_gameplay_resumes() {
+        let drawable: id = crate::mem::Ptr::from_bits(0x1234);
+        let other_layer: id = crate::mem::Ptr::from_bits(0x5678);
+        for (fullscreen, ios_direct, gameplay_direct) in [
+            (drawable, false, true),
+            (other_layer, false, true),
+            (nil, true, true),
+            (nil, false, false),
+        ] {
+            assert_eq!(
+                can_present_without_composition(drawable, fullscreen, ios_direct, false),
+                gameplay_direct
+            );
+            assert!(!can_present_without_composition(
+                drawable, fullscreen, ios_direct, true
+            ));
+            assert_eq!(
+                can_present_without_composition(drawable, fullscreen, ios_direct, false),
+                gameplay_direct
+            );
+        }
+    }
 
     struct ReadbackBackend {
         renderbuffer: GLuint,
