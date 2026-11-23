@@ -502,7 +502,7 @@ fn dispatch_sync(env: &mut Environment, queue: dispatch_queue_t, block: dispatch
     }
     if queue.to_bits() == MAIN_QUEUE_PTR {
         dispatch_main_sync(env, MainQueueWork::Block(block));
-    } else if queues::is_serial(env, queue) {
+    } else if queues::requires_sync_worker(env, queue) {
         queues::sync(env, queue, MainQueueWork::Block(block));
     } else {
         with_current_queue(env, queue, |env| call_void_block(env, block));
@@ -541,7 +541,7 @@ fn dispatch_sync_f(
     }
     if queue.to_bits() == MAIN_QUEUE_PTR {
         dispatch_main_sync(env, MainQueueWork::Function(work, context));
-    } else if queues::is_serial(env, queue) {
+    } else if queues::requires_sync_worker(env, queue) {
         queues::sync(env, queue, MainQueueWork::Function(work, context));
     } else {
         with_current_queue(env, queue, |env| {

@@ -470,6 +470,21 @@ int test_dispatch_background_group(void) {
 
 static void barrier_finish(void *context) { (void)context; }
 
+// Ordinary dispatch_sync must wait behind earlier barriers on concurrent
+// queues; the inline fast path must not bypass pending work.
+// https://developer.apple.com/documentation/dispatch/1452797-dispatch_barrier_async
+int test_dispatch_sync_after_barrier(void) {
+  struct BackgroundQueueProbe probe = {0};
+  probe.queue = dispatch_queue_create("TestApp.sync-after-barrier",
+                                     &_dispatch_queue_attr_concurrent);
+  dispatch_async_f(probe.queue, &probe, group_first);
+  dispatch_barrier_async_f(probe.queue, &probe, group_notification);
+  dispatch_sync_f(probe.queue, &probe, serial_queue_last);
+  dispatch_release(probe.queue);
+  return probe.calls == 3 && probe.order[0] == 1 && probe.order[1] == 2 &&
+                 probe.order[2] == 3 ? 0 : -1;
+}
+
 // A barrier separates earlier and later work on a concurrent private queue.
 // The first callback sleeps so incorrectly overlapping work changes order.
 int test_dispatch_background_barrier(void) {

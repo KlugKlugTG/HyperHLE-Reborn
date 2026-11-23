@@ -37,11 +37,13 @@ impl WorkerQueue {
     }
 }
 
-pub(super) fn is_serial(env: &mut Environment, queue: dispatch_queue_t) -> bool {
+/// A concurrent sync may run inline when no queued work or barrier prevents
+/// it. Serial queues and pending barriers require FIFO submission.
+pub(super) fn requires_sync_worker(env: &mut Environment, queue: dispatch_queue_t) -> bool {
     get_state(env)
         .worker_queues
         .get(&queue.to_bits())
-        .is_some_and(|q| !q.concurrent)
+        .is_some_and(|q| !q.concurrent || !q.pending.is_empty() || q.barrier_active)
 }
 
 pub(super) fn enqueue(env: &mut Environment, queue: dispatch_queue_t, task: MainQueueTask) {
@@ -77,11 +79,17 @@ pub(super) fn sync_barrier(env: &mut Environment, queue: dispatch_queue_t, work:
 }
 
 fn sync_task(env: &mut Environment, queue: dispatch_queue_t, work: MainQueueWork, barrier: bool) {
-    assert_ne!(
-        current_queue(env),
-        queue.to_bits(),
-        "dispatch_sync to the current serial queue would deadlock"
-    );
+    let serial = get_state(env)
+        .worker_queues
+        .get(&queue.to_bits())
+        .is_some_and(|q| !q.concurrent);
+    if serial || barrier {
+        assert_ne!(
+            current_queue(env),
+            queue.to_bits(),
+            "dispatch_sync to the current serial queue or barrier would deadlock"
+        );
+    }
     let completion = host_create_semaphore(env, 0);
     enqueue(
         env,
