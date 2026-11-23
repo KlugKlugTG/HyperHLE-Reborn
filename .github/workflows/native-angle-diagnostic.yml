@@ -1,6 +1,11 @@
 name: Native GLES 1.1 ANGLE diagnostics
 
 on:
+  push:
+    branches: ["fix/gameloft-video-menu"]
+    paths:
+      - .github/workflows/native-angle-diagnostic.yml
+      - dev-scripts/build-native-angle-ci.sh
   workflow_dispatch:
 
 permissions:
