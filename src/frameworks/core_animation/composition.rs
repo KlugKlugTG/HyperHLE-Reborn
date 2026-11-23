@@ -47,6 +47,7 @@ struct CompositedScene {
     cursor: Option<(f32, f32, bool)>,
     scale: (u32, u32),
     framebuffer: u32,
+    host_revision: u64,
 }
 
 // A composited EAGL frame only needs another draw when its layer tree or
@@ -120,6 +121,7 @@ fn snapshot_scene(env: &mut Environment) -> Option<CompositedScene> {
         cursor: window.virtual_cursor_visible_at(),
         scale: (env.options.scale_hack.get(), env.options.ui_scale.get()),
         framebuffer: window.host_framebuffer(),
+        host_revision: window.presentation_revision(),
     })
 }
 
@@ -131,24 +133,14 @@ fn compositor_reuse_observes_ui_changes_and_pending_animation() {
     let mut objc = ObjC::new();
     objc.register_host_selectors(&mut mem);
     let class = objc.get_known_class("CALayer", &mut mem);
-    let root = objc.alloc_object(
-        class,
-        Box::new(CALayerHostObject {
-            opacity: 1.0,
-            ..Default::default()
-        }),
-        &mut mem,
-    );
-    let child = objc.alloc_object(
-        class,
-        Box::new(CALayerHostObject {
-            opacity: 1.0,
-            presented_pixels: Some((vec![255; 4], 1, 1)),
-            gles_texture_is_up_to_date: true,
-            ..Default::default()
-        }),
-        &mut mem,
-    );
+    let mut root_host = CALayerHostObject::default();
+    root_host.opacity = 1.0;
+    let root = objc.alloc_object(class, Box::new(root_host), &mut mem);
+    let mut child_host = CALayerHostObject::default();
+    child_host.opacity = 1.0;
+    child_host.presented_pixels = Some((vec![255; 4], 1, 1));
+    child_host.gles_texture_is_up_to_date = true;
+    let child = objc.alloc_object(class, Box::new(child_host), &mut mem);
     objc.borrow_mut::<CALayerHostObject>(root)
         .sublayers
         .push(child);
