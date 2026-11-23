@@ -1,0 +1,81 @@
+name: Native GLES game runtime diagnostics
+
+on:
+  push:
+    branches: ["fix/ci-native-game-validation"]
+    paths: [.github/workflows/native-game-diagnostic.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  native-games:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    permissions:
+      contents: write # Download private draft-release inputs; never publish them.
+      actions: read
+    env:
+      DISPLAY: ":99"
+      ALSOFT_DRIVERS: "null"
+      ANGLE_DEFAULT_PLATFORM: vulkan
+      MESA_VK_WSI_DEBUG: sw,noshm
+      SDL_VIDEO_X11_FORCE_EGL: "1"
+      TOUCHHLE_FIX_TEXTURE_MIN_FILTER: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install prebuilt runtime packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends xvfb xdotool x11-utils imagemagick python3 libsndio-dev libstdc++6 libgl1 libegl1 libgles1 libvulkan1 mesa-vulkan-drivers
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45154298498
+          name: HyperHLE_Linux_ARM64_diagnostic
+          path: native-emulator
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45154298497
+          name: ANGLE_Linux_ARM64_GLES1
+          path: native-angle
+      - name: Download private test inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download ci-private-native-games-20261123 --repo "$GITHUB_REPOSITORY" --pattern '*.ipa' --dir private-inputs
+      - name: Set up the native GLES runtime
+        run: |
+          chmod +x native-emulator/touchHLE
+          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/native-angle" >> "$GITHUB_ENV"
+          echo "SDL_VIDEO_EGL_DRIVER=$GITHUB_WORKSPACE/native-angle/libEGL.so" >> "$GITHUB_ENV"
+          echo "SDL_VIDEO_GL_DRIVER=$GITHUB_WORKSPACE/native-angle/libGLESv1_CM.so" >> "$GITHUB_ENV"
+          native_icd=$(rg --files /usr/share/vulkan/icd.d | rg '/lvp.*\.json$' | head -n 1)
+          test -n "$native_icd"
+          echo "VK_DRIVER_FILES=$native_icd" >> "$GITHUB_ENV"
+          Xvfb :99 -screen 0 1280x960x24 -ac > xvfb.log 2>&1 &
+          sleep 2
+          cp -a native-emulator zenonia-runtime
+          cp -a native-emulator spiderman-runtime
+      - name: ZENONIA 2 splash and touch progression
+        run: |
+          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/zenonia.ipa" --exe "$GITHUB_WORKSPACE/native-emulator/touchHLE" --cwd "$GITHUB_WORKSPACE/zenonia-runtime" --out native-game-results/zenonia --step '1:-' --step '40:-' --step '25:0.5,0.5' --final-wait 15 --require-nonblack-frame --require-frame-change --require-touch-delivery -- --gles1=gles1_native --overlay=off --fix-texture-min-filter --trace-gl-errors
+      - name: Spider-Man Retina videos to menu
+        if: success() || failure()
+        run: |
+          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/spiderman.ipa" --exe "$GITHUB_WORKSPACE/native-emulator/touchHLE" --cwd "$GITHUB_WORKSPACE/spiderman-runtime" --out native-game-results/spiderman --step '1:-' --step '60:-' --step '20:0.5,0.5' --final-wait 25 --require-nonblack-frame --require-frame-change --require-touch-delivery -- --gles1=gles1_native --device-family=iphone-4s --overlay=off --fix-texture-min-filter --trace-gl-errors
+      - name: Preserve runtime logs without the private games
+        if: always()
+        run: |
+          mkdir -p native-game-results
+          cp xvfb.log native-game-results/ 2>/dev/null || true
+          cp zenonia-runtime/HyperHLE_log.txt native-game-results/zenonia-detailed.log 2>/dev/null || true
+          cp spiderman-runtime/HyperHLE_log.txt native-game-results/spiderman-detailed.log 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Native_GLES_game_runtime_results
+          path: native-game-results/
