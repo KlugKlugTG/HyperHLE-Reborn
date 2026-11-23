@@ -70,7 +70,7 @@ jobs:
           sleep 2
       - name: BackStab title, menu and game-start interaction
         run: |
-          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/backstab.ipa" --exe "$GITHUB_WORKSPACE/native-emulator/touchHLE" --cwd "$GITHUB_WORKSPACE/native-emulator" --out backstab-results --step '1:-' --step '50:0.5,0.83' --step '10:-' --step '5:0.2,0.36' --step '20:-' --step '30:-' --final-wait 15 --require-nonblack-frame --require-frame-change --require-touch-delivery -- --gles1=gles1_native --device-family=iphone-3gs --overlay=off --fix-texture-min-filter --trace-gl-errors
+          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/backstab.ipa" --exe "$GITHUB_WORKSPACE/native-emulator/touchHLE" --cwd "$GITHUB_WORKSPACE/native-emulator" --out backstab-results --step '1:-' --step '100:0.5,0.83' --step '10:-' --step '5:0.2,0.36' --step '20:-' --step '30:-' --final-wait 15 --require-nonblack-frame --require-frame-change --require-touch-delivery -- --gles1=gles1_native --device-family=iphone-3gs --overlay=off --fix-texture-min-filter --trace-gl-errors
       - name: Preserve diagnostic logs
         if: always()
         run: |
