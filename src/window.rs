@@ -1038,6 +1038,8 @@ pub struct Window {
     device_orientation: DeviceOrientation,
     controller_ctx: sdl2::GameControllerSubsystem,
     controllers: Vec<sdl2::controller::GameController>,
+    #[cfg(target_os = "windows")]
+    active_controller_touches: HashMap<i64, Coords>,
     dpad_state: DpadState,
     stick_active: bool,
     _sensor_ctx: sdl2::SensorSubsystem,
@@ -1218,7 +1220,11 @@ impl Window {
         // drivers because they cause duplicated controllers on macOS
         // (https://github.com/libsdl-org/SDL/issues/7479). Once that's fixed,
         // remove this (https://github.com/touchHLE/touchHLE/issues/85).
-        sdl2::hint::set("SDL_JOYSTICK_HIDAPI", "0");
+        if env::consts::OS == "macos" {
+            sdl2::hint::set("SDL_JOYSTICK_HIDAPI", "0");
+        } else if env::consts::OS == "windows" {
+            sdl2::hint::set("SDL_JOYSTICK_HIDAPI", "1");
+        }
 
         if env::consts::OS == "android"
             || matches!(options.gles1_implementation, Some(GLESImplementation::GLES1Native))
@@ -1460,6 +1466,8 @@ impl Window {
             device_orientation,
             controller_ctx,
             controllers: Vec::new(),
+            #[cfg(target_os = "windows")]
+            active_controller_touches: HashMap::new(),
             dpad_state: DpadState {
                 left: false,
                 right: false,
@@ -2307,7 +2315,100 @@ impl Window {
                 _ => continue,
             })
         }
+        #[cfg(target_os = "windows")]
+        {
+            use sdl2::sys as sdl;
 
+            let mut current_touches: HashMap<i64, Coords> = HashMap::new();
+            for controller in &self.controllers {
+                let instance_id = controller.instance_id();
+                let raw_controller = unsafe {
+                    sdl::SDL_GameControllerFromInstanceID(instance_id as i32)
+                };
+                if raw_controller.is_null() {
+                    continue;
+                }
+
+                let touchpad_count = unsafe {
+                    sdl::SDL_GameControllerGetNumTouchpads(raw_controller)
+                };
+                if touchpad_count <= 0 {
+                    continue;
+                }
+
+                // The DualSense exposes one large touchpad. Iterate every
+                // reported touchpad/finger so this remains compatible with
+                // other controllers that SDL maps in the same way.
+                for touchpad in 0..touchpad_count {
+                    let finger_count = unsafe {
+                        sdl::SDL_GameControllerGetNumTouchpadFingers(raw_controller, touchpad)
+                    };
+                    for finger in 0..finger_count {
+                        let mut state = 0u8;
+                        let mut x = 0.0f32;
+                        let mut y = 0.0f32;
+                        let mut pressure = 0.0f32;
+                        let result = unsafe {
+                            sdl::SDL_GameControllerGetTouchpadFinger(
+                                raw_controller,
+                                touchpad,
+                                finger,
+                                &mut state,
+                                &mut x,
+                                &mut y,
+                                &mut pressure,
+                            )
+                        };
+                        if result != 0 || state == 0 {
+                            continue;
+                        }
+                        // Negative IDs cannot collide with the positive IDs
+                        // supplied by SDL's ordinary touchscreen events.
+                        let finger_id = i64::MIN
+                            + ((instance_id as i64) << 16)
+                            + ((touchpad as i64) << 8)
+                            + finger as i64;
+                        let abs_coords = finger_absolute_coords(
+                            self,
+                            (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)),
+                        );
+                        let coords = transform_input_coords(self, abs_coords, false);
+                        current_touches.insert(finger_id, coords);
+                    }
+                }
+            }
+
+            let mut down = HashMap::new();
+            let mut moved = HashMap::new();
+            let mut up = HashMap::new();
+            for (&finger_id, &coords) in &current_touches {
+                match self.active_controller_touches.get(&finger_id) {
+                    None => {
+                        down.insert(FingerId::Touch(finger_id), coords);
+                    }
+                    Some(previous) if *previous != coords => {
+                        moved.insert(FingerId::Touch(finger_id), coords);
+                    }
+                    Some(_) => {}
+                }
+            }
+            for (&finger_id, &coords) in &self.active_controller_touches {
+                if !current_touches.contains_key(&finger_id) {
+                    up.insert(FingerId::Touch(finger_id), coords);
+                }
+            }
+            self.active_controller_touches = current_touches;
+
+            if !down.is_empty() {
+                self.event_queue.push_back(Event::TouchesDown(down));
+            }
+            if !moved.is_empty() {
+                self.event_queue.push_back(Event::TouchesMove(moved));
+            }
+            if !up.is_empty() {
+                self.event_queue.push_back(Event::TouchesUp(up));
+            }
+        }
         if controller_updated {
             let (new_x, new_y, pressed, pressed_changed, moved) =
                 self.update_virtual_cursor(options);
