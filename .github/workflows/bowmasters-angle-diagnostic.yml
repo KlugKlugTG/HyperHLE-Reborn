@@ -1,0 +1,108 @@
+name: Android ANGLE presentation regression
+
+on:
+  workflow_dispatch:
+    inputs:
+      emulator_run_id:
+        description: Successful Linux ARM64 emulator build with full TestApp
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  native-presentation:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        present: [readback, direct, auto]
+    permissions:
+      contents: write # Access draft fixtures; never publish them.
+      actions: read
+    env:
+      DISPLAY: ":99"
+      ALSOFT_DRIVERS: "null"
+      ANGLE_DEFAULT_PLATFORM: vulkan
+      SDL_VIDEO_X11_FORCE_EGL: "1"
+      MESA_VK_WSI_DEBUG: sw,noshm
+      TOUCHHLE_FRAME_TIMES: "1"
+      TOUCHHLE_NO_PRESENT_FINISH: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install runtime tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ripgrep xvfb xdotool x11-utils imagemagick python3 libsndio7.0 libstdc++6 libgl1 libegl1 libgles1 libvulkan1 mesa-vulkan-drivers sysstat
+      - name: Require successful build and full tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EMULATOR_RUN: ${{ inputs.emulator_run_id }}
+        run: gh run watch "$EMULATOR_RUN" --repo "$GITHUB_REPOSITORY" --exit-status --interval 15
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.emulator_run_id }}
+          name: HyperHLE_Linux_ARM64_diagnostic
+          path: emulator
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45154298497
+          name: ANGLE_Linux_ARM64_GLES1
+          path: angle
+      - name: Download private fixtures
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(gh release view ci-private-native-games-20261123 --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          for fixture in zenonia.ipa spiderman.ipa Bowmasters.1.0.ipa; do
+            gh release download ci-private-native-games-20261123 --repo "$GITHUB_REPOSITORY" --pattern "$fixture" --dir private-inputs
+          done
+      - name: Configure the Android ANGLE revision and record hardware
+        run: |
+          mkdir -p results
+          chmod +x emulator/touchHLE
+          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/angle" >> "$GITHUB_ENV"
+          echo "SDL_VIDEO_EGL_DRIVER=$GITHUB_WORKSPACE/angle/libEGL.so" >> "$GITHUB_ENV"
+          echo "SDL_VIDEO_GL_DRIVER=$GITHUB_WORKSPACE/angle/libGLESv1_CM.so" >> "$GITHUB_ENV"
+          native_icd=$(rg --files /usr/share/vulkan/icd.d | rg '/lvp.*\.json$' | head -n 1)
+          test -n "$native_icd"
+          echo "VK_DRIVER_FILES=$native_icd" >> "$GITHUB_ENV"
+          lscpu > results/cpu.txt
+          ls -l /dev/dri > results/gpu-devices.txt 2>&1 || true
+          Xvfb :99 -screen 0 1280x960x24 -ac > results/xvfb.log 2>&1 &
+          sleep 2
+          for game in zenonia spiderman bowmasters; do cp -a emulator "$game-runtime"; done
+          pidstat -h -r -u -w -t -C touchHLE 1 > results/pidstat.txt &
+      - name: ZENONIA 2 native GLES1 title and input
+        env:
+          PRESENT_MODE: ${{ matrix.present }}
+        run: |
+          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/zenonia.ipa" --exe "$GITHUB_WORKSPACE/emulator/touchHLE" --cwd "$GITHUB_WORKSPACE/zenonia-runtime" --out results/zenonia --step '1:-' --step '40:-' --step '25:0.5,0.5' --final-wait 15 --require-frame-content --require-frame-change --require-eagl-frames --require-touch-delivery -- --gles1=gles1_native --present-mode="$PRESENT_MODE" --overlay=off
+      - name: Spider-Man native GLES1 videos to menu
+        if: success() || failure()
+        env:
+          PRESENT_MODE: ${{ matrix.present }}
+        run: |
+          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/spiderman.ipa" --exe "$GITHUB_WORKSPACE/emulator/touchHLE" --cwd "$GITHUB_WORKSPACE/spiderman-runtime" --out results/spiderman --step '1:-' --step '60:-' --step '20:0.5,0.5' --final-wait 25 --require-frame-content --require-frame-change --require-eagl-frames --require-touch-delivery -- --gles1=gles1_native --device-family=iphone-4s --present-mode="$PRESENT_MODE" --overlay=off
+      - name: Bowmasters ANGLE startup and tutorial
+        if: success() || failure()
+        env:
+          PRESENT_MODE: ${{ matrix.present }}
+        run: |
+          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/Bowmasters.1.0.ipa" --exe "$GITHUB_WORKSPACE/emulator/touchHLE" --cwd "$GITHUB_WORKSPACE/bowmasters-runtime" --out results/bowmasters --step '1:-' --step '12:0.5,0.5' --step '10:0.5,0.9' --step '4:0.5,0.87' --step '4:0.5,0.5>0.15,0.75@0.7' --step '15:-' --final-wait 10 --require-frame-content --require-frame-change --require-eagl-frames --require-touch-delivery -- --gles1=gles1_native --device-family=iphone-4s --present-mode="$PRESENT_MODE" --overlay=off
+      - name: Preserve logs
+        if: always()
+        run: |
+          for game in zenonia spiderman bowmasters; do
+            cp "$game-runtime/HyperHLE_log.txt" "results/$game-detailed.log" 2>/dev/null || true
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Android_ANGLE_${{ matrix.present }}
+          path: results/

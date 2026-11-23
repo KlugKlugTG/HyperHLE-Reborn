@@ -2569,6 +2569,8 @@ thread_local! {
     // 1.1 present path.
     static PRESENT_ES1_REJECTED_CAPS: std::cell::Cell<Option<RejectedCaps>> =
         const { std::cell::Cell::new(None) };
+    static PRESENT_ES1_TEXTURE_UNITS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
     /// GL object names are context-local unless contexts share a sharegroup.
     /// Keep every presenter cache tied to the EAGLContext host object so a game
     /// switching contexts cannot use another context's program/FBO/texture.
@@ -2592,6 +2594,7 @@ fn invalidate_present_cache_for_context(context_token: usize) {
         PRESENT_TEXTURE_SIZE.with(|cell| cell.set(None));
         PRESENT_ES1_TEXTURE.with(|cell| cell.set(None));
         PRESENT_ES1_REJECTED_CAPS.with(|cell| cell.set(None));
+        PRESENT_ES1_TEXTURE_UNITS.with(|cell| cell.set(None));
         log!("EAGL presenter: invalidated cached GL objects after EAGL context switch");
     }
 }
@@ -2954,6 +2957,54 @@ unsafe fn ensure_present_objects(gles: &mut dyn GLES) -> PresentObjects {
     result
 }
 
+/// A presentation quad uses server and client texture unit zero. Both
+/// selectors are independent, and every enabled server unit participates
+/// in fixed-function drawing, even when no coordinate array is enabled.
+/// https://registry.khronos.org/OpenGL-Refpages/es1.1/xhtml/glActiveTexture.xml
+struct PresentTextureUnits {
+    server: GLenum,
+    client: GLenum,
+    enabled: Vec<GLenum>,
+}
+impl PresentTextureUnits {
+    unsafe fn capture(gles: &mut dyn GLES) -> Self {
+        let server = get_int(gles, gles11::ACTIVE_TEXTURE) as GLenum;
+        let client = get_int(gles, gles11::CLIENT_ACTIVE_TEXTURE) as GLenum;
+        let count = PRESENT_ES1_TEXTURE_UNITS.with(|cell| {
+            if let Some(count) = cell.get() {
+                return count;
+            }
+            let count = get_int(gles, gles11::MAX_TEXTURE_UNITS).max(1) as usize;
+            cell.set(Some(count));
+            count
+        });
+        let mut enabled = Vec::new();
+        for unit in 1..count {
+            let texture = gles11::TEXTURE0 + unit as GLenum;
+            gles.ActiveTexture(texture);
+            if gles.IsEnabled(gles11::TEXTURE_2D) != gles11::FALSE {
+                gles.Disable(gles11::TEXTURE_2D);
+                enabled.push(texture);
+            }
+        }
+        gles.ActiveTexture(gles11::TEXTURE0);
+        gles.ClientActiveTexture(gles11::TEXTURE0);
+        Self {
+            server,
+            client,
+            enabled,
+        }
+    }
+    unsafe fn restore(self, gles: &mut dyn GLES) {
+        for texture in self.enabled {
+            gles.ActiveTexture(texture);
+            gles.Enable(gles11::TEXTURE_2D);
+        }
+        gles.ActiveTexture(self.server);
+        gles.ClientActiveTexture(self.client);
+    }
+}
+
 /// Copies the pixels in a renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES`
 /// (which should be provided by the app) to a texture and presents it with
 /// [present_frame], trying to avoid noticeably modifying OpenGL ES state while
@@ -3230,11 +3281,7 @@ unsafe fn present_renderbuffer(
     // To avoid confusing the guest app, we need to be able to undo any
     // state changes we make.
     let old_framebuffer: GLuint = get_int(gles, gles11::FRAMEBUFFER_BINDING_OES) as _;
-    let old_active_texture: GLuint = get_int(gles, gles11::ACTIVE_TEXTURE) as _;
-    // The present texture must be bound on unit 0: the guest may have left a
-    // different unit active, and binding to it would both draw the present
-    // quad with the wrong texture and corrupt the guest's unit binding.
-    gles.ActiveTexture(gles11::TEXTURE0);
+    let texture_units = PresentTextureUnits::capture(gles);
     let old_texture_2d: GLuint = get_int(gles, gles11::TEXTURE_BINDING_2D) as _;
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3406,25 +3453,9 @@ unsafe fn present_renderbuffer(
     if finish_before_copy {
         gles.Finish();
     }
-    // A guest that renders 2D UI (level-select lists, HUD panels, ...) very
-    // commonly leaves GL_SCISSOR_TEST enabled at present time — iOS titles
-    // never notice because iOS's own present path ignores scissor when
-    // resolving the drawable. Our CopyTex(Sub)Image2D readout is NOT
-    // ignored: pixels outside the guest's scissor box are never copied, so
-    // every frame would present only the scissored sub-region while the
-    // rest of the texture keeps stale content from older frames (the
-    // "Geometry Dash glitched frame" symptom). Disable the test for the
-    // copy; the generic caps save/restore loop below puts the enable flag
-    // back for the guest after the present quad.
-    let old_scissor_box: [GLint; 4] = get_ints(gles, gles11::SCISSOR_BOX);
-    gles.Disable(gles11::SCISSOR_TEST);
-    // Same story for the pack alignment: glCopyTex(Sub)Image2D reads rows
-    // with GL_PACK_ALIGNMENT, and a guest that uploaded odd-stride data
-    // with a non-default alignment skews every copied row and mangles the
-    // presented image. RGBA8 rows are always 4-byte aligned, so alignment
-    // 1 is always valid here and never changes the image.
-    let old_pack_alignment: GLint = get_int(gles, gles11::PACK_ALIGNMENT);
-    gles.PixelStorei(gles11::PACK_ALIGNMENT, 1);
+    // CopyTex(Sub)Image2D is unaffected by scissor and pixel pack state.
+    // Save the guest enables below before disabling them for the quad.
+    // https://registry.khronos.org/OpenGL-Refpages/es1.1/xhtml/glCopyTexSubImage2D.xml
     if storage_valid {
         // Steady state: copy into the preallocated storage without
         // redefining it.
@@ -3461,17 +3492,6 @@ unsafe fn present_renderbuffer(
             "after Finish + CopyTexImage2D",
         );
     }
-    // Restore the guest's pixel-store state now that the copy is done; the
-    // scissor box is restored too so a guest that reads pixels itself
-    // (screenshots) is unaffected. The scissor TEST stays disabled until
-    // the generic caps restore loop re-enables it after the present quad.
-    gles.PixelStorei(gles11::PACK_ALIGNMENT, old_pack_alignment);
-    gles.Scissor(
-        old_scissor_box[0],
-        old_scissor_box[1],
-        old_scissor_box[2],
-        old_scissor_box[3],
-    );
     // Black-frame detector, part 1: sample the source while the framebuffer
     // we copied from is still bound.
     let probe_source_max = if probe_active {
@@ -3970,15 +3990,6 @@ unsafe fn present_renderbuffer(
     // the app's previous texture, which also unbinds ours.
 
     // Restore all the state saved before rendering
-    for (&is_enabled, info) in old_arrays.iter().zip(gles1_on_gl2::ARRAYS.iter()) {
-        // Any non-zero GLboolean counts as enabled: a driver answering a
-        // query with garbage must not be able to panic the emulator here.
-        if is_enabled != gles11::FALSE {
-            gles.EnableClientState(info.name);
-        } else {
-            gles.DisableClientState(info.name);
-        }
-    }
     for (&saved, &name) in old_capabilities
         .iter()
         .zip(gles1_on_gl2::CAPABILITIES.iter())
@@ -4048,6 +4059,15 @@ unsafe fn present_renderbuffer(
         old_tex_coord_array_pointer,
     );
     gles.BindBuffer(gles11::ARRAY_BUFFER, old_array_buffer);
+    for (&is_enabled, info) in old_arrays.iter().zip(gles1_on_gl2::ARRAYS.iter()) {
+        // Any non-zero GLboolean counts as enabled: a driver answering a
+        // query with garbage must not be able to panic the emulator here.
+        if is_enabled != gles11::FALSE {
+            gles.EnableClientState(info.name);
+        } else {
+            gles.DisableClientState(info.name);
+        }
+    }
     gles.BlendFunc(old_blend_sfactor, old_blend_dfactor);
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -4095,7 +4115,7 @@ unsafe fn present_renderbuffer(
     // (see the ActiveTexture switch at the top), so restore both the unit
     // and the texture binding.
     gles.BindTexture(gles11::TEXTURE_2D, old_texture_2d);
-    gles.ActiveTexture(old_active_texture);
+    texture_units.restore(gles);
     gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -4263,4 +4283,65 @@ fn attach_orphaned_eagl_view_to_root(env: &mut Environment, drawable: id) -> boo
         }
     }
     false
+}
+
+
+#[cfg(test)]
+mod present_texture_unit_tests {
+    use super::*;
+
+    struct TextureUnits {
+        server: usize,
+        client: usize,
+        enabled: [bool; 4],
+    }
+    #[allow(non_snake_case)]
+    impl GLES for TextureUnits {
+        unsafe fn GetIntegerv(&mut self, name: GLenum, value: *mut GLint) {
+            *value = match name {
+                gles11::ACTIVE_TEXTURE => gles11::TEXTURE0 as GLint + self.server as GLint,
+                gles11::CLIENT_ACTIVE_TEXTURE => gles11::TEXTURE0 as GLint + self.client as GLint,
+                gles11::MAX_TEXTURE_UNITS => self.enabled.len() as GLint,
+                _ => panic!("Unexpected query: {name:#x}"),
+            };
+        }
+        unsafe fn ActiveTexture(&mut self, unit: GLenum) {
+            self.server = (unit - gles11::TEXTURE0) as usize;
+        }
+        unsafe fn ClientActiveTexture(&mut self, unit: GLenum) {
+            self.client = (unit - gles11::TEXTURE0) as usize;
+        }
+        unsafe fn IsEnabled(&mut self, name: GLenum) -> GLboolean {
+            assert_eq!(name, gles11::TEXTURE_2D);
+            self.enabled[self.server] as GLboolean
+        }
+        unsafe fn Enable(&mut self, name: GLenum) {
+            assert_eq!(name, gles11::TEXTURE_2D);
+            self.enabled[self.server] = true;
+        }
+        unsafe fn Disable(&mut self, name: GLenum) {
+            assert_eq!(name, gles11::TEXTURE_2D);
+            self.enabled[self.server] = false;
+        }
+    }
+
+    #[test]
+    fn presentation_isolates_unit_zero_and_restores_independent_selectors() {
+        invalidate_present_cache_for_context(crate::gles::perf_overlay::allocate_context_token());
+        let mut host = TextureUnits {
+            server: 2,
+            client: 3,
+            enabled: [true, false, true, true],
+        };
+        unsafe {
+            let saved = PresentTextureUnits::capture(&mut host);
+            assert_eq!(host.server, 0);
+            assert_eq!(host.client, 0);
+            assert_eq!(host.enabled, [true, false, false, false]);
+            saved.restore(&mut host);
+        }
+        assert_eq!(host.server, 2);
+        assert_eq!(host.client, 3);
+        assert_eq!(host.enabled, [true, false, true, true]);
+    }
 }
