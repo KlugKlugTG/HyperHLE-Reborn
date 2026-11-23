@@ -5,7 +5,9 @@
  */
 //! The `NSScanner` class.
 
-use crate::frameworks::foundation::ns_string::{from_u16_vec, to_rust_string};
+use crate::frameworks::foundation::ns_string::{
+    from_u16_vec, to_rust_string, NSCaseInsensitiveSearch,
+};
 use crate::frameworks::foundation::{unichar, NSInteger, NSNotFound, NSRange, NSUInteger};
 use crate::mem::MutPtr;
 use crate::objc::{
@@ -24,6 +26,7 @@ struct NSScannerHostObject {
     /// Length is cached since it is immutable.
     len: NSUInteger,
     pos: NSUInteger,
+    case_sensitive: bool,
 }
 impl HostObject for NSScannerHostObject {}
 
@@ -80,7 +83,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         to_be_skipped: default_set,
         string,
         len,
-        pos: 0
+        pos: 0,
+        case_sensitive: false,
     };
     this
 }
@@ -114,6 +118,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old);
 }
 
+// https://developer.apple.com/documentation/foundation/scanner/casesensitive
+// Default is NO; character-set and numeric scans ignore this property.
+- (bool)caseSensitive {
+    env.objc.borrow::<NSScannerHostObject>(this).case_sensitive
+}
+
+- (())setCaseSensitive:(bool)sensitive {
+    env.objc.borrow_mut::<NSScannerHostObject>(this).case_sensitive = sensitive;
+}
+
 - (bool)isAtEnd {
     skip_characters(env, this);
     let NSScannerHostObject { len, pos, .. } = env.objc.borrow::<NSScannerHostObject>(this);
@@ -139,7 +153,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)scanUpToCharactersFromSet:(id)cset intoString:(MutPtr<id>)str {
     skip_characters(env, this);
 
-    let NSScannerHostObject { to_be_skipped, string, len, mut pos } = env.objc.borrow::<NSScannerHostObject>(this).clone();
+    let NSScannerHostObject { to_be_skipped, string, len, mut pos, case_sensitive } = env.objc.borrow::<NSScannerHostObject>(this).clone();
     if pos >= len {
         // Does nothing (same as simulator)
         return false;
@@ -165,7 +179,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         env.mem.write(str, out);
     }
 
-    *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos };
+    *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive };
     true
 }
 
@@ -177,11 +191,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)scanHexInt:(MutPtr<u32>)result {
     skip_characters(env, this);
 
-    let NSScannerHostObject { to_be_skipped, string, len, pos } =
+    let NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive } =
         std::mem::take(env.objc.borrow_mut::<NSScannerHostObject>(this));
     if pos >= len {
         *env.objc.borrow_mut::<NSScannerHostObject>(this) =
-            NSScannerHostObject { to_be_skipped, string, len, pos };
+            NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive };
         return false;
     }
 
@@ -218,7 +232,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if i == digits_start {
         // No hexadecimal digits were found; scanner is unchanged.
         *env.objc.borrow_mut::<NSScannerHostObject>(this) =
-            NSScannerHostObject { to_be_skipped, string, len, pos };
+            NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive };
         return false;
     }
 
@@ -230,7 +244,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // of Rust chars equals the number of UTF-16 code units to advance by.
     let consumed = i as NSUInteger;
     *env.objc.borrow_mut::<NSScannerHostObject>(this) =
-        NSScannerHostObject { to_be_skipped, string, len, pos: pos + consumed };
+        NSScannerHostObject { to_be_skipped, string, len, case_sensitive, pos: pos + consumed };
     log_dbg!("scanHexInt: from '{}' -> {:#x}", st, value);
     true
 }
@@ -238,11 +252,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)scanHexLongLong:(MutPtr<u64>)result {
     skip_characters(env, this);
 
-    let NSScannerHostObject { to_be_skipped, string, len, pos } =
+    let NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive } =
         std::mem::take(env.objc.borrow_mut::<NSScannerHostObject>(this));
     if pos >= len {
         *env.objc.borrow_mut::<NSScannerHostObject>(this) =
-            NSScannerHostObject { to_be_skipped, string, len, pos };
+            NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive };
         return false;
     }
 
@@ -269,7 +283,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     if i == digits_start {
         *env.objc.borrow_mut::<NSScannerHostObject>(this) =
-            NSScannerHostObject { to_be_skipped, string, len, pos };
+            NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive };
         return false;
     }
 
@@ -279,7 +293,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let consumed = i as NSUInteger;
     *env.objc.borrow_mut::<NSScannerHostObject>(this) =
-        NSScannerHostObject { to_be_skipped, string, len, pos: pos + consumed };
+        NSScannerHostObject { to_be_skipped, string, len, case_sensitive, pos: pos + consumed };
     log_dbg!("scanHexLongLong: from '{}' -> {:#x}", st, value);
     true
 }
@@ -288,14 +302,15 @@ pub const CLASSES: ClassExports = objc_classes! {
             intoString:(MutPtr<id>)result { // NSString **
     skip_characters(env, this);
 
-    let NSScannerHostObject { to_be_skipped, string, len, pos } = std::mem::take(env.objc.borrow_mut::<NSScannerHostObject>(this));
+    let NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive } = std::mem::take(env.objc.borrow_mut::<NSScannerHostObject>(this));
     log_dbg!("scanUpToString:'{}' intoString: from '{}' at {}", to_rust_string(env, stop_string), to_rust_string(env, string), pos);
 
     // TODO: avoid string copying
     let left: id = msg![env; string substringFromIndex:pos];
-    let range: NSRange = msg![env; left rangeOfString:stop_string];
-    if range.location == 0 {
-        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos };
+    let options = if case_sensitive { 0 } else { NSCaseInsensitiveSearch };
+    let range: NSRange = msg![env; left rangeOfString:stop_string options:options];
+    if range.location == 0 || pos == len {
+        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive };
         return false;
     }
 
@@ -305,7 +320,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         range.location
     };
     assert!(pos + scan_len <= len);
-    *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos: pos + scan_len };
+    *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, case_sensitive, pos: pos + scan_len };
 
     if !result.is_null() {
         let copy: id = msg![env; left substringToIndex:scan_len];
@@ -320,24 +335,25 @@ pub const CLASSES: ClassExports = objc_classes! {
         intoString:(MutPtr<id>)result { // NSString **
     skip_characters(env, this);
 
-    let NSScannerHostObject { to_be_skipped, string, len, pos } = std::mem::take(env.objc.borrow_mut::<NSScannerHostObject>(this));
+    let NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive } = std::mem::take(env.objc.borrow_mut::<NSScannerHostObject>(this));
     log_dbg!("scanString:{} intoString: from '{}' at {}", to_rust_string(env, scan_string), to_rust_string(env, string), pos);
 
     // TODO: avoid string copying
     let left: id = msg![env; string substringFromIndex:pos];
-    let same_prefix: bool = msg![env; left hasPrefix:scan_string];
-    if !same_prefix {
-        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos };
+    let options = if case_sensitive { 0 } else { NSCaseInsensitiveSearch };
+    let range: NSRange = msg![env; left rangeOfString:scan_string options:options];
+    if range.location != 0 || range.length == 0 {
+        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive };
         return false;
     }
 
-    let scan_len: NSUInteger = msg![env; scan_string length];
+    let scan_len = range.length;
     assert!(pos + scan_len <= len);
-    *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos: pos + scan_len };
+    *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, case_sensitive, pos: pos + scan_len };
 
     if !result.is_null() {
-        let copy: id = msg![env; scan_string copy];
-        autorelease(env, copy);
+        // Return the source spelling, even for a case-insensitive match.
+        let copy: id = msg![env; left substringToIndex:scan_len];
         env.mem.write(result, copy);
     }
     true
@@ -346,10 +362,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)scanInt:(MutPtr<i32>)result {
     skip_characters(env, this);
 
-    let NSScannerHostObject { to_be_skipped, string, len, pos } = std::mem::take(env.objc.borrow_mut::<NSScannerHostObject>(this));
+    let NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive } = std::mem::take(env.objc.borrow_mut::<NSScannerHostObject>(this));
     let left: id = msg![env; string substringFromIndex:pos];
     if left == nil {
-        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos };
+        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive };
         return false;
     }
 
@@ -364,7 +380,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     if cutoff == 0 {
         log_dbg!("scanInt: no valid int found for '{}'", st);
-        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos };
+        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive };
         return false;
     }
 
@@ -374,7 +390,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         env.mem.write(result, res);
     }
 
-    *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos: pos + cutoff as NSUInteger };
+    *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, case_sensitive, pos: pos + cutoff as NSUInteger };
     true
 }
 
@@ -393,10 +409,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)scanFloat:(MutPtr<f32>)result {
     skip_characters(env, this);
 
-    let NSScannerHostObject { to_be_skipped, string, len, pos } = std::mem::take(env.objc.borrow_mut::<NSScannerHostObject>(this));
+    let NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive } = std::mem::take(env.objc.borrow_mut::<NSScannerHostObject>(this));
     let left: id = msg![env; string substringFromIndex:pos];
     if left == nil {
-        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos };
+        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive };
         return false;
     }
 
@@ -421,7 +437,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     if !seen_digit {
         log_dbg!("scanFloat: no valid float found for '{}'", st);
-        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos };
+        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive };
         return false;
     }
 
@@ -431,17 +447,17 @@ pub const CLASSES: ClassExports = objc_classes! {
         env.mem.write(result, res);
     }
 
-    *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos: pos + cutoff as NSUInteger };
+    *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, case_sensitive, pos: pos + cutoff as NSUInteger };
     true
 }
 
 - (bool)scanDouble:(MutPtr<f64>)result {
     skip_characters(env, this);
 
-    let NSScannerHostObject { to_be_skipped, string, len, pos } = std::mem::take(env.objc.borrow_mut::<NSScannerHostObject>(this));
+    let NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive } = std::mem::take(env.objc.borrow_mut::<NSScannerHostObject>(this));
     let left: id = msg![env; string substringFromIndex:pos];
     if left == nil {
-        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos };
+        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive };
         return false;
     }
 
@@ -465,7 +481,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     if !seen_digit {
-        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos };
+        *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos, case_sensitive };
         return false;
     }
 
@@ -474,7 +490,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         env.mem.write(result, res);
     }
 
-    *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, pos: pos + cutoff as NSUInteger };
+    *env.objc.borrow_mut::<NSScannerHostObject>(this) = NSScannerHostObject { to_be_skipped, string, len, case_sensitive, pos: pos + cutoff as NSUInteger };
     true
 }
 
@@ -489,6 +505,7 @@ fn skip_characters(env: &mut Environment, scanner: id) {
         string,
         len,
         mut pos,
+        ..
     } = env.objc.borrow::<NSScannerHostObject>(scanner);
     loop {
         if pos >= len {
@@ -509,11 +526,21 @@ fn skip_characters(env: &mut Environment, scanner: id) {
 fn scan_digit_text(env: &mut Environment, scanner: id) -> Option<String> {
     skip_characters(env, scanner);
 
-    let NSScannerHostObject { to_be_skipped, string, len, pos } =
-        std::mem::take(env.objc.borrow_mut::<NSScannerHostObject>(scanner));
+    let NSScannerHostObject {
+        to_be_skipped,
+        string,
+        len,
+        pos,
+        case_sensitive,
+    } = std::mem::take(env.objc.borrow_mut::<NSScannerHostObject>(scanner));
     let restore = |env: &mut Environment, next_pos: NSUInteger| {
-        *env.objc.borrow_mut::<NSScannerHostObject>(scanner) =
-            NSScannerHostObject { to_be_skipped, string, len, pos: next_pos };
+        *env.objc.borrow_mut::<NSScannerHostObject>(scanner) = NSScannerHostObject {
+            to_be_skipped,
+            string,
+            len,
+            case_sensitive,
+            pos: next_pos,
+        };
     };
     let left: id = msg![env; string substringFromIndex:pos];
     if left == nil {
@@ -550,9 +577,13 @@ fn scan_long_long(env: &mut Environment, scanner: id, result: MutPtr<i64>) -> bo
     };
     if !result.is_null() {
         // Values that don't fit saturate, like `strtoll` does.
-        let parsed = text
-            .parse::<i64>()
-            .unwrap_or_else(|_| if text.starts_with('-') { i64::MIN } else { i64::MAX });
+        let parsed = text.parse::<i64>().unwrap_or_else(|_| {
+            if text.starts_with('-') {
+                i64::MIN
+            } else {
+                i64::MAX
+            }
+        });
         env.mem.write(result, parsed);
     }
     true
