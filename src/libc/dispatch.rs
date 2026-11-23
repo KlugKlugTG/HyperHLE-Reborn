@@ -6,7 +6,9 @@
 //! Grand Central Dispatch (GCD) — `dispatch/dispatch.h`
 //!
 //! Main-queue submissions are scheduled on the main thread's run loop.
-//! Other queues and dispatch groups still have limited, inline execution.
+//! Background queues run on reusable guest workers, with FIFO serial queues.
+
+mod queues;
 
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::{
@@ -131,6 +133,9 @@ pub struct State {
     /// Nested run loops must not execute another main-queue callback while
     /// one is still running: the main queue is serial.
     draining_main_queue: bool,
+    worker_queues: HashMap<u32, queues::WorkerQueue>,
+    pending_worker_queues: std::collections::HashSet<u32>,
+    worker_entry: Option<GuestFunction>,
     /// Active dispatch sources keyed by their opaque guest handles.
     pub(super) sources: HashMap<u32, dispatch_source::DispatchSource>,
     /// Next aligned opaque source handle.
@@ -139,6 +144,10 @@ pub struct State {
 
 pub(super) fn get_state(env: &mut Environment) -> &mut State {
     &mut env.libc_state.dispatch
+}
+
+pub(crate) fn ensure_worker_capacity(env: &mut Environment) {
+    queues::ensure_capacity(env);
 }
 
 /// The queue running the caller. Outside of a submitted block, Apple's
@@ -270,6 +279,7 @@ fn dispatch_queue_create(
         st.named_queues.insert(raw_label, handle);
     }
     st.queue_labels.insert(handle, label_cstr);
+    st.worker_queues.insert(handle, queues::WorkerQueue::new(attr != DISPATCH_QUEUE_SERIAL));
     MutVoidPtr::from_bits(handle)
 }
 
@@ -405,15 +415,11 @@ fn dispatch_async(env: &mut Environment, queue: dispatch_queue_t, block: dispatc
     if block.is_null() {
         return;
     }
-    if queue.to_bits() == MAIN_QUEUE_PTR {
-        let block = crate::libc::blocks::_Block_copy(env, block.cast_const()).cast_mut();
-        get_state(env).main_queue.push_back(MainQueueTask {
-            work: MainQueueWork::Block(block),
-            completion: None,
-        });
-    } else {
-        with_current_queue(env, queue, |env| call_void_block(env, block));
-    }
+    let block = crate::libc::blocks::_Block_copy(env, block.cast_const()).cast_mut();
+    queues::enqueue(env, queue, MainQueueTask {
+        work: MainQueueWork::Block(block),
+        completion: None,
+    });
 }
 
 fn dispatch_sync(env: &mut Environment, queue: dispatch_queue_t, block: dispatch_block_t) {
@@ -422,6 +428,8 @@ fn dispatch_sync(env: &mut Environment, queue: dispatch_queue_t, block: dispatch
     }
     if queue.to_bits() == MAIN_QUEUE_PTR {
         dispatch_main_sync(env, MainQueueWork::Block(block));
+    } else if queues::is_serial(env, queue) {
+        queues::sync(env, queue, MainQueueWork::Block(block));
     } else {
         with_current_queue(env, queue, |env| call_void_block(env, block));
     }
@@ -436,16 +444,10 @@ fn dispatch_async_f(
     if work == GuestFunction::null_ptr() {
         return;
     }
-    if queue.to_bits() == MAIN_QUEUE_PTR {
-        get_state(env).main_queue.push_back(MainQueueTask {
-            work: MainQueueWork::Function(work, context),
-            completion: None,
-        });
-    } else {
-        with_current_queue(env, queue, |env| {
-            let _: () = work.call_from_host(env, (context,));
-        });
-    }
+    queues::enqueue(env, queue, MainQueueTask {
+        work: MainQueueWork::Function(work, context),
+        completion: None,
+    });
 }
 
 fn dispatch_sync_f(
@@ -459,6 +461,8 @@ fn dispatch_sync_f(
     }
     if queue.to_bits() == MAIN_QUEUE_PTR {
         dispatch_main_sync(env, MainQueueWork::Function(work, context));
+    } else if queues::is_serial(env, queue) {
+        queues::sync(env, queue, MainQueueWork::Function(work, context));
     } else {
         with_current_queue(env, queue, |env| {
             let _: () = work.call_from_host(env, (context,));

@@ -312,3 +312,87 @@ int test_dispatch_queue_thread_identity(void) {
   dispatch_release(probe.queue);
   return result;
 }
+
+struct BackgroundQueueProbe {
+  pthread_t caller;
+  dispatch_queue_t queue;
+  sem_t *ready;
+  sem_t *resume;
+  sem_t *done;
+  int error;
+  int capture;
+  int calls;
+  int order[3];
+};
+
+static void submit_background_block(struct BackgroundQueueProbe *probe) {
+  int captured = 42;
+  dispatch_async(probe->queue, ^{
+    if (pthread_equal(pthread_self(), probe->caller)) {
+      probe->error = -1;
+      sem_post(probe->done);
+      return;
+    }
+    if (dispatch_get_current_queue() != probe->queue)
+      probe->error = -2;
+    sem_post(probe->ready);
+    sem_wait(probe->resume);
+    probe->capture = captured;
+    sem_post(probe->done);
+  });
+}
+
+// Unity's WWW helper enters a background run loop while initialization
+// continues on the caller. Async execution inline deadlocks that caller.
+// A submitted stack block must also survive the submitting helper returning.
+// https://developer.apple.com/documentation/dispatch/1453057-dispatch_async
+int test_dispatch_background_async(void) {
+  struct BackgroundQueueProbe probe = {0};
+  probe.caller = pthread_self();
+  probe.queue = dispatch_get_global_queue(0, 0);
+  probe.ready = sem_open("/dispatch_bg_ready", O_CREAT | O_EXCL, 0600, 0);
+  probe.resume = sem_open("/dispatch_bg_resume", O_CREAT | O_EXCL, 0600, 0);
+  probe.done = sem_open("/dispatch_bg_done", O_CREAT | O_EXCL, 0600, 0);
+  if (probe.ready == SEM_FAILED || probe.resume == SEM_FAILED ||
+      probe.done == SEM_FAILED)
+    abort();
+  submit_background_block(&probe);
+  if (!probe.error) {
+    sem_wait(probe.ready);
+    sem_post(probe.resume);
+  }
+  sem_wait(probe.done);
+  int result = probe.error ? probe.error : (probe.capture == 42 ? 0 : -3);
+  sem_close(probe.ready);
+  sem_close(probe.resume);
+  sem_close(probe.done);
+  sem_unlink("/dispatch_bg_ready");
+  sem_unlink("/dispatch_bg_resume");
+  sem_unlink("/dispatch_bg_done");
+  return result;
+}
+
+static void serial_queue_first(void *context) {
+  struct BackgroundQueueProbe *probe = context;
+  probe->order[probe->calls++] = 1;
+  usleep(1000);
+  probe->order[probe->calls++] = 2;
+}
+
+static void serial_queue_last(void *context) {
+  struct BackgroundQueueProbe *probe = context;
+  probe->order[probe->calls++] = 3;
+}
+
+// A sync submission must wait behind earlier async work even if that work
+// yields, and serial work cannot overlap while another callback is asleep.
+// https://github.com/apple-oss-distributions/libdispatch/blob/main/man/dispatch_queue_create.3
+int test_dispatch_background_serial(void) {
+  struct BackgroundQueueProbe probe = {0};
+  probe.queue = dispatch_queue_create("TestApp.background-serial", NULL);
+  dispatch_async_f(probe.queue, &probe, serial_queue_first);
+  dispatch_sync_f(probe.queue, &probe, serial_queue_last);
+  dispatch_release(probe.queue);
+  return probe.calls == 3 && probe.order[0] == 1 && probe.order[1] == 2 &&
+                 probe.order[2] == 3 ? 0 : -1;
+}

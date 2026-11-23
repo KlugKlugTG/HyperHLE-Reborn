@@ -4287,6 +4287,7 @@ impl Environment {
     /// decrementing semaphores, setting the thread to be unblocked, etc.).
     /// It is not required that the thread is switched to immediately.
     fn schedule_next_thread(&mut self) -> ThreadId {
+        libc::dispatch::ensure_worker_capacity(self);
         // GDB can allow schedule_next_thread to be called twice in a row -
         // we make sure that this works by immediately fufilling conditions
         // (relocking mutexes, decrementing semaphores, etc.)!
