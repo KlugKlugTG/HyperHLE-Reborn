@@ -410,3 +410,8 @@ com.explorationbase.Exploration: --manual-ui-rotation --rotation-fix
 # table. Keep linker stubs intact so HLE linking does not change that hash.
 # Readback presents its GL renderbuffer without the blank shared-texture path.
 com.notdoppler.EarntoDie: --preserve-dyld-stubs --present-mode=readback
+
+# BackStab's MoviePlayer sends movieSubtitles_reset after [super dealloc].
+# Preserve the freed isa and overlay ivar until reuse so that cleanup removes
+# substView, which otherwise remains above EAGLView and intercepts every tap.
+com.gameloft.BackStab: --zero-memory-on-alloc

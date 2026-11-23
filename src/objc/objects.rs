@@ -484,6 +484,55 @@ mod allocation_tests {
     use super::*;
     use crate::objc::ObjC;
 
+    // BackStab's legacy MoviePlayer cleans up subtitle views after super
+    // dealloc. Preserve its guest fields only until reuse, without keeping
+    // the host object, allocation or weak references alive. Apple's runtime
+    // calls free; overwriting freed bytes is a malloc debugging option:
+    // https://github.com/apple-oss-distributions/objc4/blob/main/runtime/objc-runtime-new.mm
+    // https://github.com/apple-oss-distributions/libmalloc/blob/main/man/malloc.3
+    #[test]
+    fn deallocation_policy_preserves_cleanup_fields_but_not_ownership() {
+        for zero_on_free in [true, false] {
+            let mut objc = ObjC::new();
+            let mut mem = Mem::new();
+            mem.set_null_segment_size(crate::mem::PAGE_SIZE);
+            mem.zero_memory_on_free = zero_on_free;
+            let class = Ptr::from_bits(0x2000);
+            let size = 152;
+            let object =
+                objc.alloc_object_sized(class, size, Box::new(TrivialHostObject), &mut mem);
+            let overlay_ivar: MutPtr<id> = (object.cast::<u8>() + 148).cast();
+            let overlay: id = Ptr::from_bits(0x3000);
+            mem.write(overlay_ivar, overlay);
+            let weak_slot = mem.alloc_and_write(object);
+            objc.weak_refs.insert(object, vec![weak_slot]);
+
+            objc.dealloc_object(object, &mut mem);
+
+            assert!(!objc.objects.contains_key(&object));
+            assert!(!mem.is_known_allocation(object.to_bits()));
+            assert_eq!(mem.read(weak_slot), nil);
+            assert!(!objc.weak_refs.contains_key(&object));
+            assert_eq!(
+                ObjC::read_isa(object, &mem),
+                if zero_on_free { nil } else { class }
+            );
+            assert_eq!(
+                mem.read(overlay_ivar),
+                if zero_on_free { nil } else { overlay }
+            );
+
+            let reused = mem.alloc(size);
+            assert_eq!(reused, object.cast());
+            assert!(mem
+                .bytes_at(reused.cast(), size)
+                .iter()
+                .all(|&byte| byte == 0));
+            mem.free(reused);
+            mem.free(weak_slot.cast());
+        }
+    }
+
     // UIApplicationMain supports a guest subclass as its principal class.
     // Its immortal allocation still needs the entire subclass instance.
     // https://developer.apple.com/documentation/uikit/uiapplicationmain(_:_:_:_:)

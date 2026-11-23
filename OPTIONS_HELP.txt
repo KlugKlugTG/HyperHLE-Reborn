@@ -264,6 +264,13 @@ Graphics driver options:
         the first one that works.
 
 Debugging options:
+    --zero-memory-on-alloc / --zero-memory-on-free
+        Zero heap bytes when allocating instead of when freeing them, for
+        legacy apps that read freed objects during cleanup. Freed allocations
+        are still reclaimed immediately and weak references are still cleared.
+        BackStab enables this through its bundled defaults. The second option
+        restores the usual zero-on-free policy for apps without older overrides.
+
     --preserve-dyld-stubs / --no-preserve-dyld-stubs
         Resolve lazy imports through their data pointers at startup, preserving
         the executable's original linker instructions. This supports engines

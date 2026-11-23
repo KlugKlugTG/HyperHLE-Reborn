@@ -801,7 +801,11 @@ impl Environment {
             && !is_critter_crunch
             && !is_geometry_dash
             && !is_wheres_my_water
-            && !is_gravity_guy;
+            && !is_gravity_guy
+            && !options.zero_memory_on_alloc;
+        if options.zero_memory_on_alloc {
+            log!("Heap compatibility: preserving freed bytes until reuse; zeroing memory on allocation.");
+        }
         if is_spore {
             log!("Applying game-specific hack for Spore Origins: zeroing memory on alloc instead of free.");
         }

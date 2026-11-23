@@ -238,6 +238,10 @@ pub struct Options {
     /// `crate::environment::default_guest_heap_cap`). See
     /// `crate::mem::Mem::set_memory_limit`.
     pub memory_limit_mb: Option<u32>,
+    /// Preserve freed heap bytes until reuse, zeroing on allocation instead.
+    /// Opt in for legacy apps that read freed objects during their cleanup.
+    /// This does not retain objects or prevent their storage from being reused.
+    pub zero_memory_on_alloc: bool,
     pub force_composition: bool,
     /// See [PresentMode]. Can also be set with the `TOUCHHLE_PRESENT_MODE`
     /// environment variable (the option takes precedence).
@@ -433,6 +437,7 @@ impl Default for Options {
             performance_overlay_corner: PerformanceOverlayCorner::TopRight,
             fps_limit: Some(60.0),
             memory_limit_mb: None,
+            zero_memory_on_alloc: false,
             force_composition: false,
             present_mode: std::env::var("TOUCHHLE_PRESENT_MODE")
                 .ok()
@@ -738,6 +743,10 @@ impl Options {
                     .ok_or_else(|| "Invalid value for --fps-limit=".to_string())?;
                 self.fps_limit = Some(limit);
             }
+        } else if arg == "--zero-memory-on-alloc" {
+            self.zero_memory_on_alloc = true;
+        } else if arg == "--zero-memory-on-free" {
+            self.zero_memory_on_alloc = false;
         } else if let Some(value) = arg.strip_prefix("--memory-limit=") {
             self.memory_limit_mb = parse_memory_limit_mb(value)?;
         } else if arg == "--force-composition" {
@@ -961,6 +970,16 @@ fn parse_dump_options(options: &str) -> Result<DumpingOptions, String> {
 #[cfg(test)]
 mod option_parsing_tests {
     use super::*;
+
+    #[test]
+    fn preserving_freed_memory_is_opt_in_and_can_be_disabled() {
+        let mut options = Options::default();
+        assert!(!options.zero_memory_on_alloc);
+        assert!(options.parse_argument("--zero-memory-on-alloc").unwrap());
+        assert!(options.zero_memory_on_alloc);
+        assert!(options.parse_argument("--zero-memory-on-free").unwrap());
+        assert!(!options.zero_memory_on_alloc);
+    }
 
     #[test]
     fn force_composition_can_be_enabled_and_disabled() {
