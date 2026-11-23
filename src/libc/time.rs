@@ -625,11 +625,12 @@ fn nanosleep(env: &mut Environment, rqtp: ConstPtr<timespec>, _rmtp: MutPtr<time
         return -1;
     }
     let t = env.mem.read(rqtp);
-    if t.tv_sec < 0 || !(0..1_000_000_000).contains(&t.tv_nsec) {
+    let tv_nsec = t.tv_nsec;
+    if t.tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
         set_errno(env, EINVAL);
         return -1;
     }
-    let total_sleep = Duration::new(t.tv_sec as u64, t.tv_nsec as u32);
+    let total_sleep = Duration::new(t.tv_sec as u64, tv_nsec as u32);
     env.sleep_guest(total_sleep);
 
     0

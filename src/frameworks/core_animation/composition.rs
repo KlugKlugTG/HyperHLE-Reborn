@@ -699,18 +699,6 @@ unsafe fn composite_layer_recursive(
     //       supported yet :)
     // TODO: back-to-front drawing is not efficient, could we use front-to-back?
 
-    // Fully transparent subtrees cannot contribute pixels. Avoid cloning
-    // their presentation layers and issuing GL work, including for children.
-    let model = env.objc.borrow::<CALayerHostObject>(layer);
-    if model.hidden
-        || (model.opacity <= 0.0
-            && model.animations.is_empty()
-            && model.anonymous_animations.is_empty())
-        || opacity <= 0.0
-    {
-        return;
-    }
-
     // This is both acting as the presentationLayer and the private render layer
     // It might need to be reworked in the future into a guest presentationLayer
     //
@@ -733,14 +721,22 @@ unsafe fn composite_layer_recursive(
             .presented_pixels = Some((pixels, width, height));
     }
 
-    if host_obj.hidden || host_obj.opacity <= 0.0 {
+    if host_obj.hidden {
+        return;
+    }
+
+    let opacity = opacity * host_obj.opacity;
+    if opacity <= 0.0 {
+        // Skip GL work for transparent subtrees, but still advance child
+        // animations and deliver their start/stop callbacks on time.
+        for child in host_obj.sublayers {
+            composite_layer_recursive(env, animation_state, child, cumulative_transform, opacity);
+        }
         return;
     }
 
     let window = env.window.as_mut().unwrap();
     let mut gles = window.make_internal_gl_ctx_current();
-
-    let opacity = opacity * host_obj.opacity;
     let cumulative_transform = {
         let CALayerHostObject { bounds, .. } = host_obj;
 
