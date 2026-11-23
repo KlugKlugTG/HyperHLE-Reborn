@@ -940,11 +940,7 @@ impl Environment {
                 let implemented_in_host = crate::dyld::DYLIB_LIST
                     .iter()
                     .any(|d| d.path == dylib || d.aliases.contains(&dylib));
-                let is_swift = dylib
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(dylib)
-                    .starts_with("libswift");
+                let is_swift = dylib.rsplit('/').next().unwrap_or(dylib).starts_with("libswift");
                 if !implemented_in_host && !is_swift {
                     log!(
                         "Warning: app binary depends on unimplemented or missing dylib \"{}\"",
@@ -1748,9 +1744,7 @@ impl Environment {
                 break;
             }
 
-            lr = self
-                .mem
-                .read(mem::ConstPtr::<u32>::from_bits(saved_lr_addr));
+            lr = self.mem.read(mem::ConstPtr::<u32>::from_bits(saved_lr_addr));
             let previous_fp: u32 = self.mem.read(mem::ConstPtr::<u32>::from_bits(fp));
             if lr == return_to_host_routine_addr {
                 echo_no_panic!("{:2}. [host function]", i);
@@ -2219,14 +2213,16 @@ impl Environment {
                 let imminent_wakeup = self.threads.iter().any(|thread| {
                     let deadline = match thread.blocked_by {
                         ThreadBlock::Sleeping(due) => Some(due),
-                        ThreadBlock::GuestSleeping(due) => {
-                            Some(self.guest_clock.host_deadline(due))
-                        }
+                        ThreadBlock::GuestSleeping(due) => Some(self.guest_clock.host_deadline(due)),
                         _ => None,
                     };
                     deadline.is_some_and(|due| due < Instant::now() + Duration::from_millis(10))
                 });
-                self.remaining_ticks = Some(if imminent_wakeup { 100_000 } else { 1_000_000 });
+                self.remaining_ticks = Some(if imminent_wakeup {
+                    100_000
+                } else {
+                    1_000_000
+                });
             }
             // Game trainer (Cheat Engine-style memory search/patch + on-screen
             // UI). Disabled by default; skip it unless `--trainer` is enabled.
@@ -2580,7 +2576,10 @@ impl Environment {
     }
 
     /// Mark a synthetic frame installed for a host-to-guest call.
-    pub(crate) fn push_host_to_guest_stack_frame(&mut self, frame_pointer: u32) -> (ThreadId, u32) {
+    pub(crate) fn push_host_to_guest_stack_frame(
+        &mut self,
+        frame_pointer: u32,
+    ) -> (ThreadId, u32) {
         let frame = (self.current_thread, frame_pointer);
         self.host_to_guest_stack_frames.push(frame);
         frame
@@ -2898,7 +2897,9 @@ impl Environment {
                 }
                 let info = section.dyld_indirect_symbol_info.as_ref()?;
                 let index = (addr - section.addr) / info.entry_size;
-                info.indirect_undef_symbols.get(index as usize)?.as_deref()
+                info.indirect_undef_symbols
+                    .get(index as usize)?
+                    .as_deref()
             })
         })
     }
@@ -3174,7 +3175,9 @@ impl Environment {
                 // exact `fault_pc` instead.
                 let pc = legacy_pc;
                 let lr = self.cpu.regs()[cpu::Cpu::LR];
-                if is_undefined_instruction && crate::env_flag_cached!("TOUCHHLE_TRACE_UDF_REGS") {
+                if is_undefined_instruction
+                    && crate::env_flag_cached!("TOUCHHLE_TRACE_UDF_REGS")
+                {
                     static TRACE_COUNT: std::sync::atomic::AtomicUsize =
                         std::sync::atomic::AtomicUsize::new(0);
                     if pc >= 0x700000
@@ -3430,7 +3433,10 @@ impl Environment {
                 // flood the log.
                 const MAX_UNDECODABLE_SITE_DIAGNOSTICS: usize = 8;
                 if let GuestTrapKind::UndecodableInstruction { encoding } = trap_kind {
-                    let site_count = self.cpu_skipped_instruction_sites.entry(pc).or_insert(0);
+                    let site_count = self
+                        .cpu_skipped_instruction_sites
+                        .entry(pc)
+                        .or_insert(0);
                     *site_count = site_count.saturating_add(1);
                     let site_count = *site_count;
                     let distinct_sites = self.cpu_skipped_instruction_sites.len();
@@ -3523,8 +3529,7 @@ impl Environment {
                 // stable LR) are unaffected.
                 const LR_BYPASS_LIMIT: u32 = 4096;
                 let lr_count = if self.cpu_error_bypass_last_lr == Some(lr) {
-                    self.cpu_error_bypass_lr_count =
-                        self.cpu_error_bypass_lr_count.saturating_add(1);
+                    self.cpu_error_bypass_lr_count = self.cpu_error_bypass_lr_count.saturating_add(1);
                     self.cpu_error_bypass_lr_count
                 } else {
                     self.cpu_error_bypass_last_lr = Some(lr);
@@ -3542,8 +3547,7 @@ impl Environment {
                 // compiling a block there (RetroArch, wild PC 0x4000 reached
                 // from eight different scripts, then 0x100000).
                 let pc_count = if self.cpu_error_bypass_last_pc == Some(pc) {
-                    self.cpu_error_bypass_pc_count =
-                        self.cpu_error_bypass_pc_count.saturating_add(1);
+                    self.cpu_error_bypass_pc_count = self.cpu_error_bypass_pc_count.saturating_add(1);
                     self.cpu_error_bypass_pc_count
                 } else {
                     self.cpu_error_bypass_last_pc = Some(pc);
@@ -3707,9 +3711,7 @@ impl Environment {
                     };
                     let recovery_description = match recovery {
                         GuestTrapRecovery::ReturnToLr => {
-                            format!(
-                                "Faking function return to LR ({lr:#x}) to bypass the guest trap."
-                            )
+                            format!("Faking function return to LR ({lr:#x}) to bypass the guest trap.")
                         }
                         GuestTrapRecovery::UnwindFrame { frame, reason } => format!(
                             "Unwinding the frame record at r7={:#x} (saved r7={:#x}, \
@@ -4287,14 +4289,14 @@ impl Environment {
     /// decrementing semaphores, setting the thread to be unblocked, etc.).
     /// It is not required that the thread is switched to immediately.
     fn schedule_next_thread(&mut self) -> ThreadId {
-        libc::dispatch::ensure_worker_capacity(self);
         // GDB can allow schedule_next_thread to be called twice in a row -
         // we make sure that this works by immediately fufilling conditions
         // (relocking mutexes, decrementing semaphores, etc.)!
         loop {
+            libc::dispatch::ensure_worker_capacity(self);
             // Try to find a new thread to execute, starting with the thread
             // following the one currently executing.
-            let mut next_awakening: Option<Instant> = None;
+            let mut next_awakening = libc::dispatch::next_deadline(self);
             for i in 0..self.threads.len() {
                 let thread_id = (self.current_thread + 1 + i) % self.threads.len();
                 let candidate = &mut self.threads[thread_id];
@@ -4947,7 +4949,11 @@ mod guest_trap_call_site_tests {
         impl Fn(u32) -> Option<u16> + '_,
         impl Fn(u32) -> Option<u32> + '_,
     ) {
-        let read_u16 = move |addr: u32| code.iter().find(|(a, _)| *a == addr).map(|(_, v)| *v);
+        let read_u16 = move |addr: u32| {
+            code.iter()
+                .find(|(a, _)| *a == addr)
+                .map(|(_, v)| *v)
+        };
         let read_u32 = move |addr: u32| {
             let lo = code.iter().find(|(a, _)| *a == addr).map(|(_, v)| *v)?;
             let hi = code
@@ -4964,26 +4970,17 @@ mod guest_trap_call_site_tests {
         // 0x8000: f000 f802  bl 0x8008
         let code = [(0x8000, 0xf000), (0x8002, 0xf802)];
         let (r16, r32) = readers(&code);
-        assert_eq!(
-            decode_direct_call_before(0x8005, r16, r32),
-            Some((0x8000, 0x8008))
-        );
+        assert_eq!(decode_direct_call_before(0x8005, r16, r32), Some((0x8000, 0x8008)));
 
         // 0x8000: f7ff ff00  bl 0x7e04
         let code = [(0x8000, 0xf7ff), (0x8002, 0xff00)];
         let (r16, r32) = readers(&code);
-        assert_eq!(
-            decode_direct_call_before(0x8005, r16, r32),
-            Some((0x8000, 0x7e04))
-        );
+        assert_eq!(decode_direct_call_before(0x8005, r16, r32), Some((0x8000, 0x7e04)));
 
         // 0x1000: f7ff fffe  bl . (offset -4)
         let code = [(0x1000, 0xf7ff), (0x1002, 0xfffe)];
         let (r16, r32) = readers(&code);
-        assert_eq!(
-            decode_direct_call_before(0x1005, r16, r32),
-            Some((0x1000, 0x1000))
-        );
+        assert_eq!(decode_direct_call_before(0x1005, r16, r32), Some((0x1000, 0x1000)));
     }
 
     #[test]
@@ -4991,10 +4988,7 @@ mod guest_trap_call_site_tests {
         // 0x8002: f000 e800  blx 0x8004 (Align(PC, 4) + 0)
         let code = [(0x8002, 0xf000), (0x8004, 0xe800)];
         let (r16, r32) = readers(&code);
-        assert_eq!(
-            decode_direct_call_before(0x8007, r16, r32),
-            Some((0x8002, 0x8004))
-        );
+        assert_eq!(decode_direct_call_before(0x8007, r16, r32), Some((0x8002, 0x8004)));
     }
 
     #[test]
@@ -5021,26 +5015,17 @@ mod guest_trap_call_site_tests {
         // 0x1000: eb000000  bl 0x1008
         let code = [(0x1000, 0x0000), (0x1002, 0xeb00)];
         let (r16, r32) = readers(&code);
-        assert_eq!(
-            decode_direct_call_before(0x1004, r16, r32),
-            Some((0x1000, 0x1008))
-        );
+        assert_eq!(decode_direct_call_before(0x1004, r16, r32), Some((0x1000, 0x1008)));
 
         // 0x1000: ebfffffe  bl . (offset -8)
         let code = [(0x1000, 0xfffe), (0x1002, 0xebff)];
         let (r16, r32) = readers(&code);
-        assert_eq!(
-            decode_direct_call_before(0x1004, r16, r32),
-            Some((0x1000, 0x1000))
-        );
+        assert_eq!(decode_direct_call_before(0x1004, r16, r32), Some((0x1000, 0x1000)));
 
         // 0x1000: fb000000  blx 0x100a (H=1), must not be mistaken for BL
         let code = [(0x1000, 0x0000), (0x1002, 0xfb00)];
         let (r16, r32) = readers(&code);
-        assert_eq!(
-            decode_direct_call_before(0x1004, r16, r32),
-            Some((0x1000, 0x100a))
-        );
+        assert_eq!(decode_direct_call_before(0x1004, r16, r32), Some((0x1000, 0x100a)));
 
         // 0x1000: e12fff33  blx r3
         let code = [(0x1000, 0xff33), (0x1002, 0xe12f)];
@@ -5053,29 +5038,17 @@ mod guest_trap_call_site_tests {
         // Asphalt 8 shape: `bl` at 0x1e3c2 (LR=0x1e3c7), trap at 0x1e432 in
         // the same function. A call to anything outside (0x1e3c2, 0x1e432]
         // can't have produced a return address for the trapping function.
-        assert!(!direct_call_is_consistent_with_fault(
-            0x1e3c2, 0x1e000, 0x1e432
-        ));
-        assert!(!direct_call_is_consistent_with_fault(
-            0x1e3c2, 0x1e3c2, 0x1e432
-        ));
-        assert!(!direct_call_is_consistent_with_fault(
-            0x1e3c2, 0x2a000, 0x1e432
-        ));
+        assert!(!direct_call_is_consistent_with_fault(0x1e3c2, 0x1e000, 0x1e432));
+        assert!(!direct_call_is_consistent_with_fault(0x1e3c2, 0x1e3c2, 0x1e432));
+        assert!(!direct_call_is_consistent_with_fault(0x1e3c2, 0x2a000, 0x1e432));
         // A leaf callee located between the call site and the trap is a
         // plausible owner of the trap, so LR may be genuine.
-        assert!(direct_call_is_consistent_with_fault(
-            0x1e3c2, 0x1e400, 0x1e432
-        ));
-        assert!(direct_call_is_consistent_with_fault(
-            0x1e3c2, 0x1e432, 0x1e432
-        ));
+        assert!(direct_call_is_consistent_with_fault(0x1e3c2, 0x1e400, 0x1e432));
+        assert!(direct_call_is_consistent_with_fault(0x1e3c2, 0x1e432, 0x1e432));
         // Callee located before the caller: can't tell, so assume genuine.
         assert!(direct_call_is_consistent_with_fault(0x2000, 0x1000, 0x1010));
         // ...unless the call went past the trap.
-        assert!(!direct_call_is_consistent_with_fault(
-            0x2000, 0x3000, 0x1010
-        ));
+        assert!(!direct_call_is_consistent_with_fault(0x2000, 0x3000, 0x1010));
     }
 }
 
@@ -5310,7 +5283,9 @@ mod dylib_sorting_tests {
                 "/usr/lib/libstdc++.6.dylib" | "/usr/lib/libstdc++.6.0.9.dylib" => {
                     Some(vec!["/usr/lib/libgcc_s.1.dylib".to_owned()])
                 }
-                "/usr/lib/libgcc_s.1.dylib" => Some(vec!["/usr/lib/libSystem.B.dylib".to_owned()]),
+                "/usr/lib/libgcc_s.1.dylib" => {
+                    Some(vec!["/usr/lib/libSystem.B.dylib".to_owned()])
+                }
                 _ => None,
             };
             Ok(dependencies.map(|dependencies| (path.to_owned(), dependencies)))

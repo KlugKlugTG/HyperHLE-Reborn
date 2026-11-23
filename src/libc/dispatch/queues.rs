@@ -11,12 +11,16 @@
 use super::*;
 use crate::environment::ThreadBlock;
 use crate::mem::Mem;
+use crate::objc::msg_class;
 
 pub(super) struct WorkerQueue {
     concurrent: bool,
     pending: VecDeque<MainQueueTask>,
     wake: Option<MutPtr<sem_t>>,
     workers: Vec<(ThreadId, bool)>,
+    references: usize,
+    barrier_active: bool,
+    barrier_waiters: Vec<ThreadId>,
 }
 
 impl WorkerQueue {
@@ -26,6 +30,9 @@ impl WorkerQueue {
             pending: VecDeque::new(),
             wake: None,
             workers: Vec::new(),
+            references: 1,
+            barrier_active: false,
+            barrier_waiters: Vec::new(),
         }
     }
 }
@@ -44,10 +51,11 @@ pub(super) fn enqueue(env: &mut Environment, queue: dispatch_queue_t, task: Main
         return;
     }
     let state = get_state(env);
-    let q = state
-        .worker_queues
-        .entry(handle)
-        .or_insert_with(|| WorkerQueue::new(true));
+    let q = state.worker_queues.entry(handle).or_insert_with(|| {
+        let mut queue = WorkerQueue::new(true);
+        queue.references = usize::MAX; // Global queues live for the session.
+        queue
+    });
     q.pending.push_back(task);
     state.pending_worker_queues.insert(handle);
     let wake = get_state(env).worker_queues[&handle].wake;
@@ -61,6 +69,14 @@ pub(super) fn enqueue(env: &mut Environment, queue: dispatch_queue_t, task: Main
 }
 
 pub(super) fn sync(env: &mut Environment, queue: dispatch_queue_t, work: MainQueueWork) {
+    sync_task(env, queue, work, false);
+}
+
+pub(super) fn sync_barrier(env: &mut Environment, queue: dispatch_queue_t, work: MainQueueWork) {
+    sync_task(env, queue, work, true);
+}
+
+fn sync_task(env: &mut Environment, queue: dispatch_queue_t, work: MainQueueWork, barrier: bool) {
     assert_ne!(
         current_queue(env),
         queue.to_bits(),
@@ -73,6 +89,8 @@ pub(super) fn sync(env: &mut Environment, queue: dispatch_queue_t, work: MainQue
         MainQueueTask {
             work,
             completion: Some(completion),
+            group: None,
+            barrier,
         },
     );
     assert!(env.sem_decrement(completion, true));
@@ -141,10 +159,37 @@ fn dispatch_worker(env: &mut Environment, queue: dispatch_queue_t) -> MutVoidPtr
     let tid = env.current_thread;
     let wake = get_state(env).worker_queues[&handle].wake.unwrap();
     loop {
+        let q = &get_state(env).worker_queues[&handle];
+        if q.references == 0 && q.pending.is_empty() {
+            break;
+        }
         assert!(env.sem_decrement(wake, true));
+        loop {
+            let q = &get_state(env).worker_queues[&handle];
+            let ready = !q.barrier_active
+                && q.pending.front().is_some_and(|task| {
+                    !task.barrier
+                        || handle == GLOBAL_QUEUE_PTR
+                        || !q.workers.iter().any(|(_, busy)| *busy)
+                });
+            if ready || (q.references == 0 && q.pending.is_empty()) {
+                break;
+            }
+            get_state(env)
+                .worker_queues
+                .get_mut(&handle)
+                .unwrap()
+                .barrier_waiters
+                .push(tid);
+            env.suspend_thread(tid);
+        }
         let state = get_state(env);
         let q = state.worker_queues.get_mut(&handle).unwrap();
+        if q.references == 0 && q.pending.is_empty() {
+            break;
+        }
         let task = q.pending.pop_front().unwrap();
+        q.barrier_active = task.barrier && handle != GLOBAL_QUEUE_PTR;
         q.workers.iter_mut().find(|(id, _)| *id == tid).unwrap().1 = true;
         if q.pending.is_empty() {
             state.pending_worker_queues.remove(&handle);
@@ -165,6 +210,9 @@ fn dispatch_worker(env: &mut Environment, queue: dispatch_queue_t) -> MutVoidPtr
         if let Some(completion) = task.completion {
             assert!(env.sem_increment(completion));
         }
+        if let Some(group) = task.group {
+            dispatch_group_leave(env, Ptr::from_bits(group));
+        }
         get_state(env)
             .worker_queues
             .get_mut(&handle)
@@ -174,5 +222,79 @@ fn dispatch_worker(env: &mut Environment, queue: dispatch_queue_t) -> MutVoidPtr
             .find(|(id, _)| *id == tid)
             .unwrap()
             .1 = false;
+        let q = get_state(env).worker_queues.get_mut(&handle).unwrap();
+        if task.barrier {
+            q.barrier_active = false;
+        }
+        let waiters = std::mem::take(&mut q.barrier_waiters);
+        for waiter in waiters {
+            env.threads[waiter].blocked_by = ThreadBlock::NotBlocked;
+        }
     }
+    let q = get_state(env).worker_queues.get_mut(&handle).unwrap();
+    q.workers.retain(|(worker, _)| *worker != tid);
+    if q.workers.is_empty() {
+        get_state(env).worker_queues.remove(&handle);
+        host_destroy_semaphore(env, wake);
+        if let Some(label) = get_state(env).queue_labels.remove(&handle) {
+            env.mem.free(label.cast_mut().cast());
+        }
+        get_state(env)
+            .named_queues
+            .retain(|_, queue| *queue != handle);
+        get_state(env)
+            .queue_specifics
+            .retain(|(queue, _), _| *queue != handle);
+    }
+    MutVoidPtr::null()
+}
+
+pub(super) fn retain(env: &mut Environment, handle: u32) -> bool {
+    let Some(q) = get_state(env).worker_queues.get_mut(&handle) else {
+        return false;
+    };
+    if q.references != usize::MAX {
+        q.references = q
+            .references
+            .checked_add(1)
+            .expect("dispatch queue retain overflow");
+    }
+    true
+}
+
+pub(super) fn release(env: &mut Environment, handle: u32) -> bool {
+    let Some(q) = get_state(env).worker_queues.get_mut(&handle) else {
+        return false;
+    };
+    if q.references == usize::MAX {
+        return true;
+    }
+    q.references = q
+        .references
+        .checked_sub(1)
+        .expect("dispatch queue over-release");
+    if q.references != 0 {
+        return true;
+    }
+    let wake = q.wake;
+    let workers = q.workers.len();
+    if workers == 0 {
+        get_state(env).worker_queues.remove(&handle);
+        if let Some(label) = get_state(env).queue_labels.remove(&handle) {
+            env.mem.free(label.cast_mut().cast());
+        }
+        get_state(env)
+            .named_queues
+            .retain(|_, queue| *queue != handle);
+        get_state(env)
+            .queue_specifics
+            .retain(|(queue, _), _| *queue != handle);
+    } else if let Some(wake) = wake {
+        // Queue-owned callbacks finish before workers exit. Wake idle workers
+        // too, so releasing a drained serial queue frees its guest stack.
+        for _ in 0..workers {
+            assert!(env.sem_increment(wake));
+        }
+    }
+    true
 }

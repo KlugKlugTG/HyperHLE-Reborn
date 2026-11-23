@@ -425,6 +425,8 @@ pub(super) struct EAGLContextHostObject {
     renderbuffer_drawable_bindings: Rc<RefCell<HashMap<GLuint, id>>>,
     fps_counter: Option<FpsCounter>,
     next_frame_due: Option<Instant>,
+    last_profiled_frame: Option<Instant>,
+    profiled_frame_intervals: Vec<f64>,
     /// Buffers the guest currently has mapped, keyed by target and buffer
     /// object name: `(guest mirror, driver mapping, size)`.
     ///
@@ -622,6 +624,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         renderbuffer_drawable_bindings: Rc::new(RefCell::new(HashMap::new())),
         fps_counter: None,
         next_frame_due: None,
+        last_profiled_frame: None,
+        profiled_frame_intervals: Vec::new(),
         mapped_buffers: HashMap::new(),
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
@@ -1196,6 +1200,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     // plain log!() would flood, but the very first call is a key signal that
     // the app actually got past splash/init and is rendering.
     log_once!("[EAGLContext presentRenderbuffer:] first call (app reached first frame)");
+    if crate::env_flag_cached!("TOUCHHLE_FRAME_TIMES") {
+        let host = env.objc.borrow_mut::<EAGLContextHostObject>(this);
+        let now = Instant::now();
+        if let Some(previous) = host.last_profiled_frame.replace(now) {
+            host.profiled_frame_intervals.push(now.duration_since(previous).as_secs_f64() * 1000.0);
+            // Batch output to keep profiling from introducing a blocking
+            // write on every frame. Only explicit diagnostic runs collect it.
+            if host.profiled_frame_intervals.len() == 120 {
+                let samples = host.profiled_frame_intervals.iter()
+                    .map(|ms| format!("{ms:.3}")).collect::<Vec<_>>().join(",");
+                host.profiled_frame_intervals.clear();
+                log!("FRAME-TIMES context={:?} ms={}", this, samples);
+            }
+        }
+    }
     {
         static INPUT_POLL_THREAD_LOGGED: std::sync::Once = std::sync::Once::new();
         INPUT_POLL_THREAD_LOGGED.call_once(|| {

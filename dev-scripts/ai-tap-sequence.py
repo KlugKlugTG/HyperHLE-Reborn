@@ -34,6 +34,9 @@ import sys
 import threading
 import time
 import os
+import csv
+import json
+import statistics
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -43,6 +46,7 @@ if sys.platform == "win32":
     from PIL import ImageGrab
 
 FPS_RE = re.compile(r"(?:EAGLContext .*|Core Animation compositor) FPS: ([0-9.]+)")
+FRAME_TIMES_RE = re.compile(r"FRAME-TIMES context=(\S+) ms=([0-9.,]+)")
 
 
 def find_window(process_id=None, pid_hint_title="touchHLE"):
@@ -179,6 +183,44 @@ def frames_differ(first, final):
     return result.returncode == 1
 
 
+def has_frame_content(path):
+    """Reject a uniform gray/black/white surface as evidence of game progress."""
+    if sys.platform == "win32":
+        from PIL import Image, ImageStat
+
+        with Image.open(path) as frame:
+            return max(ImageStat.Stat(frame.convert("RGB")).stddev) > 1.0
+    result = subprocess.run(
+        ["identify", "-format", "%[fx:standard_deviation]", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return float(result.stdout) > 1.0 / 255.0
+
+
+def write_metrics(out, fps_samples, frame_intervals):
+    with (out / "fps.csv").open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["elapsed_seconds", "source", "fps"])
+        writer.writerows(fps_samples)
+    with (out / "frame-times.csv").open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["context", "interval_ms"])
+        writer.writerows(frame_intervals)
+    values = sorted(ms for _, ms in frame_intervals)
+    metrics = {"fps_samples": len(fps_samples), "frame_time_samples": len(values)}
+    if values:
+        def percentile(fraction):
+            index = (len(values) - 1) * fraction
+            lower = int(index)
+            upper = min(lower + 1, len(values) - 1)
+            return values[lower] + (values[upper] - values[lower]) * (index - lower)
+
+        metrics.update(mean_ms=statistics.mean(values), p50_ms=percentile(0.5),
+                       p95_ms=percentile(0.95), p99_ms=percentile(0.99), max_ms=max(values))
+    (out / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    return metrics
+
+
 def wait_for_process(proc, seconds):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -208,6 +250,8 @@ def main():
     p.add_argument("--require-touch-delivery", action="store_true")
     p.add_argument("--require-nonblack-frame", action="store_true")
     p.add_argument("--require-frame-change", action="store_true")
+    p.add_argument("--require-frame-content", action="store_true")
+    p.add_argument("--require-eagl-frames", action="store_true")
     args = p.parse_args(argv)
     if sys.platform not in ("win32", "linux"):
         p.error("This script supports Windows and Linux/X11 hosts.")
@@ -244,6 +288,8 @@ def main():
         log.close()
         p.error(f"could not start emulator {exe}: {error}")
     fps_samples = []
+    fps_rows = []
+    frame_intervals = []
 
     start = time.time()
 
@@ -255,6 +301,12 @@ def main():
             m = FPS_RE.search(line)
             if m:
                 fps_samples.append((time.time(), float(m.group(1))))
+                source = "compositor" if "Core Animation compositor" in line else "EAGL"
+                fps_rows.append((time.time() - start, source, float(m.group(1))))
+            frame_times = FRAME_TIMES_RE.search(line)
+            if frame_times:
+                frame_intervals.extend((frame_times.group(1), float(ms))
+                                       for ms in frame_times.group(2).split(","))
 
     reader_thread = threading.Thread(target=reader, daemon=True)
     reader_thread.start()
@@ -271,6 +323,7 @@ def main():
         proc.wait()
         reader_thread.join()
         log.close()
+        write_metrics(out, fps_rows, frame_intervals)
         print(
             f"FAIL: emulator window never appeared (exit code {proc.returncode}); "
             f"log: {log_path}"
@@ -325,6 +378,9 @@ def main():
             if args.require_nonblack_frame and not has_nonblack_pixels(out / "final.png"):
                 print("FAIL: final frame is black despite compositor activity")
                 ok = False
+            if args.require_frame_content and not has_frame_content(out / "final.png"):
+                print("FAIL: final frame is uniform (gray/black/white), with no game content")
+                ok = False
             if args.require_frame_change:
                 try:
                     changed = frames_differ(first_shot, out / "final.png")
@@ -342,7 +398,13 @@ def main():
     proc.wait()
     reader_thread.join()
     log.close()
+    metrics = write_metrics(out, fps_rows, frame_intervals)
+    if frame_intervals:
+        print(f"Game frame intervals (ms): {metrics}")
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    if args.require_eagl_frames and not any(source == "EAGL" for _, source, _ in fps_rows):
+        print("FAIL: the game never presented EAGL frames; compositor FPS cannot prove progress")
+        ok = False
     failure_patterns = (
         r"App called exit\(",
         r"Shader[^\n]*compile failed",

@@ -9,7 +9,7 @@ on:
       emulator_run_id:
         description: Successful Linux emulator build to test
         type: string
-        default: "45185462232"
+        default: "45215523820"
       tap_sequence:
         description: Space-separated WAIT:X,Y steps
         type: string
@@ -31,7 +31,8 @@ jobs:
       ALSOFT_DRIVERS: "null"
       TOUCHHLE_STALL_DIAG: "1"
       TOUCHHLE_TRACE_GUEST_THREADS: "1"
-      BOWMASTERS_BUILD_RUN: ${{ inputs.emulator_run_id || '45185462232' }}
+      TOUCHHLE_FRAME_TIMES: "1"
+      BOWMASTERS_BUILD_RUN: ${{ inputs.emulator_run_id || '45215523820' }}
       BOWMASTERS_TAPS: ${{ inputs.tap_sequence || '1:- 10:- 20:- 30:-' }}
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +47,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.emulator_run_id || '45185462232' }}
+          run-id: ${{ inputs.emulator_run_id || '45215523820' }}
           name: HyperHLE_Linux_ARM64_diagnostic
           path: emulator
       - name: Download private game fixture
@@ -76,7 +77,28 @@ jobs:
           tap_args=()
           for tap in "${taps[@]}"; do tap_args+=(--step "$tap"); done
           pidstat -h -r -u -w -t -C touchHLE 1 > results/pidstat.txt &
-          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/bowmasters.ipa" --exe "$BOWMASTERS_EXE" --cwd "$BOWMASTERS_CWD" --out results/startup "${tap_args[@]}" --final-wait 10 --require-nonblack-frame --require-frame-change -- --overlay=off --device-family=iphone-4s
+          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/bowmasters.ipa" --exe "$BOWMASTERS_EXE" --cwd "$BOWMASTERS_CWD" --out results/startup "${tap_args[@]}" --final-wait 10 --require-nonblack-frame --require-frame-change --require-frame-content --require-eagl-frames -- --overlay=off --device-family=iphone-4s &
+          game_test=$!
+          (
+            for attempt in $(seq 1 60); do
+              game_pid=$(pgrep -x touchHLE | head -n 1 || true)
+              if [ -n "$game_pid" ]; then break; fi
+              sleep 0.5
+            done
+            test -n "$game_pid"
+            perf_exe=$(find /usr/lib/linux-tools -type f -name perf | head -n 1)
+            test -n "$perf_exe"
+            sudo "$perf_exe" record -F 99 -e cpu-clock:u -g --call-graph fp -o "$GITHUB_WORKSPACE/results/perf.data" -p "$game_pid"
+            sudo "$perf_exe" report --stdio --no-children -i "$GITHUB_WORKSPACE/results/perf.data" > results/perf-report.txt
+            sudo chown -R "$(id -u):$(id -g)" results
+          ) > results/perf.log 2>&1 &
+          profile=$!
+          set +e
+          wait "$game_test"
+          game_status=$?
+          wait "$profile"
+          profile_status=$?
+          test "$game_status" = 0 && test "$profile_status" = 0
       - name: Preserve emulator log
         if: always()
         run: cp "$BOWMASTERS_CWD/HyperHLE_log.txt" results/detailed.log 2>/dev/null || true
