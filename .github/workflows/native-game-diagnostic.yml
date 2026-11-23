@@ -29,7 +29,7 @@ jobs:
       - name: Install prebuilt runtime packages
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends xvfb xdotool x11-utils imagemagick python3 libsndio-dev libstdc++6 libgl1 libegl1 libgles1 libvulkan1 mesa-vulkan-drivers
+          sudo apt-get install -y --no-install-recommends ripgrep xvfb xdotool x11-utils imagemagick python3 libsndio-dev libstdc++6 libgl1 libegl1 libgles1 libvulkan1 mesa-vulkan-drivers
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
@@ -47,6 +47,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release download ci-private-native-games-20261123 --repo "$GITHUB_REPOSITORY" --pattern '*.ipa' --dir private-inputs
+          test -s private-inputs/zenonia.ipa
+          test -s private-inputs/spiderman.ipa
       - name: Set up the native GLES runtime
         run: |
           chmod +x native-emulator/touchHLE
