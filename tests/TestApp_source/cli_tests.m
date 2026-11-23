@@ -5262,6 +5262,62 @@ int test_setjmp() {
   return -1;
 }
 
+// longjmp(0) must return 1, rather than re-entering initialization forever.
+// https://github.com/apple-oss-distributions/Libc/blob/Libc-594.1.4/arm/sys/_longjmp.s
+int test_longjmp_zero_and_negative() {
+  jmp_buf buffer;
+  volatile int attempts = 0;
+  int status = setjmp(buffer);
+  if (status == 0) {
+    if (++attempts > 1)
+      return -1;
+    longjmp(buffer, 0);
+  }
+  if (status != 1)
+    return -2;
+  status = _setjmp(buffer);
+  if (status == 0)
+    _longjmp(buffer, -123);
+  return status == -123 ? 0 : -3;
+}
+
+// Inspect the actual ARM save area as well as restoring d8-d15. Games and
+// bundled runtimes can mix their own save/restore code with libc calls.
+// https://github.com/apple-oss-distributions/Libc/blob/Libc-594.1.4/arm/sys/_setjmp.s
+int test_setjmp_vfp_preserved() {
+  jmp_buf buffer;
+  unsigned int original[16], actual[16];
+  const unsigned int expected[16] = {
+      0x00000000, 0x3ff00000, 0x00000000, 0x40000000,
+      0x00000000, 0x40080000, 0x00000000, 0x40100000,
+      0x00000000, 0x40140000, 0x00000000, 0x40180000,
+      0x00000000, 0x401c0000, 0x00000000, 0x40200000};
+  const unsigned int cleared[16] = {0};
+  int result = 0;
+  __asm__ volatile("vstmia %0, {d8-d15}" : : "r"(original) : "memory");
+  __asm__ volatile("vldmia %0, {d8-d15}"
+                   : : "r"(expected)
+                   : "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15");
+  if (setjmp(buffer) == 0) {
+    if (memcmp((char *)buffer + 0x24, expected, sizeof(expected)) != 0) {
+      result = -1;
+    } else {
+      __asm__ volatile("vldmia %0, {d8-d15}"
+                       : : "r"(cleared)
+                       : "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15");
+      longjmp(buffer, 1);
+    }
+  } else {
+    __asm__ volatile("vstmia %0, {d8-d15}" : : "r"(actual) : "memory");
+    if (memcmp(actual, expected, sizeof(expected)) != 0)
+      result = -2;
+  }
+  __asm__ volatile("vldmia %0, {d8-d15}"
+                   : : "r"(original)
+                   : "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15");
+  return result;
+}
+
 int test_inet_addr() {
   unsigned int res = inet_addr("127.0.0.1");
   if (res != 16777343) {
@@ -7343,6 +7399,8 @@ struct {
     FUNC_DEF(test_frexpf),
     FUNC_DEF(test_frexp),
     FUNC_DEF(test_setjmp),
+    FUNC_DEF(test_longjmp_zero_and_negative),
+    FUNC_DEF(test_setjmp_vfp_preserved),
     FUNC_DEF(test_inet_addr),
     FUNC_DEF(test_inet_ntop),
     FUNC_DEF(test_inet_pton),

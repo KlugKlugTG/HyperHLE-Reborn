@@ -15,7 +15,6 @@ use super::ca_layer::CALayerHostObject;
 use crate::frameworks::core_animation::animation;
 use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
 use crate::frameworks::core_graphics::{cg_bitmap_context, cg_image, CGFloat, CGRect, CGSize};
-use crate::frameworks::foundation::ns_time_interval_to_duration_or_zero;
 use crate::gles::gles11_raw as gles11; // constants only
 use crate::gles::gles11_raw::types::*;
 use crate::gles::present::{present_frame, FpsCounter};
@@ -61,6 +60,44 @@ unsafe fn load_matrix(gles: &mut dyn GLES, matrix: Matrix<4>) {
     gles.LoadMatrixf(matrix.columns().as_ptr() as *const _);
 }
 
+// Core Animation presents at refresh boundaries and drops missed frames.
+// https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/CoreAnimation_guide/Introduction/Introduction.html
+const COMPOSITION_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+
+fn composition_deadline(previous: Option<Instant>, finished: Instant) -> Instant {
+    let Some(previous) = previous else {
+        return finished + COMPOSITION_INTERVAL;
+    };
+    if previous > finished {
+        return previous;
+    }
+    let intervals =
+        finished.duration_since(previous).as_nanos() / COMPOSITION_INTERVAL.as_nanos() + 1;
+    u32::try_from(intervals)
+        .ok()
+        .and_then(|n| COMPOSITION_INTERVAL.checked_mul(n))
+        .and_then(|advance| previous.checked_add(advance))
+        .unwrap_or(finished + COMPOSITION_INTERVAL)
+}
+
+#[cfg(test)]
+#[test]
+fn composition_drops_missed_refreshes_without_immediate_redraw() {
+    let now = Instant::now();
+    assert_eq!(composition_deadline(None, now), now + COMPOSITION_INTERVAL);
+    let due = now + COMPOSITION_INTERVAL;
+    assert_eq!(composition_deadline(Some(due), now), due);
+    assert_eq!(
+        composition_deadline(Some(due), due),
+        due + COMPOSITION_INTERVAL
+    );
+    let finished = due + COMPOSITION_INTERVAL * 4 + Duration::from_millis(2);
+    let next = composition_deadline(Some(due), finished);
+    assert_eq!(next, due + COMPOSITION_INTERVAL * 5);
+    assert!(next > finished);
+    assert!(next.duration_since(finished) <= COMPOSITION_INTERVAL);
+}
+
 /// For use by `NSRunLoop`: call this 60 times per second. Composites the app's
 /// visible layers (i.e. UI) and presents it to the screen. Does nothing if
 /// composition isn't in use or it's too soon (the latter check is skipped if
@@ -81,7 +118,12 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
     // still process changes immediately.
     // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/CoreAnimation_guide/Introduction/Introduction.html
     if !force {
-        if let Some(next) = env.framework_state.core_animation.composition.recomposite_next {
+        if let Some(next) = env
+            .framework_state
+            .core_animation
+            .composition
+            .recomposite_next
+        {
             if next > Instant::now() {
                 return Some(next);
             }
@@ -134,57 +176,13 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             // Recheck UIKit overlays at the display rate instead of walking
             // the entire layer tree on every run-loop poll during gameplay.
             let next = Instant::now() + Duration::from_secs_f64(1.0 / 60.0);
-            env.framework_state.core_animation.composition.recomposite_next = Some(next);
+            env.framework_state
+                .core_animation
+                .composition
+                .recomposite_next = Some(next);
             return Some(next);
         }
     }
-
-    let now = Instant::now();
-    let interval = 1.0 / 60.0; // 60Hz
-    let new_recomposite_next = if let Some(recomposite_next) = env
-        .framework_state
-        .core_animation
-        .composition
-        .recomposite_next
-    {
-        if !force && recomposite_next > now {
-            log_dbg!("Not recompositing yet, wait {:?}", recomposite_next - now);
-            return Some(recomposite_next);
-        }
-
-        // See NSTimer implementation for a discussion of what this does.
-        let overdue_by = now.duration_since(recomposite_next);
-        log_dbg!("Recompositing, overdue by {:?}", overdue_by);
-        // TODO: Use `.div_duration_f64()` once that is stabilized.
-        let advance_by = (overdue_by.as_secs_f64() / interval).max(1.0).ceil();
-        assert!(advance_by == (advance_by as u32) as f64);
-        let advance_by = advance_by as u32;
-        if advance_by > 1 {
-            log_dbg!("Warning: compositor is lagging. It is overdue by {}s and has missed {} interval(s)!", overdue_by.as_secs_f64(), advance_by - 1);
-        }
-        let advance_by = ns_time_interval_to_duration_or_zero(interval)
-            .checked_mul(advance_by)
-            .unwrap_or(Duration::ZERO);
-        Some(
-            recomposite_next
-                .checked_add(advance_by)
-                .unwrap_or(recomposite_next),
-        )
-    } else {
-        // Apple's NSTimer/CADisplayLink "missed deadline" handling is
-        // tolerant of bogus intervals: if the guest hands us a negative
-        // or NaN value (seen with games that compute frameInterval from
-        // an uninitialised float), we treat it as "fire immediately"
-        // instead of panicking inside `Duration::from_secs_f64`.
-        Some(
-            now.checked_add(ns_time_interval_to_duration_or_zero(interval))
-                .unwrap_or(now),
-        )
-    };
-    env.framework_state
-        .core_animation
-        .composition
-        .recomposite_next = new_recomposite_next;
 
     if env.options.print_fps
         || cfg!(target_os = "ios")
@@ -406,11 +404,11 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             .core_animation
             .composition
             .texture_framebuffer = Some((
-                texture,
-                cached_texture_framebuffer.unwrap().1,
-                fb_width,
-                fb_height,
-            ));
+            texture,
+            cached_texture_framebuffer.unwrap().1,
+            fb_width,
+            fb_height,
+        ));
     }
 
     // Set up various other GL objects that will be reused on every frame.
@@ -654,7 +652,13 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
 
     animation_state.update_started_and_finished_animations(env);
 
-    new_recomposite_next
+    // A readback/composition can exceed one display interval. Schedule
+    // against completion so NSRunLoop does not immediately redraw the same
+    // frame and starve the next guest timer or input event.
+    let state = &mut env.framework_state.core_animation.composition;
+    let next = composition_deadline(state.recomposite_next, Instant::now());
+    state.recomposite_next = Some(next);
+    Some(next)
 }
 
 /// Call `displayIfNeeded` on all relevant layers in the tree, so their bitmaps
@@ -695,6 +699,18 @@ unsafe fn composite_layer_recursive(
     //       supported yet :)
     // TODO: back-to-front drawing is not efficient, could we use front-to-back?
 
+    // Fully transparent subtrees cannot contribute pixels. Avoid cloning
+    // their presentation layers and issuing GL work, including for children.
+    let model = env.objc.borrow::<CALayerHostObject>(layer);
+    if model.hidden
+        || (model.opacity <= 0.0
+            && model.animations.is_empty()
+            && model.anonymous_animations.is_empty())
+        || opacity <= 0.0
+    {
+        return;
+    }
+
     // This is both acting as the presentationLayer and the private render layer
     // It might need to be reworked in the future into a guest presentationLayer
     //
@@ -717,7 +733,7 @@ unsafe fn composite_layer_recursive(
             .presented_pixels = Some((pixels, width, height));
     }
 
-    if host_obj.hidden {
+    if host_obj.hidden || host_obj.opacity <= 0.0 {
         return;
     }
 

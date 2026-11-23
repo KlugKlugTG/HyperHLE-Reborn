@@ -42,6 +42,11 @@ struct JmpBuf {
     r11: u32,
     sp: u32,
     lr: u32,
+    // Apple's ARMv6 save area starts d8-d15 at byte 0x24. Keep the
+    // original nine core-register words: newer pointer-munging layouts
+    // do not apply to the iPhone OS ABI emulated here.
+    // https://github.com/apple-oss-distributions/Libc/blob/Libc-594.1.4/arm/sys/_setjmp.s
+    d8_d15: [u32; 16],
 }
 
 unsafe impl SafeRead for JmpBuf {}
@@ -60,6 +65,7 @@ fn setjmp(env: &mut Environment, jmp_buf: MutPtr<JmpBuf>) -> i32 {
         r11: regs[11],
         sp: regs[crate::cpu::Cpu::SP],
         lr: regs[crate::cpu::Cpu::LR],
+        d8_d15: env.cpu.extregs()[16..32].try_into().unwrap(),
     };
     env.mem.write(jmp_buf, buf);
     0 // no longjmp() was performed
@@ -99,7 +105,9 @@ fn longjmp(env: &mut Environment, jmp_buf: MutPtr<JmpBuf>, status: u32) {
     }
 
     let regs = env.cpu.regs_mut();
-    regs[0] = status;
+    // C/POSIX require longjmp(buf, 0) to make setjmp return 1.
+    // https://github.com/apple-oss-distributions/Libc/blob/Libc-594.1.4/arm/sys/_longjmp.s
+    regs[0] = if status == 0 { 1 } else { status };
     regs[4] = buf.r4;
     regs[5] = buf.r5;
     regs[6] = buf.r6;
@@ -110,8 +118,11 @@ fn longjmp(env: &mut Environment, jmp_buf: MutPtr<JmpBuf>, status: u32) {
     regs[crate::cpu::Cpu::SP] = buf.sp;
     regs[crate::cpu::Cpu::LR] = buf.lr;
 
+    let d8_d15 = buf.d8_d15;
+    env.cpu.extregs_mut()[16..32].copy_from_slice(&d8_d15);
     env.cpu
         .branch(GuestFunction::from_addr_with_thumb_bit(buf.lr));
+    env.note_guest_control_flow_redirect();
 }
 
 fn siglongjmp(env: &mut Environment, jmp_buf: MutPtr<JmpBuf>, status: u32) {
