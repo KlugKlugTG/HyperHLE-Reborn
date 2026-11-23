@@ -1302,11 +1302,14 @@ pub const CLASSES: ClassExports = objc_classes! {
         return false;
     };
     if renderbuffer != reported_renderbuffer {
-        log_once!(
-            "EAGL presentation binding mismatch: driver bound {:#x}; copying \
-             registered colour renderbuffer {:#x} for drawable {:?}.",
-            reported_renderbuffer, renderbuffer, drawable
-        );
+        static MISMATCH_LOGGED: std::sync::Once = std::sync::Once::new();
+        MISMATCH_LOGGED.call_once(|| {
+            log!(
+                "EAGL presentation binding mismatch: driver bound {:#x}; copying \
+                 registered colour renderbuffer {:#x} for drawable {:?}.",
+                reported_renderbuffer, renderbuffer, drawable
+            );
+        });
     }
     drop(bindings);
     if fullscreen_layer != drawable && attach_orphaned_eagl_view_to_root(env, drawable) {
