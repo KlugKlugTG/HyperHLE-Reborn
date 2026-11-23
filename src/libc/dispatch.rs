@@ -93,13 +93,21 @@ pub const DISPATCH_APPLY_AUTO: &str = "DISPATCH_APPLY_AUTO";
 /// [MAIN_QUEUE_PTR] (`0x1`). Resolving the constant to that sentinel makes
 /// `dispatch_async(_dispatch_main_q, …)` and similar binary-direct uses go
 /// through the same code path as `dispatch_get_main_queue()`.
-pub const CONSTANTS: ConstantExports = &[(
-    "__dispatch_main_q",
-    HostConstant::Custom(|_env| -> ConstVoidPtr {
-        let p: MutVoidPtr = Ptr::from_bits(MAIN_QUEUE_PTR);
-        p.cast_const()
-    }),
-)];
+pub const CONSTANTS: ConstantExports = &[
+    (
+        "__dispatch_main_q",
+        HostConstant::Custom(|_env| -> ConstVoidPtr {
+            let p: MutVoidPtr = Ptr::from_bits(MAIN_QUEUE_PTR);
+            p.cast_const()
+        }),
+    ),
+    (
+        "__dispatch_queue_attr_concurrent",
+        HostConstant::Custom(|env| -> ConstVoidPtr {
+            env.mem.alloc_and_write(0u32).cast().cast_const()
+        }),
+    ),
+];
 
 // MARK: - State
 
@@ -363,11 +371,28 @@ fn dispatch_retain(env: &mut Environment, obj: MutVoidPtr) {
     if queues::retain(env, obj.to_bits()) {
         return;
     }
+    if let Some(group) = get_state(env).groups.get_mut(&obj.to_bits()) {
+        group.references = group
+            .references
+            .checked_add(1)
+            .expect("dispatch group retain overflow");
+        return;
+    }
     dispatch_source::retain_source(env, obj);
 }
 
 fn dispatch_release(env: &mut Environment, obj: MutVoidPtr) {
     if queues::release(env, obj.to_bits()) {
+        return;
+    }
+    if let Some(group) = get_state(env).groups.get_mut(&obj.to_bits()) {
+        group.references = group
+            .references
+            .checked_sub(1)
+            .expect("dispatch group over-release");
+        if group.references == 0 && group.pending == 0 {
+            get_state(env).groups.remove(&obj.to_bits());
+        }
         return;
     }
     if !release_if_semaphore(env, obj) {
@@ -394,6 +419,8 @@ struct MainQueueTask {
 #[derive(Default)]
 struct DispatchGroup {
     pending: u32,
+    references: usize,
+    generation: u64,
     waiters: Vec<ThreadId>,
     notifications: Vec<(dispatch_queue_t, MainQueueTask)>,
 }
@@ -428,6 +455,7 @@ pub(crate) fn drain_main_queue(env: &mut Environment) {
         }
         if let Some(group) = task.group {
             dispatch_group_leave(env, Ptr::from_bits(group));
+            dispatch_release(env, Ptr::from_bits(group));
         }
     }
     get_state(env).draining_main_queue = false;
@@ -673,7 +701,13 @@ fn dispatch_group_create(env: &mut Environment) -> dispatch_group_t {
     let st = get_state(env);
     st.next_queue_handle += 2;
     let handle = st.next_queue_handle | 0x0200_0000;
-    st.groups.insert(handle, DispatchGroup::default());
+    st.groups.insert(
+        handle,
+        DispatchGroup {
+            references: 1,
+            ..Default::default()
+        },
+    );
     MutVoidPtr::from_bits(handle)
 }
 
@@ -687,6 +721,7 @@ fn dispatch_group_async(
         return;
     }
     let block = crate::libc::blocks::_Block_copy(env, block.cast_const()).cast_mut();
+    dispatch_retain(env, group);
     dispatch_group_enter(env, group);
     queues::enqueue(
         env,
@@ -710,6 +745,7 @@ fn dispatch_group_async_f(
     if work == GuestFunction::null_ptr() {
         return;
     }
+    dispatch_retain(env, group);
     dispatch_group_enter(env, group);
     queues::enqueue(
         env,
@@ -735,6 +771,7 @@ fn dispatch_group_enter(env: &mut Environment, group: dispatch_group_t) {
 }
 
 fn dispatch_group_leave(env: &mut Environment, group: dispatch_group_t) {
+    let handle = group;
     let group = get_state(env)
         .groups
         .get_mut(&group.to_bits())
@@ -746,6 +783,7 @@ fn dispatch_group_leave(env: &mut Environment, group: dispatch_group_t) {
     if group.pending != 0 {
         return;
     }
+    group.generation = group.generation.wrapping_add(1);
     let waiters = std::mem::take(&mut group.waiters);
     let notifications = std::mem::take(&mut group.notifications);
     for thread in waiters {
@@ -753,6 +791,7 @@ fn dispatch_group_leave(env: &mut Environment, group: dispatch_group_t) {
     }
     for (queue, task) in notifications {
         queues::enqueue(env, queue, task);
+        dispatch_release(env, handle);
     }
 }
 
@@ -764,6 +803,7 @@ fn dispatch_group_wait(env: &mut Environment, group: dispatch_group_t, timeout: 
     if timeout == DISPATCH_TIME_NOW {
         return 1;
     }
+    let generation = get_state(env).groups[&group.to_bits()].generation;
     get_state(env)
         .groups
         .get_mut(&group.to_bits())
@@ -778,7 +818,7 @@ fn dispatch_group_wait(env: &mut Environment, group: dispatch_group_t, timeout: 
     }
     let group = get_state(env).groups.get_mut(&group.to_bits()).unwrap();
     group.waiters.retain(|&waiter| waiter != tid);
-    i32::from(group.pending != 0)
+    i32::from(group.pending != 0 && group.generation == generation)
 }
 
 fn dispatch_group_notify(
@@ -828,6 +868,10 @@ fn group_notify(
     if group.pending == 0 {
         queues::enqueue(env, queue, task);
     } else {
+        group.references = group
+            .references
+            .checked_add(1)
+            .expect("dispatch group retain overflow");
         group.notifications.push((queue, task));
     }
 }

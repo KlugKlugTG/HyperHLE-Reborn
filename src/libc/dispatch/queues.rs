@@ -212,6 +212,7 @@ fn dispatch_worker(env: &mut Environment, queue: dispatch_queue_t) -> MutVoidPtr
         }
         if let Some(group) = task.group {
             dispatch_group_leave(env, Ptr::from_bits(group));
+            dispatch_release(env, Ptr::from_bits(group));
         }
         get_state(env)
             .worker_queues

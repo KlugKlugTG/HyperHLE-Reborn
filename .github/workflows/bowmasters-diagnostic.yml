@@ -30,7 +30,6 @@ jobs:
       DISPLAY: ":99"
       ALSOFT_DRIVERS: "null"
       TOUCHHLE_STALL_DIAG: "1"
-      TOUCHHLE_TRACE_GUEST_THREADS: "0"
       TOUCHHLE_FRAME_TIMES: "1"
       BOWMASTERS_BUILD_RUN: ${{ inputs.emulator_run_id || '45215523820' }}
       BOWMASTERS_TAPS: ${{ inputs.tap_sequence || '1:- 10:- 20:- 30:-' }}
@@ -89,7 +88,7 @@ jobs:
             perf_exe=$(rg --files -L /usr/lib/linux-tools* | rg '/perf$' | head -n 1)
             test -n "$perf_exe" || { echo 'No installed perf executable found' >&2; exit 1; }
             echo "Profiling PID $game_pid with $perf_exe"
-            sudo "$perf_exe" record -F 99 -e cpu-clock:u -g --call-graph fp -o "$GITHUB_WORKSPACE/results/perf.data" -p "$game_pid" -- sleep 75
+            sudo "$perf_exe" record -F 99 -e cpu-clock:u -g --call-graph fp -o "$GITHUB_WORKSPACE/results/perf.data" -p "$game_pid" -- sleep 45
             sudo "$perf_exe" report --stdio --no-children -i "$GITHUB_WORKSPACE/results/perf.data" > results/perf-report.txt
             sudo chown -R "$(id -u):$(id -g)" results
           ) > results/perf.log 2>&1 &
@@ -99,10 +98,13 @@ jobs:
           game_status=$?
           wait "$profile"
           profile_status=$?
+          cat results/perf.log
           test "$game_status" = 0 && test "$profile_status" = 0
       - name: Preserve emulator log
         if: always()
-        run: cp "$BOWMASTERS_CWD/HyperHLE_log.txt" results/detailed.log 2>/dev/null || true
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" results
+          cp "$BOWMASTERS_CWD/HyperHLE_log.txt" results/detailed.log 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
