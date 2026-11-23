@@ -1160,6 +1160,29 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             );
         }
 
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_TOUCHES") {
+            static TARGETS: AtomicUsize = AtomicUsize::new(0);
+            if TARGETS.fetch_add(1, Ordering::Relaxed) < 12 {
+                let class: crate::objc::Class = msg![env; view class];
+                let class_name = env.objc.get_class_name(class).to_owned();
+                log!("TOUCH-TARGET window={:?} view={:?} class={} point={:?}",
+                    window, view, class_name, location_in_window);
+                let children: id = msg![env; window subviews];
+                let count: NSUInteger = msg![env; children count];
+                for index in 0..count.min(12) {
+                    let child: id = msg![env; children objectAtIndex:index];
+                    let class: crate::objc::Class = msg![env; child class];
+                    let name = env.objc.get_class_name(class).to_owned();
+                    let hidden: bool = msg![env; child isHidden];
+                    let alpha: f32 = msg![env; child alpha];
+                    let interactive: bool = msg![env; child isUserInteractionEnabled];
+                    let frame: CGRect = msg![env; child frame];
+                    log!("TOUCH-WINDOW-CHILD {:?} {} hidden={} alpha={} interactive={} frame={:?}",
+                        child, name, hidden, alpha, interactive, frame);
+                }
+            }
+        }
+
         let is_multi_touch_enabled: bool = msg![env; view isMultipleTouchEnabled];
         if !is_multi_touch_enabled
             && !touchhle_cocos_should_allow_multitouch(env, view)
