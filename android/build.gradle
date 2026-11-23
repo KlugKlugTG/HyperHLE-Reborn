@@ -13,8 +13,11 @@ buildscript {
         kotlin_version = '2.0.21'
     }
     repositories {
-        mavenCentral()
         google()
+        // Maven Central's canonical endpoint rate-limits shared CI egress.
+        // Google's public Central mirror serves the same Maven artifacts.
+        maven { url "https://maven-central.storage-download.googleapis.com/maven2/" }
+        mavenCentral()
         maven {
             url "https://plugins.gradle.org/m2/"
         }
@@ -31,8 +34,9 @@ buildscript {
 
 allprojects {
     repositories {
-        mavenCentral()
         google()
+        maven { url "https://maven-central.storage-download.googleapis.com/maven2/" }
+        mavenCentral()
     }
 }
 

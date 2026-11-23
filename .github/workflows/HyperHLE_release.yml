@@ -327,6 +327,11 @@ jobs:
         distribution: temurin
         java-version: '17'
 
+    - name: Cache Android Gradle dependencies
+      uses: gradle/actions/setup-gradle@v4
+      with:
+        cache-read-only: false
+
     - name: Build for Android  
       run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/HyperHLE-Reborn-release.apk ../HyperHLE-Reborn.apk  
       env:  
