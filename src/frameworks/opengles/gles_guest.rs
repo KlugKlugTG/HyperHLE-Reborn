@@ -2413,6 +2413,34 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
     );
 }
 
+unsafe fn trace_native_draw_state(gles: &mut dyn GLES, shadow: &GLShadowState) {
+    if !gles.is_native_es1() || !crate::env_flag_cached!("TOUCHHLE_TRACE_NATIVE_GL_STATE") {
+        return;
+    }
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static DRAWS: AtomicU32 = AtomicU32::new(0);
+    let draw = DRAWS.fetch_add(1, Ordering::Relaxed);
+    if !matches!(draw, 0 | 100 | 1000 | 5000 | 10000 | 20000 | 40000) {
+        return;
+    }
+    let mut modelview = [0.0; 16];
+    let mut projection = [0.0; 16];
+    let mut colour = [0.0; 4];
+    let mut viewport = [0; 4];
+    let mut colour_mask = [0; 4];
+    gles.GetFloatv(gles11::MODELVIEW_MATRIX, modelview.as_mut_ptr());
+    gles.GetFloatv(gles11::PROJECTION_MATRIX, projection.as_mut_ptr());
+    gles.GetFloatv(gles11::CURRENT_COLOR, colour.as_mut_ptr());
+    gles.GetIntegerv(gles11::VIEWPORT, viewport.as_mut_ptr());
+    gles.GetBooleanv(gles11::COLOR_WRITEMASK, colour_mask.as_mut_ptr());
+    let states = [gles11::VERTEX_ARRAY, gles11::COLOR_ARRAY, gles11::TEXTURE_COORD_ARRAY,
+        gles11::TEXTURE_2D, gles11::LIGHTING, gles11::ALPHA_TEST, gles11::DEPTH_TEST,
+        gles11::CULL_FACE, gles11::SCISSOR_TEST, gles11::BLEND]
+        .map(|cap| (cap, gles.IsEnabled(cap)));
+    log!("Native draw #{}: viewport={:?} colour={:?} mask={:?} states={:?} arrays={:?} modelview={:?} projection={:?}",
+        draw, viewport, colour, colour_mask, states, shadow.vertex_array_state, modelview, projection);
+}
+
 fn glDrawElements(
     env: &mut Environment,
     mode: GLenum,
@@ -2489,6 +2517,7 @@ fn glDrawElements(
 
         let indices =
             translate_pointer_or_offset_to_host(gles, mem, shadow, indices, ELEMENT_ARRAY_BUFFER);
+        trace_native_draw_state(gles, shadow);
         crate::gles::perf_overlay::record_draw();
         gles.DrawElements(mode, count, type_, indices);
         if count > 3 && crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
@@ -3819,6 +3848,13 @@ fn glBindFramebufferOES(env: &mut Environment, target: GLenum, framebuffer: GLui
     })
 }
 fn glBindRenderbufferOES(env: &mut Environment, target: GLenum, renderbuffer: GLuint) {
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_NATIVE_GL_STATE") {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static BINDS: AtomicU32 = AtomicU32::new(0);
+        if BINDS.fetch_add(1, Ordering::Relaxed) < 16 {
+            log!("Guest glBindRenderbufferOES(target={:#x}, rb={:#x})", target, renderbuffer);
+        }
+    }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.BindRenderbufferOES(target, renderbuffer)
     })
