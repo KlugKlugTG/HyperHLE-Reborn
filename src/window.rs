@@ -18,7 +18,7 @@ mod native_aspect_ratio;
 use crate::gles::present::present_frame;
 use crate::gles::{
     create_gles1_ctx_no_parent_stack, create_gles2_ctx_no_parent_stack, GLESContext,
-    LoggingGLESContext, GLES,
+    LoggingGLESContext, GLESImplementation, GLES,
 };
 use crate::image::Image;
 use crate::matrix::Matrix;
@@ -1160,13 +1160,18 @@ impl Window {
         // remove this (https://github.com/touchHLE/touchHLE/issues/85).
         sdl2::hint::set("SDL_JOYSTICK_HIDAPI", "0");
 
-        if env::consts::OS == "android" {
+        if env::consts::OS == "android"
+            || matches!(options.gles1_implementation, Some(GLESImplementation::GLES1Native))
+        {
             // It's important to set context version BEFORE window creation
             // ref. https://wiki.libsdl.org/SDL2/SDL_GLattr
             let attr = video_ctx.gl_attr();
             attr.set_context_version(1, 1);
             attr.set_context_profile(sdl2::video::GLProfile::GLES);
 
+        }
+
+        if env::consts::OS == "android" {
             // Disable blocking of event loop when app is paused.
             sdl2::hint::set("SDL_ANDROID_BLOCK_ON_PAUSE", "0");
         }

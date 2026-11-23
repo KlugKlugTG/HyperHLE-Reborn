@@ -57,6 +57,7 @@ angle_build_all = false
 angle_build_tests = false
 angle_enable_gl = true
 angle_enable_vulkan = true
+angle_use_custom_libvulkan = false
 angle_enable_swiftshader = false
 angle_enable_d3d11 = false
 angle_enable_metal = false
