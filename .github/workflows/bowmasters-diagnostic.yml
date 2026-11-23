@@ -52,7 +52,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           test "$(gh release view ci-private-native-games-20261123 --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
-          gh release download ci-private-native-games-20261123 --repo "$GITHUB_REPOSITORY" --pattern bowmasters.ipa --dir private-inputs
+          gh release download ci-private-native-games-20261123 --repo "$GITHUB_REPOSITORY" --pattern Bowmasters.1.0.ipa --dir private-inputs
+          mv private-inputs/Bowmasters.1.0.ipa private-inputs/bowmasters.ipa
       - name: Record available CPU and graphics hardware and start display
         run: |
           mkdir -p results
