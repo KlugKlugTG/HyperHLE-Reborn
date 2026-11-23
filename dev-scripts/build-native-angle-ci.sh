@@ -9,7 +9,7 @@ exec > >(tee native-angle-build.log) 2>&1
 angle_commit=b7a90a6cc08e52857a6addc2bc2e569b7b01e9df
 git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git native-depot-tools
 export PATH="$PWD/native-depot-tools:$PATH"
-export VPYTHON_BYPASS="manually managed Python environment"
+export VPYTHON_BYPASS="manually managed python not supported by chrome operations"
 mkdir native-angle
 cd native-angle
 git init -q

@@ -1927,12 +1927,11 @@ unsafe fn get_renderbuffer_size(gles: &mut dyn GLES, renderbuffer: GLuint) -> (G
     (width, height)
 }
 
-/// Copies the pixels in a renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES`
-/// (which should be provided by the app) to a provided [Vec], trying to avoid
+/// Copies the selected colour renderbuffer to a provided [Vec], trying to avoid
 /// noticeably modifying OpenGL ES state while doing so.
 ///
 /// This uses `glReadPixels()`, with all the associated performance risks. Any
-/// existing content in the [Vec] will bereplaced. The format is RGBA8.
+/// existing content in the [Vec] will be replaced. The format is RGBA8.
 /// The returned values are the [Vec], the width and height.
 ///
 /// The provided context must be current.
@@ -2019,6 +2018,23 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
         height,
         Instant::now().saturating_duration_since(before)
     );
+
+    if gles.is_native_es1() {
+        static READBACK_FRAMES: AtomicU32 = AtomicU32::new(0);
+        let frame = READBACK_FRAMES.fetch_add(1, Ordering::Relaxed);
+        if matches!(frame, 0 | 60 | 300 | 600 | 1800 | 3600) {
+            let step = (pixel_buffer.len() / 4 / 256).max(1);
+            let colour_samples = pixel_buffer.chunks_exact(4).step_by(step)
+                .filter(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0).count();
+            log!(
+                "Native ES1 readback #{}: rb={:#x} {}x{}, guest_fbo={:#x}, \
+                 colour_attachment={:#x}, status={:#x}, app_fbo={}, \
+                 nonblack_samples={}",
+                frame, renderbuffer, width, height, old_framebuffer,
+                attached_renderbuffer, framebuffer_status, use_bound_framebuffer, colour_samples
+            );
+        }
+    }
 
     if !use_bound_framebuffer {
         gles.DeleteFramebuffersOES(1, &src_framebuffer);
