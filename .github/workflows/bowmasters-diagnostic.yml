@@ -9,7 +9,7 @@ on:
       emulator_run_id:
         description: Successful Linux emulator build to test
         type: string
-        default: "45187891750"
+        default: "45185462232"
       tap_sequence:
         description: Space-separated WAIT:X,Y steps
         type: string
@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   bowmasters:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     permissions:
       contents: write # Read the private draft fixture; never publish it.
@@ -29,7 +29,7 @@ jobs:
     env:
       DISPLAY: ":99"
       ALSOFT_DRIVERS: "null"
-      BOWMASTERS_BUILD_RUN: ${{ inputs.emulator_run_id || '45187891750' }}
+      BOWMASTERS_BUILD_RUN: ${{ inputs.emulator_run_id || '45185462232' }}
       BOWMASTERS_TAPS: ${{ inputs.tap_sequence || '1:- 10:- 20:- 30:-' }}
     steps:
       - uses: actions/checkout@v4
@@ -44,8 +44,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
-          run-id: ${{ inputs.emulator_run_id || '45187891750' }}
-          name: HyperHLE_Linux_x86_64
+          run-id: ${{ inputs.emulator_run_id || '45185462232' }}
+          name: HyperHLE_Linux_ARM64_diagnostic
           path: emulator
       - name: Download private game fixture
         env:
