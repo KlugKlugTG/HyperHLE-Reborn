@@ -30,7 +30,7 @@ jobs:
       DISPLAY: ":99"
       ALSOFT_DRIVERS: "null"
       TOUCHHLE_STALL_DIAG: "1"
-      TOUCHHLE_TRACE_GUEST_THREADS: "1"
+      TOUCHHLE_TRACE_GUEST_THREADS: "0"
       TOUCHHLE_FRAME_TIMES: "1"
       BOWMASTERS_BUILD_RUN: ${{ inputs.emulator_run_id || '45215523820' }}
       BOWMASTERS_TAPS: ${{ inputs.tap_sequence || '1:- 10:- 20:- 30:-' }}
@@ -86,9 +86,10 @@ jobs:
               sleep 0.5
             done
             test -n "$game_pid"
-            perf_exe=$(find /usr/lib/linux-tools -type f -name perf | head -n 1)
-            test -n "$perf_exe"
-            sudo "$perf_exe" record -F 99 -e cpu-clock:u -g --call-graph fp -o "$GITHUB_WORKSPACE/results/perf.data" -p "$game_pid"
+            perf_exe=$(rg --files -L /usr/lib/linux-tools* | rg '/perf$' | head -n 1)
+            test -n "$perf_exe" || { echo 'No installed perf executable found' >&2; exit 1; }
+            echo "Profiling PID $game_pid with $perf_exe"
+            sudo "$perf_exe" record -F 99 -e cpu-clock:u -g --call-graph fp -o "$GITHUB_WORKSPACE/results/perf.data" -p "$game_pid" -- sleep 75
             sudo "$perf_exe" report --stdio --no-children -i "$GITHUB_WORKSPACE/results/perf.data" > results/perf-report.txt
             sudo chown -R "$(id -u):$(id -g)" results
           ) > results/perf.log 2>&1 &
