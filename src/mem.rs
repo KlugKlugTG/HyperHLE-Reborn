@@ -592,8 +592,8 @@ pub struct Mem {
     /// The flag to control if memory is zeroed out on free (`true`, default)
     /// or on alloc (`false`).
     ///
-    /// Right now only one game, Spore Origin, is setting this value to `false`
-    /// via a game-specific hack.
+    /// Selected legacy apps and `--zero-memory-on-alloc` set this to `false`.
+    /// Allocations are still reclaimed immediately; only scrubbing moves.
     /// See [crate::Environment] for more info.
     pub(super) zero_memory_on_free: bool,
 

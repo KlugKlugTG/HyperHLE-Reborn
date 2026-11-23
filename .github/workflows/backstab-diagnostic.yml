@@ -1,0 +1,154 @@
+name: BackStab menu-to-gameplay diagnostics
+
+on:
+  push:
+    branches: ["fix/backstab-gameplay"]
+    paths: [.github/workflows/backstab-diagnostic.yml]
+  workflow_dispatch:
+    inputs:
+      emulator_run_id:
+        description: Emulator diagnostics build run to test
+        type: string
+        default: "45185462232"
+      tap_sequence:
+        description: Space-separated WAIT:X,Y steps (use WAIT:- for screenshots)
+        type: string
+        default: "1:- 100:0.5,0.83 5:0.78,0.33 3:0.92,0.96 5:- 30:- 60:- 30:-"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  backstab:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    permissions:
+      contents: write # Read the private draft input; never publish it.
+      actions: read
+    env:
+      DISPLAY: ":99"
+      ALSOFT_DRIVERS: "null"
+      ANGLE_DEFAULT_PLATFORM: vulkan
+      SDL_VIDEO_X11_FORCE_EGL: "1"
+      TOUCHHLE_FIX_TEXTURE_MIN_FILTER: "1"
+      TOUCHHLE_TRACE_TOUCHES: "1"
+      TOUCHHLE_TRACE_TOUCH_REMAP: "1"
+      TOUCHHLE_DUMP_LAYER_TREE: "1"
+      TOUCHHLE_TRACE_PRESENT_ROUTE: "1"
+      BACKSTAB_TAP_SEQUENCE: ${{ inputs.tap_sequence || '1:- 100:0.5,0.83 5:0.78,0.33 3:0.92,0.96 5:- 30:- 60:- 30:-' }}
+      BACKSTAB_BUILD_RUN: ${{ inputs.emulator_run_id || '45185462232' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install prebuilt runtime packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ripgrep xvfb xdotool x11-utils imagemagick ffmpeg python3 libsndio-dev libstdc++6 libgl1 libegl1 libgles1 libvulkan1 mesa-vulkan-drivers
+      - name: Require the emulator build and full tests to pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run watch "$BACKSTAB_BUILD_RUN" --repo "$GITHUB_REPOSITORY" --exit-status --interval 15
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.emulator_run_id || '45185462232' }}
+          name: HyperHLE_Linux_ARM64_diagnostic
+          path: native-emulator
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45154298497
+          name: ANGLE_Linux_ARM64_GLES1
+          path: native-angle
+      - name: Download the private BackStab input
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          fixture_ready=0
+          for attempt in $(seq 1 60); do
+            fixture_ready=$(gh api "repos/$GITHUB_REPOSITORY/releases/455271225" --jq '[.assets[] | select(.name == "backstab.ipa" and .state == "uploaded")] | length')
+            if [ "$fixture_ready" = 1 ]; then break; fi
+            sleep 10
+          done
+          test "$fixture_ready" = 1
+          gh release download ci-private-native-games-20261123 --repo "$GITHUB_REPOSITORY" --pattern backstab.ipa --dir private-inputs
+          test -s private-inputs/backstab.ipa
+      - name: Start the native graphics runtime
+        run: |
+          chmod +x native-emulator/touchHLE
+          echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/native-angle" >> "$GITHUB_ENV"
+          echo "SDL_VIDEO_EGL_DRIVER=$GITHUB_WORKSPACE/native-angle/libEGL.so" >> "$GITHUB_ENV"
+          echo "SDL_VIDEO_GL_DRIVER=$GITHUB_WORKSPACE/native-angle/libGLESv1_CM.so" >> "$GITHUB_ENV"
+          native_icd=$(rg --files /usr/share/vulkan/icd.d | rg '/lvp.*\.json$' | head -n 1)
+          test -n "$native_icd"
+          echo "VK_DRIVER_FILES=$native_icd" >> "$GITHUB_ENV"
+          Xvfb :99 -screen 0 1280x960x24 -ac > xvfb.log 2>&1 &
+          sleep 2
+      - name: BackStab title, menu and game-start interaction
+        run: |
+          read -r -a taps <<< "$BACKSTAB_TAP_SEQUENCE"
+          tap_args=()
+          for tap in "${taps[@]}"; do tap_args+=(--step "$tap"); done
+          mkdir -p backstab-results
+          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/backstab.ipa" --exe "$GITHUB_WORKSPACE/native-emulator/touchHLE" --cwd "$GITHUB_WORKSPACE/native-emulator" --out backstab-results "${tap_args[@]}" --final-wait 15 --require-nonblack-frame --require-frame-change --require-touch-delivery -- --gles1=gles1_native --device-family=iphone-3gs --overlay=off --fix-texture-min-filter --trace-gl-errors &
+          sequence_pid=$!
+          (
+            movie_window=""
+            for attempt in $(seq 1 60); do
+              movie_window=$(xdotool search --onlyvisible --name BackStab | head -n 1 || true)
+              if [ -n "$movie_window" ]; then break; fi
+              sleep 0.5
+            done
+            test -n "$movie_window"
+            sleep 20
+            ffmpeg -hide_banner -loglevel warning -nostdin -y -f x11grab -framerate 60 -window_id "$movie_window" -i "$DISPLAY" -t 5 -vf scale=240:160 -c:v libx264 -preset ultrafast -crf 18 backstab-results/intro-clip.mp4
+          ) > backstab-results/intro-record.log 2>&1 &
+          recording_pid=$!
+          set +e
+          wait "$sequence_pid"
+          sequence_status=$?
+          wait "$recording_pid"
+          recording_status=$?
+          test "$sequence_status" = 0 && test "$recording_status" = 0
+      - name: Require post-intro input to reach the game view
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          log = Path('backstab-results/emulator.log').read_text(errors='replace')
+          targets = re.findall(r'TOUCH-TARGET .*?class=(\S+)', log)
+          requested = sum(int(step.rsplit('*', 1)[1]) if '*' in step else 1
+                          for step in os.environ['BACKSTAB_TAP_SEQUENCE'].split()
+                          if step.partition(':')[2] != '-')
+          assert requested > 0, 'At least one post-intro game tap is required'
+          assert len(targets) >= min(requested, 12), f'Missing touch targets: {targets}'
+          assert all(target == 'EAGLView' for target in targets), f'Taps intercepted: {targets}'
+          assert not re.search(r'nil isa[^\n]*movieSubtitles_reset', log), 'Movie cleanup was skipped'
+          print(f'All {len(targets)} recorded title/menu taps reached EAGLView')
+          PY
+      - name: Require movie composition and normal presentation after playback
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          log = Path('backstab-results/emulator.log').read_text(errors='replace')
+          routes = re.findall(r'PRESENT-ROUTE video_active=(true|false) bypass_composition=(true|false)', log)
+          assert ('true', 'false') in routes, 'No composited movie/game frames recorded'
+          assert ('true', 'true') not in routes, 'Game-only swaps are overwriting video'
+          last_movie = max(i for i, (active, _) in enumerate(routes) if active == 'true')
+          assert ('false', 'true') in routes[last_movie + 1:], 'Normal presenter did not resume after the intro'
+          assert Path('backstab-results/intro-clip.mp4').stat().st_size > 0
+          print('Movies stayed composited; the normal presenter resumed for the menu/game')
+          PY
+      - name: Preserve diagnostic logs
+        if: always()
+        run: |
+          mkdir -p backstab-results
+          cp xvfb.log backstab-results/ 2>/dev/null || true
+          cp native-emulator/HyperHLE_log.txt backstab-results/detailed.log 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: BackStab_gameplay_diagnostics
+          path: backstab-results/
