@@ -70,6 +70,8 @@ pub struct Thread {
     /// If this is not [ThreadBlock::NotBlocked], the thread is not executing
     /// until a certain condition is fufilled.
     pub blocked_by: ThreadBlock,
+    /// Result of the current timed mutex wait, set by the scheduler.
+    pub(crate) timed_mutex_acquired: bool,
     /// Container for thread local state of various child modules
     pub thread_local_framework_state: frameworks::ThreadLocalState,
     /// Whether the current API dispatch came directly from a guest SVC.
@@ -355,6 +357,8 @@ pub enum ThreadBlock {
     GuestSleeping(Instant),
     // Thread is waiting for a mutex to unlock.
     Mutex(MutexId),
+    // Mutex acquisition with a deadline in guest time.
+    TimedMutex(MutexId, Instant),
     // Thread is waiting on a semaphore.
     Semaphore(MutPtr<sem_t>),
     // Thread is waiting on a condition variable
@@ -1151,6 +1155,7 @@ impl Environment {
         let main_thread = Thread {
             active: true,
             blocked_by: ThreadBlock::NotBlocked,
+            timed_mutex_acquired: false,
             return_value: None,
             guest_context: None,
             host_context: Some(main_thread_init_routine),
@@ -1366,6 +1371,7 @@ impl Environment {
         let main_thread = Thread {
             active: true,
             blocked_by: ThreadBlock::NotBlocked,
+            timed_mutex_acquired: false,
             return_value: None,
             guest_context: None,
             host_context: None,
@@ -1817,6 +1823,7 @@ impl Environment {
         self.threads.push(Thread {
             active: true,
             blocked_by: ThreadBlock::NotBlocked,
+            timed_mutex_acquired: false,
             return_value: None,
             guest_context: Some(Box::new(cpu::CpuContext::new())),
             host_context: Some(thread_routine),
@@ -2213,7 +2220,7 @@ impl Environment {
                 let imminent_wakeup = self.threads.iter().any(|thread| {
                     let deadline = match thread.blocked_by {
                         ThreadBlock::Sleeping(due) => Some(due),
-                        ThreadBlock::GuestSleeping(due) => Some(self.guest_clock.host_deadline(due)),
+                        ThreadBlock::GuestSleeping(due) | ThreadBlock::TimedMutex(_, due) => Some(self.guest_clock.host_deadline(due)),
                         _ => None,
                     };
                     deadline.is_some_and(|due| due < Instant::now() + Duration::from_millis(10))
@@ -4332,6 +4339,21 @@ impl Environment {
                             self.relock_unblocked_mutex_for_thread(thread_id, mutex_id);
                             return thread_id;
                         }
+                    }
+                    ThreadBlock::TimedMutex(mutex_id, due) => {
+                        if due <= self.guest_clock.now() {
+                            self.mutex_state.cancel_mutex_wait(mutex_id);
+                            self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
+                            return thread_id;
+                        }
+                        if self.mutex_state.mutex_can_be_locked_by(mutex_id, thread_id) {
+                            self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
+                            self.relock_unblocked_mutex_for_thread(thread_id, mutex_id);
+                            self.threads[thread_id].timed_mutex_acquired = true;
+                            return thread_id;
+                        }
+                        let host_due = self.guest_clock.host_deadline(due);
+                        next_awakening = Some(next_awakening.map_or(host_due, |d| d.min(host_due)));
                     }
                     ThreadBlock::Semaphore(sem) => {
                         // The semaphore a thread is waiting on may have been

@@ -7,8 +7,9 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::time::Instant;
 
-use super::{Environment, ThreadId};
+use super::{Environment, ThreadBlock, ThreadId};
 use crate::libc::errno::{EBUSY, EDEADLK, EPERM};
 
 /// Stores and manages mutexes. Note that all the methods for locking and
@@ -137,9 +138,29 @@ impl MutexState {
         !self.mutex_is_locked(mutex_id)
             || (self.mutex_is_recursive(mutex_id) && self.mutex_is_locked_by(mutex_id, thread))
     }
+
+    pub(super) fn cancel_mutex_wait(&mut self, mutex_id: MutexId) {
+        let mutex = self.mutexes.get_mut(&mutex_id).unwrap();
+        mutex.waiting_count = mutex.waiting_count.checked_sub(1).unwrap();
+    }
 }
 
 impl Environment {
+    /// Try immediately, then wait cooperatively for ownership or a guest
+    /// deadline. A timeout removes the waiter without acquiring the mutex.
+    pub fn lock_mutex_until(&mut self, mutex_id: MutexId, due: Instant) -> bool {
+        if self.mutex_state.mutex_can_be_locked_by(mutex_id, self.current_thread) {
+            return self.lock_mutex(mutex_id).is_ok();
+        }
+        if due <= self.guest_clock.now() {
+            return false;
+        }
+        self.mutex_state.mutexes.get_mut(&mutex_id).unwrap().waiting_count += 1;
+        self.threads[self.current_thread].timed_mutex_acquired = false;
+        self.yield_thread(ThreadBlock::TimedMutex(mutex_id, due));
+        self.threads[self.current_thread].timed_mutex_acquired
+    }
+
     /// Relock mutex that was just unblocked. This should probably only be used
     /// by the thread scheduler.
     pub fn relock_unblocked_mutex_for_thread(&mut self, thread_id: ThreadId, mutex_id: MutexId) {

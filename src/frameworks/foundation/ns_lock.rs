@@ -10,10 +10,11 @@
 //! work as it breaks expected inheritance chain.)
 
 use crate::environment::MutexType::PTHREAD_MUTEX_RECURSIVE;
-use crate::environment::{MutexId, PTHREAD_MUTEX_DEFAULT};
+use crate::environment::{Environment, MutexId, PTHREAD_MUTEX_DEFAULT};
 use crate::msg;
 use crate::objc::{id, nil, objc_classes, ClassExports, HostObject};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 // NSInteger is i32 on 32-bit ARM.
 type NSInteger = i32;
@@ -42,6 +43,30 @@ struct NSConditionLockHostObject {
 impl HostObject for NSConditionLockHostObject {}
 
 // ---------------------------------------------------------------------------
+
+/// Try first, including for an expired deadline, as Foundation does.
+/// Waiters use the guest scheduler so the owning thread can release the lock.
+/// https://github.com/swiftlang/swift-corelibs-foundation/blob/main/Sources/Foundation/NSLock.swift
+fn lock_before_date(env: &mut Environment, lock: id, date: id) -> bool {
+    let mutex_id = env.objc.borrow::<NSLockHostObject>(lock).mutex_id;
+    if env
+        .mutex_state
+        .mutex_can_be_locked_by(mutex_id, env.current_thread)
+    {
+        return env.lock_mutex(mutex_id).is_ok();
+    }
+    let remaining: f64 = msg![env; date timeIntervalSinceNow];
+    if !remaining.is_finite() || remaining <= 0.0 {
+        return false;
+    }
+    let Ok(remaining) = Duration::try_from_secs_f64(remaining) else {
+        return false;
+    };
+    let Some(due) = env.guest_clock.now().checked_add(remaining) else {
+        return false;
+    };
+    env.lock_mutex_until(mutex_id, due)
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -82,11 +107,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (bool)tryLock {
     let host_object = env.objc.borrow::<NSLockHostObject>(this);
-    if env.mutex_state.mutex_is_locked(host_object.mutex_id) {
-        false
-    } else {
-        env.lock_mutex(host_object.mutex_id).is_ok()
-    }
+    let mutex_id = host_object.mutex_id;
+    env.mutex_state.mutex_can_be_locked_by(mutex_id, env.current_thread)
+        && env.lock_mutex(mutex_id).is_ok()
+}
+
+// https://developer.apple.com/documentation/foundation/nslock/lock(before:)
+- (bool)lockBeforeDate:(id)date {
+    lock_before_date(env, this, date)
 }
 
 - (())setName:(id)name { // NSString *
@@ -137,11 +165,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (bool)tryLock {
     let host_object = env.objc.borrow::<NSLockHostObject>(this);
-    if env.mutex_state.mutex_is_locked(host_object.mutex_id) {
-        false
-    } else {
-        env.lock_mutex(host_object.mutex_id).is_ok()
-    }
+    let mutex_id = host_object.mutex_id;
+    env.mutex_state.mutex_can_be_locked_by(mutex_id, env.current_thread)
+        && env.lock_mutex(mutex_id).is_ok()
+}
+
+// https://developer.apple.com/documentation/foundation/nslock/lock(before:)
+- (bool)lockBeforeDate:(id)date {
+    lock_before_date(env, this, date)
 }
 
 - (())setName:(id)name { // NSString *
