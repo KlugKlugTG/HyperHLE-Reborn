@@ -5,6 +5,15 @@ on:
     branches: ["fix/backstab-gameplay"]
     paths: [.github/workflows/backstab-diagnostic.yml]
   workflow_dispatch:
+    inputs:
+      emulator_run_id:
+        description: Emulator diagnostics build run to test
+        type: string
+        default: "45179169027"
+      tap_sequence:
+        description: Space-separated WAIT:X,Y steps (use WAIT:- for screenshots)
+        type: string
+        default: "1:- 100:0.5,0.83 10:- 5:0.2,0.36 20:- 30:-"
 
 permissions:
   contents: read
@@ -26,16 +35,22 @@ jobs:
       TOUCHHLE_TRACE_TOUCHES: "1"
       TOUCHHLE_TRACE_TOUCH_REMAP: "1"
       TOUCHHLE_DUMP_LAYER_TREE: "1"
+      BACKSTAB_TAP_SEQUENCE: ${{ inputs.tap_sequence || '1:- 100:0.5,0.83 10:- 5:0.2,0.36 20:- 30:-' }}
+      BACKSTAB_BUILD_RUN: ${{ inputs.emulator_run_id || '45179169027' }}
     steps:
       - uses: actions/checkout@v4
       - name: Install prebuilt runtime packages
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends ripgrep xvfb xdotool x11-utils imagemagick python3 libsndio-dev libstdc++6 libgl1 libegl1 libgles1 libvulkan1 mesa-vulkan-drivers
+      - name: Require the emulator build and full tests to pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run watch "$BACKSTAB_BUILD_RUN" --repo "$GITHUB_REPOSITORY" --exit-status --interval 15
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
-          run-id: 45172986981
+          run-id: ${{ inputs.emulator_run_id || '45179169027' }}
           name: HyperHLE_Linux_ARM64_diagnostic
           path: native-emulator
       - uses: actions/download-artifact@v4
@@ -70,7 +85,27 @@ jobs:
           sleep 2
       - name: BackStab title, menu and game-start interaction
         run: |
-          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/backstab.ipa" --exe "$GITHUB_WORKSPACE/native-emulator/touchHLE" --cwd "$GITHUB_WORKSPACE/native-emulator" --out backstab-results --step '1:-' --step '100:0.5,0.83' --step '10:-' --step '5:0.2,0.36' --step '20:-' --step '30:-' --final-wait 15 --require-nonblack-frame --require-frame-change --require-touch-delivery -- --gles1=gles1_native --device-family=iphone-3gs --overlay=off --fix-texture-min-filter --trace-gl-errors
+          read -r -a taps <<< "$BACKSTAB_TAP_SEQUENCE"
+          tap_args=()
+          for tap in "${taps[@]}"; do tap_args+=(--step "$tap"); done
+          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/backstab.ipa" --exe "$GITHUB_WORKSPACE/native-emulator/touchHLE" --cwd "$GITHUB_WORKSPACE/native-emulator" --out backstab-results "${tap_args[@]}" --final-wait 15 --require-nonblack-frame --require-frame-change --require-touch-delivery -- --gles1=gles1_native --device-family=iphone-3gs --overlay=off --fix-texture-min-filter --trace-gl-errors
+      - name: Require post-intro input to reach the game view
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          log = Path('backstab-results/emulator.log').read_text(errors='replace')
+          targets = re.findall(r'TOUCH-TARGET .*?class=(\S+)', log)
+          requested = sum(int(step.rsplit('*', 1)[1]) if '*' in step else 1
+                          for step in os.environ['BACKSTAB_TAP_SEQUENCE'].split()
+                          if step.partition(':')[2] != '-')
+          assert requested > 0, 'At least one post-intro game tap is required'
+          assert len(targets) >= min(requested, 12), f'Missing touch targets: {targets}'
+          assert all(target == 'EAGLView' for target in targets), f'Taps intercepted: {targets}'
+          assert not re.search(r'nil isa[^\n]*movieSubtitles_reset', log), 'Movie cleanup was skipped'
+          print(f'All {len(targets)} recorded title/menu taps reached EAGLView')
+          PY
       - name: Preserve diagnostic logs
         if: always()
         run: |
