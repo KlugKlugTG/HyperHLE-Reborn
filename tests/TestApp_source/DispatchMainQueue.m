@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -29,6 +30,18 @@ extern void dispatch_queue_set_specific(dispatch_queue_t, const void *, void *,
                                         dispatch_function_t);
 extern void *dispatch_get_specific(const void *);
 extern void dispatch_release(void *);
+typedef void *dispatch_group_t;
+extern struct dispatch_queue_s _dispatch_queue_attr_concurrent;
+extern void dispatch_after_f(uint64_t, dispatch_queue_t, void *, dispatch_function_t);
+extern uint64_t dispatch_time(uint64_t, int64_t);
+extern dispatch_group_t dispatch_group_create(void);
+extern void dispatch_group_enter(dispatch_group_t);
+extern void dispatch_group_leave(dispatch_group_t);
+extern long dispatch_group_wait(dispatch_group_t, uint64_t);
+extern void dispatch_group_async_f(dispatch_group_t, dispatch_queue_t, void *, dispatch_function_t);
+extern void dispatch_group_notify_f(dispatch_group_t, dispatch_queue_t, void *, dispatch_function_t);
+extern void dispatch_barrier_async_f(dispatch_queue_t, void *, dispatch_function_t);
+extern void dispatch_barrier_sync_f(dispatch_queue_t, void *, dispatch_function_t);
 
 @interface NSRunLoop : NSObject
 + (instancetype)mainRunLoop;
@@ -310,5 +323,270 @@ int test_dispatch_queue_thread_identity(void) {
   sem_unlink("/dispatch_queue_ready");
   sem_unlink("/dispatch_queue_resume");
   dispatch_release(probe.queue);
+  return result;
+}
+
+struct BackgroundQueueProbe {
+  pthread_t caller;
+  dispatch_queue_t queue;
+  sem_t *ready;
+  sem_t *resume;
+  sem_t *done;
+  int error;
+  int capture;
+  int calls;
+  int order[3];
+};
+
+static void submit_background_block(struct BackgroundQueueProbe *probe) {
+  int captured = 42;
+  dispatch_async(probe->queue, ^{
+    if (pthread_equal(pthread_self(), probe->caller)) {
+      probe->error = -1;
+      sem_post(probe->done);
+      return;
+    }
+    if (dispatch_get_current_queue() != probe->queue)
+      probe->error = -2;
+    sem_post(probe->ready);
+    sem_wait(probe->resume);
+    probe->capture = captured;
+    sem_post(probe->done);
+  });
+}
+
+// Unity's WWW helper enters a background run loop while initialization
+// continues on the caller. Async execution inline deadlocks that caller.
+// A submitted stack block must also survive the submitting helper returning.
+// https://developer.apple.com/documentation/dispatch/1453057-dispatch_async
+int test_dispatch_background_async(void) {
+  struct BackgroundQueueProbe probe = {0};
+  probe.caller = pthread_self();
+  probe.queue = dispatch_get_global_queue(0, 0);
+  probe.ready = sem_open("/dispatch_bg_ready", O_CREAT | O_EXCL, 0600, 0);
+  probe.resume = sem_open("/dispatch_bg_resume", O_CREAT | O_EXCL, 0600, 0);
+  probe.done = sem_open("/dispatch_bg_done", O_CREAT | O_EXCL, 0600, 0);
+  if (probe.ready == SEM_FAILED || probe.resume == SEM_FAILED ||
+      probe.done == SEM_FAILED)
+    abort();
+  submit_background_block(&probe);
+  if (!probe.error) {
+    sem_wait(probe.ready);
+    sem_post(probe.resume);
+  }
+  sem_wait(probe.done);
+  int result = probe.error ? probe.error : (probe.capture == 42 ? 0 : -3);
+  sem_close(probe.ready);
+  sem_close(probe.resume);
+  sem_close(probe.done);
+  sem_unlink("/dispatch_bg_ready");
+  sem_unlink("/dispatch_bg_resume");
+  sem_unlink("/dispatch_bg_done");
+  return result;
+}
+
+static void serial_queue_first(void *context) {
+  struct BackgroundQueueProbe *probe = context;
+  probe->order[probe->calls++] = 1;
+  usleep(1000);
+  probe->order[probe->calls++] = 2;
+}
+
+static void serial_queue_last(void *context) {
+  struct BackgroundQueueProbe *probe = context;
+  probe->order[probe->calls++] = 3;
+}
+
+// A sync submission must wait behind earlier async work even if that work
+// yields, and serial work cannot overlap while another callback is asleep.
+// https://github.com/apple-oss-distributions/libdispatch/blob/main/man/dispatch_queue_create.3
+int test_dispatch_background_serial(void) {
+  struct BackgroundQueueProbe probe = {0};
+  probe.queue = dispatch_queue_create("TestApp.background-serial", NULL);
+  dispatch_async_f(probe.queue, &probe, serial_queue_first);
+  dispatch_sync_f(probe.queue, &probe, serial_queue_last);
+  dispatch_release(probe.queue);
+  return probe.calls == 3 && probe.order[0] == 1 && probe.order[1] == 2 &&
+                 probe.order[2] == 3 ? 0 : -1;
+}
+
+static void background_deadline(void *context) {
+  struct BackgroundQueueProbe *probe = context;
+  if (pthread_equal(pthread_self(), probe->caller) ||
+      dispatch_get_current_queue() != probe->queue)
+    probe->error = -2;
+  probe->calls++;
+}
+
+// Background dispatch deadlines must fire even when the submitting thread
+// has no running NSRunLoop. Main-thread sleep lets the worker run directly.
+// https://github.com/apple-oss-distributions/libdispatch/blob/main/man/dispatch_after.3
+int test_dispatch_background_deadline(void) {
+  struct BackgroundQueueProbe probe = {0};
+  probe.caller = pthread_self();
+  probe.queue = dispatch_get_global_queue(0, 0);
+  dispatch_after_f(dispatch_time(0, 20000000), probe.queue, &probe,
+                   background_deadline);
+  for (int i = 0; i < 100 && !probe.calls; i++)
+    usleep(1000);
+  int result = probe.calls == 1 ? probe.error : -1;
+  // Drain a timer-based broken implementation before the context expires.
+  if (!probe.calls)
+    pump_dispatch_main_loop();
+  return result;
+}
+
+static void group_first(void *context) {
+  struct BackgroundQueueProbe *probe = context;
+  usleep(1000);
+  probe->order[probe->calls++] = 1;
+}
+static void group_notification(void *context) {
+  struct BackgroundQueueProbe *probe = context;
+  probe->order[probe->calls++] = 2;
+}
+
+// Waiting and notification must honor entered work and actual completion,
+// including callbacks that yield. Notify itself remains asynchronous.
+// https://github.com/apple-oss-distributions/libdispatch/blob/main/man/dispatch_group_create.3
+int test_dispatch_background_group(void) {
+  struct BackgroundQueueProbe probe = {0};
+  probe.queue = dispatch_queue_create("TestApp.background-group", NULL);
+  dispatch_group_t group = dispatch_group_create();
+  dispatch_group_enter(group);
+  if (dispatch_group_wait(group, 0) == 0)
+    return -1;
+  dispatch_group_notify_f(group, probe.queue, &probe, group_notification);
+  dispatch_group_async_f(group, probe.queue, &probe, group_first);
+  dispatch_group_leave(group);
+  if (dispatch_group_wait(group, UINT64_MAX) != 0)
+    return -2;
+  dispatch_sync_f(probe.queue, &probe, serial_queue_last);
+  dispatch_release(group);
+  dispatch_release(probe.queue);
+  return probe.calls == 3 && probe.order[0] == 1 && probe.order[1] == 2 &&
+                 probe.order[2] == 3 ? 0 : -3;
+}
+
+static void barrier_finish(void *context) { (void)context; }
+
+static int deferred_queue_key;
+static void deferred_queue_callback(void *context) {
+  struct BackgroundQueueProbe *probe = context;
+  if (dispatch_get_current_queue() != probe->queue ||
+      dispatch_get_specific(&deferred_queue_key) != probe)
+    probe->error = -2;
+  probe->calls++;
+}
+
+// Deferred submission retains its destination queue. Releasing the caller's
+// reference must not destroy queue-specific state before the callback runs.
+// https://github.com/apple-oss-distributions/libdispatch/blob/main/man/dispatch_after.3
+// https://github.com/apple-oss-distributions/libdispatch/blob/main/man/dispatch_group_create.3
+int test_dispatch_deferred_queue_lifetime(void) {
+  for (int notification = 0; notification < 2; notification++) {
+    struct BackgroundQueueProbe probe = {0};
+    probe.queue = dispatch_queue_create("TestApp.deferred-lifetime", NULL);
+    dispatch_queue_set_specific(probe.queue, &deferred_queue_key, &probe, NULL);
+    if (notification) {
+      dispatch_group_t group = dispatch_group_create();
+      dispatch_group_enter(group);
+      dispatch_group_notify_f(group, probe.queue, &probe, deferred_queue_callback);
+      dispatch_release(probe.queue);
+      dispatch_group_leave(group);
+      dispatch_release(group);
+    } else {
+      dispatch_after_f(dispatch_time(0, 20000000), probe.queue, &probe,
+                       deferred_queue_callback);
+      dispatch_release(probe.queue);
+    }
+    for (int i = 0; i < 1000 && !probe.calls; i++)
+      usleep(1000);
+    if (probe.calls != 1 || probe.error)
+      return probe.error ? probe.error : -1;
+    // Let worker completion release the queue before reusing the stack.
+    usleep(1000);
+  }
+  return 0;
+}
+
+// Ordinary dispatch_sync must wait behind earlier barriers on concurrent
+// queues; the inline fast path must not bypass pending work.
+// https://developer.apple.com/documentation/dispatch/1452797-dispatch_barrier_async
+int test_dispatch_sync_after_barrier(void) {
+  struct BackgroundQueueProbe probe = {0};
+  probe.queue = dispatch_queue_create("TestApp.sync-after-barrier",
+                                     &_dispatch_queue_attr_concurrent);
+  dispatch_async_f(probe.queue, &probe, group_first);
+  dispatch_barrier_async_f(probe.queue, &probe, group_notification);
+  dispatch_sync_f(probe.queue, &probe, serial_queue_last);
+  dispatch_release(probe.queue);
+  return probe.calls == 3 && probe.order[0] == 1 && probe.order[1] == 2 &&
+                 probe.order[2] == 3 ? 0 : -1;
+}
+
+// A barrier separates earlier and later work on a concurrent private queue.
+// The first callback sleeps so incorrectly overlapping work changes order.
+int test_dispatch_background_barrier(void) {
+  struct BackgroundQueueProbe probe = {0};
+  probe.queue = dispatch_queue_create("TestApp.background-barrier",
+                                     &_dispatch_queue_attr_concurrent);
+  dispatch_async_f(probe.queue, &probe, group_first);
+  dispatch_barrier_async_f(probe.queue, &probe, group_notification);
+  dispatch_async_f(probe.queue, &probe, serial_queue_last);
+  dispatch_barrier_sync_f(probe.queue, NULL, barrier_finish);
+  dispatch_release(probe.queue);
+  return probe.calls == 3 && probe.order[0] == 1 && probe.order[1] == 2 &&
+                 probe.order[2] == 3 ? 0 : -1;
+}
+
+@interface CADisplayLink : NSObject
++ (id)displayLinkWithTarget:(id)target selector:(SEL)selector;
+- (void)setFrameInterval:(NSInteger)interval;
+- (void)addToRunLoop:(id)runLoop forMode:(id)mode;
+- (double)timestamp;
+- (double)duration;
+- (void)invalidate;
+@end
+
+@interface DisplayLinkTimingProbe : NSObject {
+@public
+  int calls;
+  int error;
+}
+- (void)frame:(CADisplayLink *)link;
+@end
+
+@implementation DisplayLinkTimingProbe
+- (void)frame:(CADisplayLink *)link {
+  double timestamp = [link timestamp];
+  usleep(1000);
+  if ([link timestamp] != timestamp || timestamp <= 0)
+    error = -2;
+  double refresh = [link duration];
+  if (refresh < 0.01666666666 || refresh > 0.01666666667)
+    error = -3;
+  calls++;
+}
+@end
+
+// The timestamp remains stable for a frame, and firing every two refreshes
+// does not double the duration of the physical display's refresh cycle.
+// https://developer.apple.com/documentation/quartzcore/cadisplaylink/duration
+// https://developer.apple.com/documentation/quartzcore/cadisplaylink/timestamp
+int test_CADisplayLink_refresh_clock(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  DisplayLinkTimingProbe *probe = [[DisplayLinkTimingProbe alloc] init];
+  CADisplayLink *link = [[CADisplayLink displayLinkWithTarget:probe
+                              selector:@selector(frame:)] retain];
+  [link setFrameInterval:2];
+  [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSDefaultRunLoopMode];
+  for (int i = 0; i < 100 && !probe->calls; i++)
+    pump_dispatch_main_loop();
+  int result = probe->calls ? probe->error : -1;
+  [link invalidate];
+  [link release];
+  [probe release];
+  [pool drain];
   return result;
 }

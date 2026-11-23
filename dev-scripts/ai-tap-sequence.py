@@ -22,6 +22,8 @@ to differ from the first step screenshot, catching an unchanged splash
 even when frames are still being presented. Use an early screenshot step
 and disable emulator overlays and cursor effects with these image checks.
 A changing image alone does not prove that a game reached its menu.
+Use X,Y>END_X,END_Y@SECONDS for a held drag (SECONDS defaults to 0.5),
+for example --step '3:0.6,0.5>0.3,0.7@0.5' to aim and release a shot.
 
 Windows requires Pillow and pywin32. Linux/X11 requires xdotool, xwininfo,
 and ImageMagick's import.
@@ -34,6 +36,9 @@ import sys
 import threading
 import time
 import os
+import csv
+import json
+import statistics
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -43,6 +48,7 @@ if sys.platform == "win32":
     from PIL import ImageGrab
 
 FPS_RE = re.compile(r"(?:EAGLContext .*|Core Animation compositor) FPS: ([0-9.]+)")
+FRAME_TIMES_RE = re.compile(r"FRAME-TIMES context=(\S+) ms=([0-9.,]+)")
 
 
 def find_window(process_id=None, pid_hint_title="touchHLE"):
@@ -138,6 +144,48 @@ def parse_step_position(position):
     return position, count
 
 
+def drag(hwnd, position):
+    start, end = position.split(">", 1)
+    end, _, duration_text = end.partition("@")
+    duration = float(duration_text) if duration_text else 0.5
+    if not 0 < duration <= 10:
+        raise ValueError("drag duration must be between 0 and 10 seconds")
+    fx, fy = (float(v) for v in start.split(","))
+    ex, ey = (float(v) for v in end.split(","))
+    if not all(0 <= v <= 1 for v in (fx, fy, ex, ey)):
+        raise ValueError("drag coordinates must be fractions between 0 and 1")
+    x0, y0, x1, y1 = client_rect(hwnd)
+
+    def move(x, y):
+        px, py = int(x0 + (x1 - x0) * x), int(y0 + (y1 - y0) * y)
+        if sys.platform == "win32":
+            win32api.SetCursorPos((px, py))
+        else:
+            subprocess.run(["xdotool", "mousemove", "--sync", "--window",
+                            str(hwnd), str(px), str(py)], check=True)
+
+    if sys.platform == "win32":
+        win32gui.SetForegroundWindow(hwnd)
+    else:
+        subprocess.run(["xdotool", "windowfocus", "--sync", str(hwnd)], check=True)
+    move(fx, fy)
+    if sys.platform == "win32":
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
+    else:
+        subprocess.run(["xdotool", "mousedown", "1"], check=True)
+    try:
+        steps = max(2, int(duration * 30))
+        for index in range(1, steps + 1):
+            time.sleep(duration / steps)
+            fraction = index / steps
+            move(fx + (ex - fx) * fraction, fy + (ey - fy) * fraction)
+    finally:
+        if sys.platform == "win32":
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
+        else:
+            subprocess.run(["xdotool", "mouseup", "1"], check=True)
+
+
 def screenshot(hwnd, path):
     if sys.platform == "win32":
         ImageGrab.grab(bbox=client_rect(hwnd), all_screens=True).save(path)
@@ -179,6 +227,44 @@ def frames_differ(first, final):
     return result.returncode == 1
 
 
+def has_frame_content(path):
+    """Reject a uniform gray/black/white surface as evidence of game progress."""
+    if sys.platform == "win32":
+        from PIL import Image, ImageStat
+
+        with Image.open(path) as frame:
+            return max(ImageStat.Stat(frame.convert("RGB")).stddev) > 1.0
+    result = subprocess.run(
+        ["identify", "-format", "%[fx:standard_deviation]", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    return float(result.stdout) > 1.0 / 255.0
+
+
+def write_metrics(out, fps_samples, frame_intervals):
+    with (out / "fps.csv").open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["elapsed_seconds", "source", "fps"])
+        writer.writerows(fps_samples)
+    with (out / "frame-times.csv").open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["context", "interval_ms"])
+        writer.writerows(frame_intervals)
+    values = sorted(ms for _, ms in frame_intervals)
+    metrics = {"fps_samples": len(fps_samples), "frame_time_samples": len(values)}
+    if values:
+        def percentile(fraction):
+            index = (len(values) - 1) * fraction
+            lower = int(index)
+            upper = min(lower + 1, len(values) - 1)
+            return values[lower] + (values[upper] - values[lower]) * (index - lower)
+
+        metrics.update(mean_ms=statistics.mean(values), p50_ms=percentile(0.5),
+                       p95_ms=percentile(0.95), p99_ms=percentile(0.99), max_ms=max(values))
+    (out / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    return metrics
+
+
 def wait_for_process(proc, seconds):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -208,6 +294,8 @@ def main():
     p.add_argument("--require-touch-delivery", action="store_true")
     p.add_argument("--require-nonblack-frame", action="store_true")
     p.add_argument("--require-frame-change", action="store_true")
+    p.add_argument("--require-frame-content", action="store_true")
+    p.add_argument("--require-eagl-frames", action="store_true")
     args = p.parse_args(argv)
     if sys.platform not in ("win32", "linux"):
         p.error("This script supports Windows and Linux/X11 hosts.")
@@ -244,6 +332,8 @@ def main():
         log.close()
         p.error(f"could not start emulator {exe}: {error}")
     fps_samples = []
+    fps_rows = []
+    frame_intervals = []
 
     start = time.time()
 
@@ -255,6 +345,12 @@ def main():
             m = FPS_RE.search(line)
             if m:
                 fps_samples.append((time.time(), float(m.group(1))))
+                source = "compositor" if "Core Animation compositor" in line else "EAGL"
+                fps_rows.append((time.time() - start, source, float(m.group(1))))
+            frame_times = FRAME_TIMES_RE.search(line)
+            if frame_times:
+                frame_intervals.extend((frame_times.group(1), float(ms))
+                                       for ms in frame_times.group(2).split(","))
 
     reader_thread = threading.Thread(target=reader, daemon=True)
     reader_thread.start()
@@ -271,6 +367,7 @@ def main():
         proc.wait()
         reader_thread.join()
         log.close()
+        write_metrics(out, fps_rows, frame_intervals)
         print(
             f"FAIL: emulator window never appeared (exit code {proc.returncode}); "
             f"log: {log_path}"
@@ -297,6 +394,12 @@ def main():
         if first_shot is None:
             first_shot = shot
         if position != "-":
+            if ">" in position:
+                if tap_count != 1:
+                    raise ValueError("drag steps cannot repeat with *N")
+                drag(hwnd, position)
+                print(f"step {n}: screenshot {shot.name}, drag {position}")
+                continue
             fx, fy = (float(v) for v in position.split(","))
             tap(hwnd, fx, fy, tap_count)
             action = "double-tap" if tap_count == 2 else f"{tap_count} tap(s)"
@@ -325,6 +428,9 @@ def main():
             if args.require_nonblack_frame and not has_nonblack_pixels(out / "final.png"):
                 print("FAIL: final frame is black despite compositor activity")
                 ok = False
+            if args.require_frame_content and not has_frame_content(out / "final.png"):
+                print("FAIL: final frame is uniform (gray/black/white), with no game content")
+                ok = False
             if args.require_frame_change:
                 try:
                     changed = frames_differ(first_shot, out / "final.png")
@@ -342,7 +448,13 @@ def main():
     proc.wait()
     reader_thread.join()
     log.close()
+    metrics = write_metrics(out, fps_rows, frame_intervals)
+    if frame_intervals:
+        print(f"Game frame intervals (ms): {metrics}")
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    if args.require_eagl_frames and not any(source == "EAGL" for _, source, _ in fps_rows):
+        print("FAIL: the game never presented EAGL frames; compositor FPS cannot prove progress")
+        ok = False
     failure_patterns = (
         r"App called exit\(",
         r"Shader[^\n]*compile failed",

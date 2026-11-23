@@ -38,6 +38,7 @@ struct EaglPresentOptions {
     trace_gl_errors: bool,
     present_mode: PresentMode,
     present_finish: bool,
+    angle_backend: bool,
     /// The framebuffer that draws to the window. This is 0 everywhere except
     /// iOS, where SDL2 renders the window through a framebuffer object of its
     /// own (see `EAGLContextHostObject::drawable_framebuffer`).
@@ -425,6 +426,8 @@ pub(super) struct EAGLContextHostObject {
     renderbuffer_drawable_bindings: Rc<RefCell<HashMap<GLuint, id>>>,
     fps_counter: Option<FpsCounter>,
     next_frame_due: Option<Instant>,
+    last_profiled_frame: Option<Instant>,
+    profiled_frame_intervals: Vec<f64>,
     /// Buffers the guest currently has mapped, keyed by target and buffer
     /// object name: `(guest mirror, driver mapping, size)`.
     ///
@@ -622,6 +625,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         renderbuffer_drawable_bindings: Rc::new(RefCell::new(HashMap::new())),
         fps_counter: None,
         next_frame_due: None,
+        last_profiled_frame: None,
+        profiled_frame_intervals: Vec::new(),
         mapped_buffers: HashMap::new(),
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
@@ -1196,6 +1201,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     // plain log!() would flood, but the very first call is a key signal that
     // the app actually got past splash/init and is rendering.
     log_once!("[EAGLContext presentRenderbuffer:] first call (app reached first frame)");
+    if crate::env_flag_cached!("TOUCHHLE_FRAME_TIMES") {
+        let host = env.objc.borrow_mut::<EAGLContextHostObject>(this);
+        let now = Instant::now();
+        if let Some(previous) = host.last_profiled_frame.replace(now) {
+            host.profiled_frame_intervals.push(now.duration_since(previous).as_secs_f64() * 1000.0);
+            // Batch output to keep profiling from introducing a blocking
+            // write on every frame. Only explicit diagnostic runs collect it.
+            if host.profiled_frame_intervals.len() == 120 {
+                let samples = host.profiled_frame_intervals.iter()
+                    .map(|ms| format!("{ms:.3}")).collect::<Vec<_>>().join(",");
+                host.profiled_frame_intervals.clear();
+                log!("FRAME-TIMES context={:?} ms={}", this, samples);
+            }
+        }
+    }
     {
         static INPUT_POLL_THREAD_LOGGED: std::sync::Once = std::sync::Once::new();
         INPUT_POLL_THREAD_LOGGED.call_once(|| {
@@ -1256,6 +1276,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // Unclear from documentation if this method requires the context to be
     // current, but it would be weird if it didn't?
+    let host_uses_angle = env.window.as_ref().is_some_and(|window| window.is_angle_backend());
     let Some(window) = env.window.as_mut() else {
         log_dbg!(
             "[EAGLContext presentRenderbuffer:{:#x}] ignored in headless mode",
@@ -1380,11 +1401,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         // stall plus two full-frame copies per frame — very slow, but it
         // never touches the app's GL state).
         //
-        // The readback route used to be the default for every native ES 1.1
-        // backend, i.e. for every ES 1.1 game on Android, where it was by far
-        // the biggest per-frame cost. It's now an explicit choice
-        // (--present-mode=readback) or an automatic fallback when the GPU
-        // route demonstrably produces black frames on this driver.
+        // ANGLE's native ES1 path preserves guest state and copies on the GPU.
+        // Keep RAM readback for the translator and vendor ES1 drivers whose
+        // presentation path has not been validated, or if the probe fails.
         let use_readback = match env.options.present_mode {
             PresentMode::Readback => {
                 if backend_is_es2 && !backend_is_translator {
@@ -1404,16 +1423,9 @@ pub const CLASSES: ClassExports = objc_classes! {
             // (its glDrawArrays is the fixed-function emulation itself), so
             // it keeps using readback unless explicitly overridden.
             PresentMode::Auto => {
-                // Native ES 1.1 games keep the readback presenter by default.
-                // The GPU-copy path changes guest-visible fixed-function state
-                // in ways 2D engines (cocos2d etc.) notice — sprite
-                // blending/tinting breaks even though the frame is not black,
-                // so the automatic black-frame fallback never triggers. ES 2.0
-                // backends keep the fast GPU path (its save/restore is exact,
-                // and that is where the 3D games live).
                 backend_is_translator
-                    || backend_is_native_es1
-                    || (backend_is_es2 && direct_present_is_broken())
+                    || (backend_is_native_es1 && !host_uses_angle)
+                    || ((backend_is_native_es1 || backend_is_es2) && direct_present_is_broken())
             }
         };
         {
@@ -1455,6 +1467,7 @@ pub const CLASSES: ClassExports = objc_classes! {
                 trace_gl_errors: env.options.trace_gl_errors,
                 present_mode: env.options.present_mode,
                 present_finish: env.options.present_finish,
+                angle_backend: host_uses_angle,
                 window_framebuffer: env
                     .objc
                     .borrow::<EAGLContextHostObject>(this)
@@ -2550,6 +2563,8 @@ thread_local! {
     // 1.1 present path.
     static PRESENT_ES1_REJECTED_CAPS: std::cell::Cell<Option<RejectedCaps>> =
         const { std::cell::Cell::new(None) };
+    static PRESENT_ES1_TEXTURE_UNITS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
     /// GL object names are context-local unless contexts share a sharegroup.
     /// Keep every presenter cache tied to the EAGLContext host object so a game
     /// switching contexts cannot use another context's program/FBO/texture.
@@ -2573,6 +2588,7 @@ fn invalidate_present_cache_for_context(context_token: usize) {
         PRESENT_TEXTURE_SIZE.with(|cell| cell.set(None));
         PRESENT_ES1_TEXTURE.with(|cell| cell.set(None));
         PRESENT_ES1_REJECTED_CAPS.with(|cell| cell.set(None));
+        PRESENT_ES1_TEXTURE_UNITS.with(|cell| cell.set(None));
         log!("EAGL presenter: invalidated cached GL objects after EAGL context switch");
     }
 }
@@ -2935,6 +2951,54 @@ unsafe fn ensure_present_objects(gles: &mut dyn GLES) -> PresentObjects {
     result
 }
 
+/// A presentation quad uses server and client texture unit zero. Both
+/// selectors are independent, and every enabled server unit participates
+/// in fixed-function drawing, even when no coordinate array is enabled.
+/// https://registry.khronos.org/OpenGL-Refpages/es1.1/xhtml/glActiveTexture.xml
+struct PresentTextureUnits {
+    server: GLenum,
+    client: GLenum,
+    enabled: Vec<GLenum>,
+}
+impl PresentTextureUnits {
+    unsafe fn capture(gles: &mut dyn GLES) -> Self {
+        let server = get_int(gles, gles11::ACTIVE_TEXTURE) as GLenum;
+        let client = get_int(gles, gles11::CLIENT_ACTIVE_TEXTURE) as GLenum;
+        let count = PRESENT_ES1_TEXTURE_UNITS.with(|cell| {
+            if let Some(count) = cell.get() {
+                return count;
+            }
+            let count = get_int(gles, gles11::MAX_TEXTURE_UNITS).max(1) as usize;
+            cell.set(Some(count));
+            count
+        });
+        let mut enabled = Vec::new();
+        for unit in 1..count {
+            let texture = gles11::TEXTURE0 + unit as GLenum;
+            gles.ActiveTexture(texture);
+            if gles.IsEnabled(gles11::TEXTURE_2D) != gles11::FALSE {
+                gles.Disable(gles11::TEXTURE_2D);
+                enabled.push(texture);
+            }
+        }
+        gles.ActiveTexture(gles11::TEXTURE0);
+        gles.ClientActiveTexture(gles11::TEXTURE0);
+        Self {
+            server,
+            client,
+            enabled,
+        }
+    }
+    unsafe fn restore(self, gles: &mut dyn GLES) {
+        for texture in self.enabled {
+            gles.ActiveTexture(texture);
+            gles.Enable(gles11::TEXTURE_2D);
+        }
+        gles.ActiveTexture(self.server);
+        gles.ClientActiveTexture(self.client);
+    }
+}
+
 /// Copies the pixels in a renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES`
 /// (which should be provided by the app) to a texture and presents it with
 /// [present_frame], trying to avoid noticeably modifying OpenGL ES state while
@@ -3211,11 +3275,7 @@ unsafe fn present_renderbuffer(
     // To avoid confusing the guest app, we need to be able to undo any
     // state changes we make.
     let old_framebuffer: GLuint = get_int(gles, gles11::FRAMEBUFFER_BINDING_OES) as _;
-    let old_active_texture: GLuint = get_int(gles, gles11::ACTIVE_TEXTURE) as _;
-    // The present texture must be bound on unit 0: the guest may have left a
-    // different unit active, and binding to it would both draw the present
-    // quad with the wrong texture and corrupt the guest's unit binding.
-    gles.ActiveTexture(gles11::TEXTURE0);
+    let texture_units = PresentTextureUnits::capture(gles);
     let old_texture_2d: GLuint = get_int(gles, gles11::TEXTURE_BINDING_2D) as _;
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3354,58 +3414,21 @@ unsafe fn present_renderbuffer(
             );
             (texture, false)
         };
-    // glCopyTex(Sub)Image2D from the bound framebuffer is ordered after the
-    // app's draws into it by the driver; that's what the spec guarantees and
-    // what every driver we've seen honours. We used to glFinish() here
-    // regardless, on the suspicion that a Mali-G57 r32p1 "title menu renders
-    // as a uniform colour" bug was a missing tile resolve — it turned out to
-    // be mipmap-incomplete textures (see fix_texture_min_filter). A full
-    // pipeline drain every frame is the single most expensive thing a
-    // presenter can do on a tile-based GPU (it serialises CPU and GPU and
-    // defeats the driver's frame pipelining), so it is opt-in now:
-    // --present-finish / TOUCHHLE_PRESENT_FINISH=1.
-    // Tile-based GPUs resolve the app's draws to the renderbuffer's main
-    // memory at well-defined sync points. CopyTex(Sub)Image2D is spec-ordered
-    // after the app's draws, but real ES 1.1 surfaces (Adreno/Mali, native or
-    // over ANGLE) have historically needed an explicit drain for alpha-blended
-    // 2D scenes (many small quads): without it, the copy can race the tile
-    // resolve and produce partially-drawn / garbled frames, while 3D scenes
-    // (few big depth-tested draws) usually happen to be fine. Keep the full
-    // drain as the default on native ES 1.1 backends (it was unconditional
-    // before the GPU-present rework); on ES 2.0 shader backends the resolve
-    // is reliable, so it stays opt-in there.
-    let native_es1 = gles.is_native_es1();
+    // Copies are ordered after draws. ANGLE's Vulkan path explicitly records
+    // source transfer reads and destination writes and closes the render pass;
+    // it needs no CPU/GPU pipeline drain. Retain the vendor-native ES1 option
+    // for older drivers, and the user's explicit --present-finish override.
+    // https://github.com/google/angle/blob/b7a90a6cc08e52857a6addc2bc2e569b7b01e9df/src/libANGLE/renderer/vulkan/TextureVk.cpp
     let finish_before_copy = options.present_finish
-        || (native_es1 && !crate::env_flag_cached!("TOUCHHLE_NO_PRESENT_FINISH"));
-    if finish_before_copy && !options.present_finish {
-        log_once!(
-            "EAGL presenter: native ES1.1 backend - forcing glFinish before the \
-             renderbuffer copy (tile-resolve safety for 2D alpha-blended games; \
-             opt out with TOUCHHLE_NO_PRESENT_FINISH=1)."
-        );
-    }
+        || (gles.is_native_es1()
+            && !options.angle_backend
+            && !crate::env_flag_cached!("TOUCHHLE_NO_PRESENT_FINISH"));
     if finish_before_copy {
         gles.Finish();
     }
-    // A guest that renders 2D UI (level-select lists, HUD panels, ...) very
-    // commonly leaves GL_SCISSOR_TEST enabled at present time — iOS titles
-    // never notice because iOS's own present path ignores scissor when
-    // resolving the drawable. Our CopyTex(Sub)Image2D readout is NOT
-    // ignored: pixels outside the guest's scissor box are never copied, so
-    // every frame would present only the scissored sub-region while the
-    // rest of the texture keeps stale content from older frames (the
-    // "Geometry Dash glitched frame" symptom). Disable the test for the
-    // copy; the generic caps save/restore loop below puts the enable flag
-    // back for the guest after the present quad.
-    let old_scissor_box: [GLint; 4] = get_ints(gles, gles11::SCISSOR_BOX);
-    gles.Disable(gles11::SCISSOR_TEST);
-    // Same story for the pack alignment: glCopyTex(Sub)Image2D reads rows
-    // with GL_PACK_ALIGNMENT, and a guest that uploaded odd-stride data
-    // with a non-default alignment skews every copied row and mangles the
-    // presented image. RGBA8 rows are always 4-byte aligned, so alignment
-    // 1 is always valid here and never changes the image.
-    let old_pack_alignment: GLint = get_int(gles, gles11::PACK_ALIGNMENT);
-    gles.PixelStorei(gles11::PACK_ALIGNMENT, 1);
+    // CopyTex(Sub)Image2D is unaffected by scissor and pixel pack state.
+    // Save the guest enables below before disabling them for the quad.
+    // https://registry.khronos.org/OpenGL-Refpages/es1.1/xhtml/glCopyTexSubImage2D.xml
     if storage_valid {
         // Steady state: copy into the preallocated storage without
         // redefining it.
@@ -3442,17 +3465,6 @@ unsafe fn present_renderbuffer(
             "after Finish + CopyTexImage2D",
         );
     }
-    // Restore the guest's pixel-store state now that the copy is done; the
-    // scissor box is restored too so a guest that reads pixels itself
-    // (screenshots) is unaffected. The scissor TEST stays disabled until
-    // the generic caps restore loop re-enables it after the present quad.
-    gles.PixelStorei(gles11::PACK_ALIGNMENT, old_pack_alignment);
-    gles.Scissor(
-        old_scissor_box[0],
-        old_scissor_box[1],
-        old_scissor_box[2],
-        old_scissor_box[3],
-    );
     // Black-frame detector, part 1: sample the source while the framebuffer
     // we copied from is still bound.
     let probe_source_max = if probe_active {
@@ -3951,15 +3963,6 @@ unsafe fn present_renderbuffer(
     // the app's previous texture, which also unbinds ours.
 
     // Restore all the state saved before rendering
-    for (&is_enabled, info) in old_arrays.iter().zip(gles1_on_gl2::ARRAYS.iter()) {
-        // Any non-zero GLboolean counts as enabled: a driver answering a
-        // query with garbage must not be able to panic the emulator here.
-        if is_enabled != gles11::FALSE {
-            gles.EnableClientState(info.name);
-        } else {
-            gles.DisableClientState(info.name);
-        }
-    }
     for (&saved, &name) in old_capabilities
         .iter()
         .zip(gles1_on_gl2::CAPABILITIES.iter())
@@ -4029,6 +4032,15 @@ unsafe fn present_renderbuffer(
         old_tex_coord_array_pointer,
     );
     gles.BindBuffer(gles11::ARRAY_BUFFER, old_array_buffer);
+    for (&is_enabled, info) in old_arrays.iter().zip(gles1_on_gl2::ARRAYS.iter()) {
+        // Any non-zero GLboolean counts as enabled: a driver answering a
+        // query with garbage must not be able to panic the emulator here.
+        if is_enabled != gles11::FALSE {
+            gles.EnableClientState(info.name);
+        } else {
+            gles.DisableClientState(info.name);
+        }
+    }
     gles.BlendFunc(old_blend_sfactor, old_blend_dfactor);
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -4076,7 +4088,7 @@ unsafe fn present_renderbuffer(
     // (see the ActiveTexture switch at the top), so restore both the unit
     // and the texture binding.
     gles.BindTexture(gles11::TEXTURE_2D, old_texture_2d);
-    gles.ActiveTexture(old_active_texture);
+    texture_units.restore(gles);
     gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, old_framebuffer);
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -4244,4 +4256,65 @@ fn attach_orphaned_eagl_view_to_root(env: &mut Environment, drawable: id) -> boo
         }
     }
     false
+}
+
+
+#[cfg(test)]
+mod present_texture_unit_tests {
+    use super::*;
+
+    struct TextureUnits {
+        server: usize,
+        client: usize,
+        enabled: [bool; 4],
+    }
+    #[allow(non_snake_case)]
+    impl GLES for TextureUnits {
+        unsafe fn GetIntegerv(&mut self, name: GLenum, value: *mut GLint) {
+            *value = match name {
+                gles11::ACTIVE_TEXTURE => gles11::TEXTURE0 as GLint + self.server as GLint,
+                gles11::CLIENT_ACTIVE_TEXTURE => gles11::TEXTURE0 as GLint + self.client as GLint,
+                gles11::MAX_TEXTURE_UNITS => self.enabled.len() as GLint,
+                _ => panic!("Unexpected query: {name:#x}"),
+            };
+        }
+        unsafe fn ActiveTexture(&mut self, unit: GLenum) {
+            self.server = (unit - gles11::TEXTURE0) as usize;
+        }
+        unsafe fn ClientActiveTexture(&mut self, unit: GLenum) {
+            self.client = (unit - gles11::TEXTURE0) as usize;
+        }
+        unsafe fn IsEnabled(&mut self, name: GLenum) -> GLboolean {
+            assert_eq!(name, gles11::TEXTURE_2D);
+            self.enabled[self.server] as GLboolean
+        }
+        unsafe fn Enable(&mut self, name: GLenum) {
+            assert_eq!(name, gles11::TEXTURE_2D);
+            self.enabled[self.server] = true;
+        }
+        unsafe fn Disable(&mut self, name: GLenum) {
+            assert_eq!(name, gles11::TEXTURE_2D);
+            self.enabled[self.server] = false;
+        }
+    }
+
+    #[test]
+    fn presentation_isolates_unit_zero_and_restores_independent_selectors() {
+        invalidate_present_cache_for_context(crate::gles::perf_overlay::allocate_context_token());
+        let mut host = TextureUnits {
+            server: 2,
+            client: 3,
+            enabled: [true, false, true, true],
+        };
+        unsafe {
+            let saved = PresentTextureUnits::capture(&mut host);
+            assert_eq!(host.server, 0);
+            assert_eq!(host.client, 0);
+            assert_eq!(host.enabled, [true, false, false, false]);
+            saved.restore(&mut host);
+        }
+        assert_eq!(host.server, 2);
+        assert_eq!(host.client, 3);
+        assert_eq!(host.enabled, [true, false, true, true]);
+    }
 }

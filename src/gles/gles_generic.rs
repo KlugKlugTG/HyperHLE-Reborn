@@ -396,7 +396,7 @@ pub trait GLESContext {
     fn make_current<'gl_ctx, 'win: 'gl_ctx>(
         &'gl_ctx mut self,
         window: &'win mut Window,
-    ) -> Box<dyn GLES + 'gl_ctx>;
+    ) -> crate::gles::CurrentGLES<'gl_ctx>;
 
     /// Make this context (and any underlying context) the active OpenGL
     /// context, without checking if it is the only context. You shouldn't use
@@ -411,7 +411,7 @@ pub trait GLESContext {
         &'gl_ctx mut self,
         make_current_fn: &mut dyn FnMut(&GLContext),
         loader_fn: &mut dyn FnMut(&'static str) -> *const std::ffi::c_void,
-    ) -> Box<dyn GLES + 'gl_ctx>;
+    ) -> crate::gles::CurrentGLES<'gl_ctx>;
 }
 
 /// An active GLES context that can be used.
@@ -3318,7 +3318,7 @@ mod tests {
         for (backend, profile) in profile_backends() {
             for verbose in [false, true] {
                 let wrapped = crate::gles::LoggingGLES {
-                    inner: Box::new(backend),
+                    inner: Box::new(backend).into(),
                     verbose,
                 };
                 assert_eq!(
@@ -3341,7 +3341,7 @@ mod tests {
                         pvrtc,
                         vao,
                         ..Default::default()
-                    }),
+                    }).into(),
                     verbose: false,
                 };
                 assert_eq!(wrapped.pvrtc_native(), pvrtc);

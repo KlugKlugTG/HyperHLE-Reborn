@@ -2048,6 +2048,81 @@ unsafe fn guard_client_vertex_arrays(
     disabled
 }
 
+/// Pointer setters specify storage; they must not change client-array enable
+/// bits. Guard undefined NULL client reads only for the duration of a draw,
+/// using the tracked state instead of querying the mobile driver per array.
+/// https://registry.khronos.org/OpenGL-Refpages/es1.1/xhtml/glVertexPointer.xml
+#[derive(Default)]
+struct NativeClientArraysGuard {
+    fixed: u8,
+    tex_coords: u8,
+    client_unit: usize,
+}
+
+const GUARDED_FIXED_ARRAYS: [FixedArray; 5] = [
+    FixedArray::Normal,
+    FixedArray::Color,
+    FixedArray::PointSize,
+    FixedArray::MatrixIndex,
+    FixedArray::Weight,
+];
+
+fn has_unbacked_client_storage(state: &software_vao::ArrayState) -> bool {
+    state.enabled && state.pointer.buffer == 0 && state.pointer.pointer == 0
+}
+
+unsafe fn guard_native_client_arrays(
+    gles: &mut dyn GLES,
+    shadow: &GLShadowState,
+) -> Option<NativeClientArraysGuard> {
+    let mut guard = NativeClientArraysGuard::default();
+    if !gles.is_native_es1() {
+        return Some(guard);
+    }
+    let state = &shadow.vertex_array_state;
+    if has_unbacked_client_storage(state.fixed(FixedArray::Vertex)) {
+        log_once!("Skipping draw with an enabled NULL vertex array and no VBO");
+        return None;
+    }
+    guard.client_unit = shadow.client_active_texture;
+    for (index, &array) in GUARDED_FIXED_ARRAYS.iter().enumerate() {
+        if has_unbacked_client_storage(state.fixed(array)) {
+            gles.DisableClientState(array.client_state());
+            guard.fixed |= 1 << index;
+        }
+    }
+    for unit in 0..software_vao::MAX_TEXTURE_UNITS {
+        if has_unbacked_client_storage(state.tex_coord(unit).unwrap()) {
+            gles.ClientActiveTexture(gles11::TEXTURE0 + unit as GLenum);
+            gles.DisableClientState(gles11::TEXTURE_COORD_ARRAY);
+            guard.tex_coords |= 1 << unit;
+        }
+    }
+    if guard.tex_coords != 0 {
+        gles.ClientActiveTexture(gles11::TEXTURE0 + guard.client_unit as GLenum);
+    }
+    Some(guard)
+}
+
+impl NativeClientArraysGuard {
+    unsafe fn restore(self, gles: &mut dyn GLES) {
+        for (index, &array) in GUARDED_FIXED_ARRAYS.iter().enumerate() {
+            if self.fixed & (1 << index) != 0 {
+                gles.EnableClientState(array.client_state());
+            }
+        }
+        for unit in 0..software_vao::MAX_TEXTURE_UNITS {
+            if self.tex_coords & (1 << unit) != 0 {
+                gles.ClientActiveTexture(gles11::TEXTURE0 + unit as GLenum);
+                gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
+            }
+        }
+        if self.tex_coords != 0 {
+            gles.ClientActiveTexture(gles11::TEXTURE0 + self.client_unit as GLenum);
+        }
+    }
+}
+
 /// Valid primitive modes for GLES1/2 draw calls. A guest passing anything else
 /// would raise GL_INVALID_ENUM (0x500) on the host driver; we filter those
 /// draws out with a one-time warning instead of feeding the driver garbage.
@@ -2213,6 +2288,9 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
                 }
             }
         }
+        let Some(native_arrays) = guard_native_client_arrays(gles, shadow) else {
+            return;
+        };
         let disabled_arrays = guard_client_vertex_arrays(gles, mem, shadow);
         let fog_state_backup = clamp_fog_state_values(gles, shadow);
         if crate::env_flag_cached!("TOUCHHLE_POTATO_NATIVE_GLES2_PC_STATE") {
@@ -2233,6 +2311,7 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
         crate::gles::perf_overlay::record_draw();
         gles.DrawArrays(mode, first, count);
         restore_fog_state_values(gles, fog_state_backup);
+        native_arrays.restore(gles);
         for index in disabled_arrays {
             gles.EnableVertexAttribArray(index);
         }
@@ -2498,6 +2577,9 @@ fn glDrawElements(
             );
             log_es2_draw_state_once(gles, shadow, mem);
         }
+        let Some(native_arrays) = guard_native_client_arrays(gles, shadow) else {
+            return;
+        };
         let disabled_arrays = guard_client_vertex_arrays(gles, mem, shadow);
         let fog_state_backup = clamp_fog_state_values(gles, shadow);
         if crate::env_flag_cached!("TOUCHHLE_POTATO_NATIVE_GLES2_PC_STATE") {
@@ -2550,6 +2632,7 @@ fn glDrawElements(
             }
         }
         restore_fog_state_values(gles, fog_state_backup);
+        native_arrays.restore(gles);
         for index in disabled_arrays {
             gles.EnableVertexAttribArray(index);
         }
@@ -10074,5 +10157,136 @@ mod performance_texture_size_tests {
         assert_eq!(texture_storage_volume_bytes(8, 4, 2, 0x8058), 256);
         assert_eq!(texture_storage_level_bytes(0, 8, 0x8058), 0);
         assert_eq!(texture_storage_level_bytes(16, 8, 0x83F1), 0);
+    }
+}
+
+#[cfg(test)]
+mod native_client_array_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct NativeArrays {
+        client_unit: usize,
+        disabled: Vec<(GLenum, usize)>,
+    }
+    #[allow(non_snake_case)]
+    impl GLES for NativeArrays {
+        fn is_native_es1(&self) -> bool {
+            true
+        }
+        unsafe fn ClientActiveTexture(&mut self, unit: GLenum) {
+            self.client_unit = (unit - gles11::TEXTURE0) as usize;
+        }
+        unsafe fn DisableClientState(&mut self, array: GLenum) {
+            self.disabled.push((
+                array,
+                if array == gles11::TEXTURE_COORD_ARRAY {
+                    self.client_unit
+                } else {
+                    0
+                },
+            ));
+        }
+        unsafe fn EnableClientState(&mut self, array: GLenum) {
+            let unit = if array == gles11::TEXTURE_COORD_ARRAY {
+                self.client_unit
+            } else {
+                0
+            };
+            let index = self
+                .disabled
+                .iter()
+                .position(|&entry| entry == (array, unit))
+                .unwrap();
+            self.disabled.remove(index);
+        }
+    }
+
+    #[test]
+    fn null_array_guard_restores_enables_and_client_texture_unit() {
+        let mut shadow = GLShadowState::default();
+        shadow.client_active_texture = 3;
+        shadow
+            .vertex_array_state
+            .set_client_state(gles11::COLOR_ARRAY, 0, true);
+        shadow
+            .vertex_array_state
+            .set_client_state(gles11::TEXTURE_COORD_ARRAY, 1, true);
+        shadow
+            .vertex_array_state
+            .set_client_state(gles11::TEXTURE_COORD_ARRAY, 3, true);
+        let original = shadow.vertex_array_state.clone();
+        let mut host = NativeArrays {
+            client_unit: 3,
+            ..Default::default()
+        };
+        unsafe {
+            let guard = guard_native_client_arrays(&mut host, &shadow).unwrap();
+            assert_eq!(
+                host.disabled,
+                [
+                    (gles11::COLOR_ARRAY, 0),
+                    (gles11::TEXTURE_COORD_ARRAY, 1),
+                    (gles11::TEXTURE_COORD_ARRAY, 3)
+                ]
+            );
+            assert_eq!(host.client_unit, 3);
+            guard.restore(&mut host);
+        }
+        assert!(host.disabled.is_empty());
+        assert_eq!(host.client_unit, 3);
+        assert_eq!(shadow.vertex_array_state, original);
+    }
+
+    // NULL denotes offset zero when a buffer was bound at pointer setup.
+    // https://registry.khronos.org/OpenGL-Refpages/es1.1/xhtml/glVertexPointer.xml
+    #[test]
+    fn buffer_offset_zero_and_valid_client_pointers_are_not_disabled() {
+        let mut shadow = GLShadowState::default();
+        for array in [FixedArray::Vertex, FixedArray::Color] {
+            shadow
+                .vertex_array_state
+                .set_client_state(array.client_state(), 0, true);
+            shadow.vertex_array_state.set_fixed_pointer(
+                array,
+                software_vao::ArrayPointer {
+                    buffer: 7,
+                    ..Default::default()
+                },
+            );
+        }
+        shadow
+            .vertex_array_state
+            .set_client_state(gles11::NORMAL_ARRAY, 0, true);
+        shadow.vertex_array_state.set_fixed_pointer(
+            FixedArray::Normal,
+            software_vao::ArrayPointer {
+                pointer: 0x1000,
+                ..Default::default()
+            },
+        );
+        // The current binding does not replace the buffer captured by Pointer.
+        shadow.array_buffer = 0;
+        let mut host = NativeArrays::default();
+        unsafe {
+            guard_native_client_arrays(&mut host, &shadow)
+                .unwrap()
+                .restore(&mut host);
+        }
+        assert!(host.disabled.is_empty());
+    }
+
+    #[test]
+    fn enabled_vertex_array_without_storage_skips_draw_before_mutating_host() {
+        let mut shadow = GLShadowState::default();
+        shadow
+            .vertex_array_state
+            .set_client_state(gles11::VERTEX_ARRAY, 0, true);
+        shadow
+            .vertex_array_state
+            .set_client_state(gles11::COLOR_ARRAY, 0, true);
+        let mut host = NativeArrays::default();
+        assert!(unsafe { guard_native_client_arrays(&mut host, &shadow) }.is_none());
+        assert!(host.disabled.is_empty());
     }
 }

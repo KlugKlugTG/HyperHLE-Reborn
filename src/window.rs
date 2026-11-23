@@ -2732,7 +2732,7 @@ impl Window {
     /// Make the internal OpenGL ES context (for splash screen and UI rendering)
     /// current.
     #[must_use]
-    pub fn make_internal_gl_ctx_current<'win>(&'win mut self) -> Box<dyn GLES + 'win> {
+    pub fn make_internal_gl_ctx_current<'win>(&'win mut self) -> crate::gles::CurrentGLES<'win> {
         // The invariant is held up here - since the instance we return is
         // bound to the lifetime of window, it can't outlive the internal GL
         // context and can't outlive the window.
@@ -2835,6 +2835,7 @@ impl Window {
     /// presented.
     pub fn swap_window(&mut self) {
         self.window.gl_swap_window();
+        crate::gles::present::note_window_swap();
         self.perf_hints.frame_presented();
         crate::gles::perf_overlay::record_host_present();
 

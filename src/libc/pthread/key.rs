@@ -15,16 +15,26 @@ use crate::dyld::{export_c_func, FunctionExports};
 use crate::libc::errno::{EAGAIN, EINVAL};
 use crate::mem::{ConstVoidPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::{Environment, ThreadId};
-use std::collections::HashMap;
 
-#[derive(Default)]
 pub struct State {
     /// Allocated dynamic keys and initialized static keys, with destructors.
     /// A NULL destructor still marks a key as allocated.
-    keys: HashMap<pthread_key_t, GuestFunction>,
+    keys: [Option<GuestFunction>; TSD_SLOTS as usize],
     /// Each thread's guest TSD array, see the module documentation.
-    tsd_arrays: HashMap<ThreadId, MutPtr<MutVoidPtr>>,
+    tsd_arrays: Vec<Option<MutPtr<MutVoidPtr>>>,
 }
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            keys: [None; TSD_SLOTS as usize],
+            tsd_arrays: Vec::new(),
+        }
+    }
+}
+
+// Keys and thread IDs are small dense indices. Direct indexing avoids hashing
+// in pthread_*specific and at every JIT thread-context transition.
 
 // iOS reserves slots 0..=9 for libsyscall, 10..=255 for frameworks, and
 // 256..=511 for pthread_key_create. macOS has a larger dynamic range.
@@ -37,12 +47,20 @@ const TSD_SLOTS: u32 = 512;
 /// Get the address of a thread's guest TSD array (allocating it if needed),
 /// which is the value of the TPIDRURO register while that thread is running.
 pub fn tsd_array_for_thread(env: &mut Environment, thread: ThreadId) -> MutPtr<MutVoidPtr> {
-    if let Some(&array) = get_state(env).tsd_arrays.get(&thread) {
+    if let Some(&array) = get_state(env)
+        .tsd_arrays
+        .get(thread)
+        .and_then(Option::as_ref)
+    {
         return array;
     }
     let array: MutPtr<MutVoidPtr> = env.mem.calloc(TSD_SLOTS * 4).cast();
     assert!(!array.is_null(), "Could not allocate thread-specific data");
-    get_state(env).tsd_arrays.insert(thread, array);
+    let arrays = &mut get_state(env).tsd_arrays;
+    if arrays.len() <= thread {
+        arrays.resize(thread + 1, None);
+    }
+    arrays[thread] = Some(array);
     array
 }
 
@@ -59,8 +77,8 @@ fn pthread_key_create(
 ) -> i32 {
     let state = get_state(env);
     for key in DYNAMIC_KEY_START..TSD_SLOTS {
-        if let std::collections::hash_map::Entry::Vacant(entry) = state.keys.entry(key) {
-            entry.insert(destructor);
+        if state.keys[key as usize].is_none() {
+            state.keys[key as usize] = Some(destructor);
             env.mem.write(key_ptr, key);
             return 0;
         }
@@ -74,7 +92,7 @@ fn pthread_key_init_np(env: &mut Environment, key: i32, destructor: GuestFunctio
     if !(STATIC_KEY_START as i32..DYNAMIC_KEY_START as i32).contains(&key) {
         return EINVAL;
     }
-    get_state(env).keys.entry(key as u32).or_insert(destructor);
+    get_state(env).keys[key as usize].get_or_insert(destructor);
     0
 }
 
@@ -86,7 +104,11 @@ fn pthread_getspecific(env: &mut Environment, key: pthread_key_t) -> MutVoidPtr 
         return Ptr::null();
     }
     let current_thread = env.current_thread;
-    let Some(&array) = get_state(env).tsd_arrays.get(&current_thread) else {
+    let Some(&array) = get_state(env)
+        .tsd_arrays
+        .get(current_thread)
+        .and_then(Option::as_ref)
+    else {
         return Ptr::null();
     };
     env.mem.read(array + key)
@@ -100,11 +122,8 @@ fn pthread_setspecific(env: &mut Environment, key: pthread_key_t, value: ConstVo
         return EINVAL;
     }
     if key < DYNAMIC_KEY_START {
-        get_state(env)
-            .keys
-            .entry(key)
-            .or_insert(GuestFunction::null_ptr());
-    } else if !get_state(env).keys.contains_key(&key) {
+        get_state(env).keys[key as usize].get_or_insert(GuestFunction::null_ptr());
+    } else if get_state(env).keys[key as usize].is_none() {
         return EINVAL;
     }
     let current_thread = env.current_thread;
@@ -117,11 +136,12 @@ fn pthread_key_delete(env: &mut Environment, key: pthread_key_t) -> i32 {
     // Deletion only accepts allocated dynamic keys. It clears values in every
     // thread and releases the key without calling its destructor.
     // https://github.com/apple-oss-distributions/libpthread/blob/libpthread-137.1.1/src/pthread_tsd.c
-    if !(DYNAMIC_KEY_START..TSD_SLOTS).contains(&key) || get_state(env).keys.remove(&key).is_none()
+    if !(DYNAMIC_KEY_START..TSD_SLOTS).contains(&key)
+        || get_state(env).keys[key as usize].take().is_none()
     {
         return EINVAL;
     }
-    for &array in env.libc_state.pthread.key.tsd_arrays.values() {
+    for &array in env.libc_state.pthread.key.tsd_arrays.iter().flatten() {
         env.mem.write(array + key, Ptr::null());
     }
     0
@@ -133,7 +153,11 @@ fn pthread_key_delete(env: &mut Environment, key: pthread_key_t) -> i32 {
 /// https://github.com/apple-oss-distributions/libpthread/blob/libpthread-137.1.1/src/pthread_tsd.c
 pub(crate) fn cleanup_thread_tsd(env: &mut Environment) {
     let current_thread = env.current_thread;
-    let Some(&array) = get_state(env).tsd_arrays.get(&current_thread) else {
+    let Some(&array) = get_state(env)
+        .tsd_arrays
+        .get(current_thread)
+        .and_then(Option::as_ref)
+    else {
         return;
     };
     for _ in 0..4 {
@@ -157,7 +181,7 @@ pub(crate) fn cleanup_thread_tsd(env: &mut Environment) {
 }
 
 fn cleanup_key(env: &mut Environment, array: MutPtr<MutVoidPtr>, key: pthread_key_t) {
-    let Some(&destructor) = get_state(env).keys.get(&key) else {
+    let Some(&destructor) = get_state(env).keys[key as usize].as_ref() else {
         return;
     };
     let value: MutVoidPtr = env.mem.read(array + key);
@@ -172,7 +196,11 @@ fn cleanup_key(env: &mut Environment, array: MutPtr<MutVoidPtr>, key: pthread_ke
 
 /// Reclaim TSD after the thread's coroutine and final exit handlers have ended.
 pub(crate) fn release_thread_tsd(env: &mut Environment, thread: ThreadId) {
-    if let Some(array) = get_state(env).tsd_arrays.remove(&thread) {
+    if let Some(array) = get_state(env)
+        .tsd_arrays
+        .get_mut(thread)
+        .and_then(Option::take)
+    {
         env.mem.free(array.cast());
     }
 }

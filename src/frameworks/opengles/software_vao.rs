@@ -54,7 +54,7 @@ const FIXED_ARRAYS: [FixedArray; FIXED_ARRAY_COUNT] = [
     FixedArray::Weight,
 ];
 impl FixedArray {
-    fn client_state(self) -> GLenum {
+    pub(super) fn client_state(self) -> GLenum {
         match self {
             FixedArray::Vertex => gles11::VERTEX_ARRAY,
             FixedArray::Normal => gles11::NORMAL_ARRAY,
@@ -99,7 +99,6 @@ impl VertexArrayState {
     pub fn fixed(&self, array: FixedArray) -> &ArrayState {
         &self.fixed[array as usize]
     }
-    #[cfg(test)]
     pub fn tex_coord(&self, unit: usize) -> Option<&ArrayState> {
         self.tex_coords.get(unit)
     }

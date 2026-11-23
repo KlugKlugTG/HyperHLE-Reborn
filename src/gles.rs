@@ -96,8 +96,63 @@ pub use gles_generic::GLESContext;
 pub use gles_generic::GLES;
 pub(crate) use gles_generic::GuestGlesCallGuard;
 
+/// A context-bound GL interface. Renderers use inline wrappers instead of
+/// allocating and freeing a box on every guest GL entry. Their
+/// lifetime and transient staging buffers still end at the call boundary.
+pub enum CurrentGLES<'a> {
+    NativeES1(gles1_native::GLES1Native<'a>),
+    NativeES2(gles2_native::GLES2Native<'a>),
+    NativeES3(gles3_native::GLES3Native<'a>),
+    ES1OnGL2(gles1_on_gl2::GLES1OnGL2<'a>),
+    ES1OnGLES2(gles1_on_gles2::GLES1OnGLES2<'a>),
+    ES3OnGL3(gles3_on_gl3::GLES3OnGL3<'a>),
+    Other(Box<dyn GLES + 'a>),
+}
+
+impl<'a> std::ops::Deref for CurrentGLES<'a> {
+    type Target = dyn GLES + 'a;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::NativeES1(gles) => gles,
+            Self::NativeES2(gles) => gles,
+            Self::NativeES3(gles) => gles,
+            Self::ES1OnGL2(gles) => gles,
+            Self::ES1OnGLES2(gles) => gles,
+            Self::ES3OnGL3(gles) => gles,
+            Self::Other(gles) => gles.as_ref(),
+        }
+    }
+}
+
+impl std::ops::DerefMut for CurrentGLES<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::NativeES1(gles) => gles,
+            Self::NativeES2(gles) => gles,
+            Self::NativeES3(gles) => gles,
+            Self::ES1OnGL2(gles) => gles,
+            Self::ES1OnGLES2(gles) => gles,
+            Self::ES3OnGL3(gles) => gles,
+            Self::Other(gles) => gles.as_mut(),
+        }
+    }
+}
+
+impl<'a> CurrentGLES<'a> {
+    pub fn as_mut(&mut self) -> &mut (dyn GLES + 'a) {
+        &mut **self
+    }
+}
+
+impl<'a, T: GLES + 'a> From<Box<T>> for CurrentGLES<'a> {
+    fn from(gles: Box<T>) -> Self {
+        Self::Other(gles)
+    }
+}
+
 pub struct LoggingGLES<'a> {
-    pub inner: Box<dyn GLES + 'a>,
+    pub inner: CurrentGLES<'a>,
     pub verbose: bool,
 }
 
@@ -120,24 +175,24 @@ impl GLESContext for LoggingGLESContext {
     fn make_current<'gl_ctx, 'win: 'gl_ctx>(
         &'gl_ctx mut self,
         window: &'win mut crate::window::Window,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         let gles = self.inner.make_current(window);
         Box::new(LoggingGLES {
             inner: gles,
             verbose: self.verbose,
-        })
+        }).into()
     }
 
     unsafe fn make_current_unchecked_for_window<'gl_ctx>(
         &'gl_ctx mut self,
         make_current_fn: &mut dyn FnMut(&GLContext),
         loader_fn: &mut dyn FnMut(&'static str) -> *const std::ffi::c_void,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         let gles = self.inner.make_current_unchecked_for_window(make_current_fn, loader_fn);
         Box::new(LoggingGLES {
             inner: gles,
             verbose: self.verbose,
-        })
+        }).into()
     }
 }
 

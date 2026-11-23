@@ -70,6 +70,8 @@ pub struct Thread {
     /// If this is not [ThreadBlock::NotBlocked], the thread is not executing
     /// until a certain condition is fufilled.
     pub blocked_by: ThreadBlock,
+    /// Result of the current timed mutex wait, set by the scheduler.
+    pub(crate) timed_mutex_acquired: bool,
     /// Container for thread local state of various child modules
     pub thread_local_framework_state: frameworks::ThreadLocalState,
     /// Whether the current API dispatch came directly from a guest SVC.
@@ -355,6 +357,8 @@ pub enum ThreadBlock {
     GuestSleeping(Instant),
     // Thread is waiting for a mutex to unlock.
     Mutex(MutexId),
+    // Mutex acquisition with a deadline in guest time.
+    TimedMutex(MutexId, Instant),
     // Thread is waiting on a semaphore.
     Semaphore(MutPtr<sem_t>),
     // Thread is waiting on a condition variable
@@ -1151,6 +1155,7 @@ impl Environment {
         let main_thread = Thread {
             active: true,
             blocked_by: ThreadBlock::NotBlocked,
+            timed_mutex_acquired: false,
             return_value: None,
             guest_context: None,
             host_context: Some(main_thread_init_routine),
@@ -1366,6 +1371,7 @@ impl Environment {
         let main_thread = Thread {
             active: true,
             blocked_by: ThreadBlock::NotBlocked,
+            timed_mutex_acquired: false,
             return_value: None,
             guest_context: None,
             host_context: None,
@@ -1589,6 +1595,12 @@ impl Environment {
         // very first frame.
         let _ = FIRST_SEEN_MS.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
         let since_present = match crate::gles::present::ms_since_last_present() {
+            // A compositor can repeatedly swap an unchanged splash or gray
+            // layer while the game's startup callback is stuck. Capture all
+            // thread states independently of swaps when explicitly requested.
+            _ if crate::env_flag_cached!("TOUCHHLE_TRACE_GUEST_THREADS") => {
+                now.saturating_sub(FIRST_SEEN_MS.load(Ordering::Relaxed))
+            }
             // A frame has been presented: stall = >3s since the last one.
             Some(ms) if ms >= 3000 => ms,
             Some(_) => return,
@@ -1616,6 +1628,15 @@ impl Environment {
             regs[abi::FRAME_POINTER],
             regs[cpu::Cpu::SP],
         );
+        for (tid, thread) in self.threads.iter().enumerate() {
+            if thread.active {
+                echo_no_panic!(
+                    "STALL-DIAG thread #{} blocked_by={:?}",
+                    tid,
+                    thread.blocked_by
+                );
+            }
+        }
         self.stack_trace_all();
     }
 
@@ -1802,6 +1823,7 @@ impl Environment {
         self.threads.push(Thread {
             active: true,
             blocked_by: ThreadBlock::NotBlocked,
+            timed_mutex_acquired: false,
             return_value: None,
             guest_context: Some(Box::new(cpu::CpuContext::new())),
             host_context: Some(thread_routine),
@@ -2198,7 +2220,7 @@ impl Environment {
                 let imminent_wakeup = self.threads.iter().any(|thread| {
                     let deadline = match thread.blocked_by {
                         ThreadBlock::Sleeping(due) => Some(due),
-                        ThreadBlock::GuestSleeping(due) => Some(self.guest_clock.host_deadline(due)),
+                        ThreadBlock::GuestSleeping(due) | ThreadBlock::TimedMutex(_, due) => Some(self.guest_clock.host_deadline(due)),
                         _ => None,
                     };
                     deadline.is_some_and(|due| due < Instant::now() + Duration::from_millis(10))
@@ -4278,9 +4300,10 @@ impl Environment {
         // we make sure that this works by immediately fufilling conditions
         // (relocking mutexes, decrementing semaphores, etc.)!
         loop {
+            libc::dispatch::ensure_worker_capacity(self);
             // Try to find a new thread to execute, starting with the thread
             // following the one currently executing.
-            let mut next_awakening: Option<Instant> = None;
+            let mut next_awakening = libc::dispatch::next_deadline(self);
             for i in 0..self.threads.len() {
                 let thread_id = (self.current_thread + 1 + i) % self.threads.len();
                 let candidate = &mut self.threads[thread_id];
@@ -4316,6 +4339,21 @@ impl Environment {
                             self.relock_unblocked_mutex_for_thread(thread_id, mutex_id);
                             return thread_id;
                         }
+                    }
+                    ThreadBlock::TimedMutex(mutex_id, due) => {
+                        if due <= self.guest_clock.now() {
+                            self.mutex_state.cancel_mutex_wait(mutex_id);
+                            self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
+                            return thread_id;
+                        }
+                        if self.mutex_state.mutex_can_be_locked_by(mutex_id, thread_id) {
+                            self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
+                            self.relock_unblocked_mutex_for_thread(thread_id, mutex_id);
+                            self.threads[thread_id].timed_mutex_acquired = true;
+                            return thread_id;
+                        }
+                        let host_due = self.guest_clock.host_deadline(due);
+                        next_awakening = Some(next_awakening.map_or(host_due, |d| d.min(host_due)));
                     }
                     ThreadBlock::Semaphore(sem) => {
                         // The semaphore a thread is waiting on may have been

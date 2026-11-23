@@ -64,9 +64,9 @@ impl GLESContext for GLES2NativeContext {
     fn make_current<'gl_ctx, 'win: 'gl_ctx>(
         &'gl_ctx mut self,
         window: &'win mut Window,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if self.gl_ctx.is_current() && self.is_loaded {
-            return Box::new(GLES2Native {
+            return crate::gles::CurrentGLES::NativeES2(GLES2Native {
                 _gl_lifetime: PhantomData,
                 pvrtc_native: self.pvrtc_native,
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
@@ -91,7 +91,7 @@ impl GLESContext for GLES2NativeContext {
             self.texture_3d_ext_supported = unsafe { detect_texture_3d_ext_support() };
             self.pvrtc_native_checked = true;
         }
-        Box::new(GLES2Native {
+        crate::gles::CurrentGLES::NativeES2(GLES2Native {
             _gl_lifetime: PhantomData,
             pvrtc_native: self.pvrtc_native,
             texture_lod_ext_supported: self.texture_lod_ext_supported,
@@ -105,9 +105,9 @@ impl GLESContext for GLES2NativeContext {
         &'gl_ctx mut self,
         make_current_fn: &mut dyn FnMut(&GLContext),
         loader_fn: &mut dyn FnMut(&'static str) -> *const std::ffi::c_void,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if self.gl_ctx.is_current() && self.is_loaded {
-            return Box::new(GLES2Native {
+            return crate::gles::CurrentGLES::NativeES2(GLES2Native {
                 _gl_lifetime: PhantomData,
                 pvrtc_native: self.pvrtc_native,
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
@@ -127,7 +127,7 @@ impl GLESContext for GLES2NativeContext {
             self.texture_3d_ext_supported = detect_texture_3d_ext_support();
             self.pvrtc_native_checked = true;
         }
-        Box::new(GLES2Native {
+        crate::gles::CurrentGLES::NativeES2(GLES2Native {
             _gl_lifetime: PhantomData,
             pvrtc_native: self.pvrtc_native,
             texture_lod_ext_supported: self.texture_lod_ext_supported,

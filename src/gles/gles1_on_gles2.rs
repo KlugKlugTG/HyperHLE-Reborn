@@ -314,14 +314,14 @@ impl GLESContext for GLES1OnGLES2Context {
     fn make_current<'gl_ctx, 'win: 'gl_ctx>(
         &'gl_ctx mut self,
         window: &'win mut Window,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if !self.gl_ctx.is_current() || !self.is_loaded {
             unsafe { window.make_gl_context_current(&self.gl_ctx) };
             gl::load_with(|s| window.gl_get_proc_address(s));
             es1::load_with(|s| window.gl_get_proc_address(s));
             self.is_loaded = true;
         }
-        Box::new(GLES1OnGLES2 {
+        crate::gles::CurrentGLES::ES1OnGLES2(GLES1OnGLES2 {
             state: &mut self.state,
             _gl_lifetime: PhantomData,
         })
@@ -331,14 +331,14 @@ impl GLESContext for GLES1OnGLES2Context {
         &'gl_ctx mut self,
         make_current_fn: &mut dyn FnMut(&GLContext),
         loader_fn: &mut dyn FnMut(&'static str) -> *const std::ffi::c_void,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if !self.gl_ctx.is_current() || !self.is_loaded {
             make_current_fn(&self.gl_ctx);
             gl::load_with(&mut *loader_fn);
             es1::load_with(&mut *loader_fn);
             self.is_loaded = true;
         }
-        Box::new(GLES1OnGLES2 {
+        crate::gles::CurrentGLES::ES1OnGLES2(GLES1OnGLES2 {
             state: &mut self.state,
             _gl_lifetime: PhantomData,
         })

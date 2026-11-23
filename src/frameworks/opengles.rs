@@ -144,7 +144,7 @@ fn sync_context<'objc, 'win: 'objc>(
     objc: &'objc mut crate::objc::ObjC,
     window: &'win mut crate::window::Window,
     current_thread: crate::ThreadId,
-) -> Option<Box<dyn crate::gles::GLES + 'objc>> {
+) -> Option<crate::gles::CurrentGLES<'objc>> {
     let gles_ctx = get_thread_context(state, objc, current_thread)?;
     Some(gles_ctx.make_current(window))
 }

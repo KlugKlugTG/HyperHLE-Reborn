@@ -191,9 +191,9 @@ impl GLESContext for GLES1NativeContext {
     fn make_current<'gl_ctx, 'win: 'gl_ctx>(
         &'gl_ctx mut self,
         window: &'win mut Window,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if self.gl_ctx.is_current() && self.is_loaded {
-            return Box::new(GLES1Native {
+            return crate::gles::CurrentGLES::NativeES1(GLES1Native {
                 _gl_lifetime: PhantomData,
                 pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
                 pvrtc_native: self.pvrtc_native,
@@ -227,7 +227,7 @@ impl GLESContext for GLES1NativeContext {
                 },
             );
         }
-        Box::new(GLES1Native {
+        crate::gles::CurrentGLES::NativeES1(GLES1Native {
             _gl_lifetime: PhantomData,
             pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
             pvrtc_native: self.pvrtc_native,
@@ -239,9 +239,9 @@ impl GLESContext for GLES1NativeContext {
         &'gl_ctx mut self,
         make_current_fn: &mut dyn FnMut(&GLContext),
         loader_fn: &mut dyn FnMut(&'static str) -> *const std::ffi::c_void,
-    ) -> Box<dyn GLES + 'gl_ctx> {
+    ) -> crate::gles::CurrentGLES<'gl_ctx> {
         if self.gl_ctx.is_current() && self.is_loaded {
-            return Box::new(GLES1Native {
+            return crate::gles::CurrentGLES::NativeES1(GLES1Native {
                 _gl_lifetime: PhantomData,
                 pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
                 pvrtc_native: self.pvrtc_native,
@@ -258,7 +258,7 @@ impl GLESContext for GLES1NativeContext {
             self.discard_ext_checked = true;
             self.pvrtc_native_checked = true;
         }
-        Box::new(GLES1Native {
+        crate::gles::CurrentGLES::NativeES1(GLES1Native {
             _gl_lifetime: PhantomData,
             pending_synthetic_error: std::cell::Cell::new(gles11::NO_ERROR),
             pvrtc_native: self.pvrtc_native,
@@ -693,26 +693,10 @@ impl GLES for GLES1Native<'_> {
         stride: GLsizei,
         pointer: *const GLvoid,
     ) {
-        if pointer.is_null() {
-            let mut bound_buffer: GLint = 0;
-            gles11::GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut bound_buffer);
-            if bound_buffer == 0 {
-                gles11::DisableClientState(gles11::COLOR_ARRAY);
-                return;
-            }
-        }
         gles11::ColorPointer(size, type_, stride, pointer)
     }
 
     unsafe fn NormalPointer(&mut self, type_: GLenum, stride: GLsizei, pointer: *const GLvoid) {
-        if pointer.is_null() {
-            let mut bound_buffer: GLint = 0;
-            gles11::GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut bound_buffer);
-            if bound_buffer == 0 {
-                gles11::DisableClientState(gles11::NORMAL_ARRAY);
-                return;
-            }
-        }
         gles11::NormalPointer(type_, stride, pointer)
     }
 
@@ -723,14 +707,6 @@ impl GLES for GLES1Native<'_> {
         stride: GLsizei,
         pointer: *const GLvoid,
     ) {
-        if pointer.is_null() {
-            let mut bound_buffer: GLint = 0;
-            gles11::GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut bound_buffer);
-            if bound_buffer == 0 {
-                gles11::DisableClientState(gles11::TEXTURE_COORD_ARRAY);
-                return;
-            }
-        }
         gles11::TexCoordPointer(size, type_, stride, pointer)
     }
 
@@ -741,14 +717,6 @@ impl GLES for GLES1Native<'_> {
         stride: GLsizei,
         pointer: *const GLvoid,
     ) {
-        if pointer.is_null() {
-            let mut bound_buffer: GLint = 0;
-            gles11::GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut bound_buffer);
-            if bound_buffer == 0 {
-                gles11::DisableClientState(gles11::VERTEX_ARRAY);
-                return;
-            }
-        }
         gles11::VertexPointer(size, type_, stride, pointer)
     }
 
