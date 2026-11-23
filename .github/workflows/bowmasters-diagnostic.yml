@@ -53,7 +53,7 @@ jobs:
         run: |
           test "$(gh release view ci-private-native-games-20261123 --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
           gh release download ci-private-native-games-20261123 --repo "$GITHUB_REPOSITORY" --pattern bowmasters.ipa --dir private-inputs
-      - name: Record available hardware and start display
+      - name: Record available CPU and graphics hardware and start display
         run: |
           mkdir -p results
           lscpu > results/cpu.txt
