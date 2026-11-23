@@ -22,6 +22,8 @@ to differ from the first step screenshot, catching an unchanged splash
 even when frames are still being presented. Use an early screenshot step
 and disable emulator overlays and cursor effects with these image checks.
 A changing image alone does not prove that a game reached its menu.
+Use X,Y>END_X,END_Y@SECONDS for a held drag (SECONDS defaults to 0.5),
+for example --step '3:0.6,0.5>0.3,0.7@0.5' to aim and release a shot.
 
 Windows requires Pillow and pywin32. Linux/X11 requires xdotool, xwininfo,
 and ImageMagick's import.
@@ -140,6 +142,48 @@ def parse_step_position(position):
         if count < 1:
             raise ValueError("tap count must be at least 1")
     return position, count
+
+
+def drag(hwnd, position):
+    start, end = position.split(">", 1)
+    end, _, duration_text = end.partition("@")
+    duration = float(duration_text) if duration_text else 0.5
+    if not 0 < duration <= 10:
+        raise ValueError("drag duration must be between 0 and 10 seconds")
+    fx, fy = (float(v) for v in start.split(","))
+    ex, ey = (float(v) for v in end.split(","))
+    if not all(0 <= v <= 1 for v in (fx, fy, ex, ey)):
+        raise ValueError("drag coordinates must be fractions between 0 and 1")
+    x0, y0, x1, y1 = client_rect(hwnd)
+
+    def move(x, y):
+        px, py = int(x0 + (x1 - x0) * x), int(y0 + (y1 - y0) * y)
+        if sys.platform == "win32":
+            win32api.SetCursorPos((px, py))
+        else:
+            subprocess.run(["xdotool", "mousemove", "--sync", "--window",
+                            str(hwnd), str(px), str(py)], check=True)
+
+    if sys.platform == "win32":
+        win32gui.SetForegroundWindow(hwnd)
+    else:
+        subprocess.run(["xdotool", "windowfocus", "--sync", str(hwnd)], check=True)
+    move(fx, fy)
+    if sys.platform == "win32":
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
+    else:
+        subprocess.run(["xdotool", "mousedown", "1"], check=True)
+    try:
+        steps = max(2, int(duration * 30))
+        for index in range(1, steps + 1):
+            time.sleep(duration / steps)
+            fraction = index / steps
+            move(fx + (ex - fx) * fraction, fy + (ey - fy) * fraction)
+    finally:
+        if sys.platform == "win32":
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
+        else:
+            subprocess.run(["xdotool", "mouseup", "1"], check=True)
 
 
 def screenshot(hwnd, path):
@@ -350,6 +394,12 @@ def main():
         if first_shot is None:
             first_shot = shot
         if position != "-":
+            if ">" in position:
+                if tap_count != 1:
+                    raise ValueError("drag steps cannot repeat with *N")
+                drag(hwnd, position)
+                print(f"step {n}: screenshot {shot.name}, drag {position}")
+                continue
             fx, fy = (float(v) for v in position.split(","))
             tap(hwnd, fx, fy, tap_count)
             action = "double-tap" if tap_count == 2 else f"{tap_count} tap(s)"

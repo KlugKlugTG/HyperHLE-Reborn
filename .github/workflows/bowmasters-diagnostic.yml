@@ -74,9 +74,13 @@ jobs:
         run: |
           read -r -a taps <<< "$BOWMASTERS_TAPS"
           tap_args=()
-          for tap in "${taps[@]}"; do tap_args+=(--step "$tap"); done
+          touch_args=()
+          for tap in "${taps[@]}"; do
+            tap_args+=(--step "$tap")
+            if [ "${tap#*:}" != '-' ]; then touch_args=(--require-touch-delivery); fi
+          done
           pidstat -h -r -u -w -t -C touchHLE 1 > results/pidstat.txt &
-          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/bowmasters.ipa" --exe "$BOWMASTERS_EXE" --cwd "$BOWMASTERS_CWD" --out results/startup "${tap_args[@]}" --final-wait 10 --require-nonblack-frame --require-frame-change --require-frame-content --require-eagl-frames -- --overlay=off --device-family=iphone-4s &
+          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/bowmasters.ipa" --exe "$BOWMASTERS_EXE" --cwd "$BOWMASTERS_CWD" --out results/startup "${tap_args[@]}" "${touch_args[@]}" --final-wait 10 --require-nonblack-frame --require-frame-change --require-frame-content --require-eagl-frames -- --overlay=off --device-family=iphone-4s &
           game_test=$!
           (
             for attempt in $(seq 1 60); do
