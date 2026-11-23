@@ -29,6 +29,8 @@ jobs:
     env:
       DISPLAY: ":99"
       ALSOFT_DRIVERS: "null"
+      TOUCHHLE_STALL_DIAG: "1"
+      TOUCHHLE_TRACE_GUEST_THREADS: "1"
       BOWMASTERS_BUILD_RUN: ${{ inputs.emulator_run_id || '45185462232' }}
       BOWMASTERS_TAPS: ${{ inputs.tap_sequence || '1:- 10:- 20:- 30:-' }}
     steps:
