@@ -14,6 +14,8 @@ mod eagl;
 mod gles_guest;
 mod software_vao;
 
+pub(crate) use gles_guest::{glBindFramebuffer, glViewport, with_ctx_and_mem};
+
 use touchHLE_gl_bindings::gles11::types::{GLenum, GLint, GLsizei, GLuint};
 
 use crate::mem::ConstPtr;

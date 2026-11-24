@@ -23,7 +23,7 @@ use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant}
 use crate::frameworks::core_graphics::{CGFloat, CGRect};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval};
-use crate::frameworks::opengles::gles_guest::{glBindFramebuffer, glViewport, with_ctx_and_mem};
+use crate::frameworks::opengles::{glBindFramebuffer, glViewport, with_ctx_and_mem};
 use crate::frameworks::uikit::ui_view::UIViewHostObject;
 use crate::frameworks::uikit::ui_view_controller::UIViewControllerHostObject;
 use crate::gles::gles11_raw as gl;
