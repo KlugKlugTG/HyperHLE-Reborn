@@ -267,10 +267,13 @@ def write_metrics(out, fps_samples, frame_intervals):
 
 def wait_for_process(proc, seconds):
     deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
+    while True:
         if proc.poll() is not None:
             return False
-        time.sleep(min(0.25, deadline - time.monotonic()))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.25, remaining))
     return proc.poll() is None
 
 
