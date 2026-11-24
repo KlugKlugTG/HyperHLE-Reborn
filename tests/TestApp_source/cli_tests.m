@@ -7405,6 +7405,11 @@ int test_objc_struct_return_imp(void);
 int test_objc_struct_return_super(void);
 int test_NSProcessInfo_allocated_instance(void);
 int test_objc_struct_return_imp_initialization(void);
+int test_CTFont_registration_names_descriptors(void);
+int test_CTFont_draw_glyphs_bitmap(void);
+int test_CTFont_cff_symbol_bitmap(void);
+int test_CTFont_descriptor_attribute_merging(void);
+int test_CTTypesetter_ranges_utf16_metrics(void);
 
 // clang-format off
 // Tests marked XFUNC_DEF assert behaviour that PR #259 ("fix testapp
@@ -7421,6 +7426,11 @@ struct {
   const char *name;
   int known_fail;
 } test_func_array[] = {
+    FUNC_DEF(test_CTFont_registration_names_descriptors),
+    FUNC_DEF(test_CTFont_draw_glyphs_bitmap),
+    FUNC_DEF(test_CTFont_cff_symbol_bitmap),
+    FUNC_DEF(test_CTFont_descriptor_attribute_merging),
+    FUNC_DEF(test_CTTypesetter_ranges_utf16_metrics),
     FUNC_DEF(test_NSScanner_case_sensitivity),
     FUNC_DEF(test_NSProcessInfo_allocated_instance),
     FUNC_DEF(test_objc_struct_return_imp),

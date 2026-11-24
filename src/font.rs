@@ -127,6 +127,63 @@ impl Font {
         font.glyph(glyph_id)
     }
 
+    /// OpenType name record: 1=family, 2=style, 4=full, 6=PostScript.
+    /// Keep the identity of application fonts through Core Text and UIKit.
+    pub fn name(&self, name_id: u16) -> Option<String> {
+        self.table_data(0x6e616d65)
+            .and_then(|table| name_from_table(&table, name_id))
+    }
+
+    /// Core Text's symbolic traits from the actual font data.
+    pub fn symbolic_traits(&self) -> u32 {
+        let mut traits = 0;
+        if let Some(head) = self.table_data(0x68656164) {
+            if let Some(bytes) = head.get(44..46) {
+                let style = u16::from_be_bytes([bytes[0], bytes[1]]);
+                if style & 1 != 0 {
+                    traits |= 1 << 1;
+                } // bold
+                if style & 2 != 0 {
+                    traits |= 1;
+                } // italic
+            }
+        }
+        if let Some(post) = self.table_data(0x706f7374) {
+            if let Some(bytes) = post.get(12..16) {
+                if u32::from_be_bytes(bytes.try_into().unwrap()) != 0 {
+                    traits |= 1 << 10;
+                }
+            }
+        }
+        // OpenType OS/2: width class, family class and selection flags.
+        // https://learn.microsoft.com/en-us/typography/opentype/spec/os2
+        if let Some(os2) = self.table_data(0x4f532f32) {
+            if let Some(width) = os2.get(6..8) {
+                let width = u16::from_be_bytes(width.try_into().unwrap());
+                if (1..5).contains(&width) {
+                    traits |= 1 << 6;
+                }
+                if (6..=9).contains(&width) {
+                    traits |= 1 << 5;
+                }
+            }
+            if let Some(selection) = os2.get(62..64) {
+                let selection = u16::from_be_bytes(selection.try_into().unwrap());
+                if selection & 1 != 0 {
+                    traits |= 1;
+                }
+                if selection & (1 << 5) != 0 {
+                    traits |= 1 << 1;
+                }
+            }
+            if let Some(class) = os2.get(30..32) {
+                let class = u16::from_be_bytes(class.try_into().unwrap()) >> 8;
+                traits |= u32::from(class) << 28;
+            }
+        }
+        traits
+    }
+
     /// Returns the total number of glyphs in the font.
     pub fn glyph_count(&self) -> u32 {
         self.rt().glyph_count() as u32
@@ -174,13 +231,13 @@ impl Font {
 
     pub(crate) fn glyph_advance_at_size(&self, glyph_id: GlyphId, font_size: f32) -> f32 {
         self.glyph(glyph_id)
-            .scaled(scale(font_size))
+            .scaled(self.em_scale(font_size))
             .h_metrics()
             .advance_width
     }
 
     pub(crate) fn glyph_positions_at_size(&self, font_size: f32, glyphs: &[GlyphId]) -> Vec<f32> {
-        let font_scale = scale(font_size);
+        let font_scale = self.em_scale(font_size);
         let mut previous: Option<GlyphId> = None;
         let mut x = 0.0;
         glyphs
@@ -206,7 +263,7 @@ impl Font {
     ) -> (f32, f32, f32, f32) {
         let glyph = self
             .glyph(glyph_id)
-            .scaled(scale(font_size))
+            .scaled(self.em_scale(font_size))
             .positioned(Point { x: 0.0, y: 0.0 });
         match glyph.pixel_bounding_box() {
             Some(bb) => (
@@ -220,6 +277,22 @@ impl Font {
             ),
             None => (0.0, 0.0, 0.0, 0.0),
         }
+    }
+
+    /// Advance of a simple, horizontal glyph sequence in Core Text points.
+    /// Core Text and Core Graphics both measure font size in units per em.
+    pub(crate) fn text_advance_at_size(&self, font_size: f32, text: &str) -> f32 {
+        let glyphs: Vec<_> = text
+            .chars()
+            .map(|ch| self.glyph_id_for_unicode(ch))
+            .collect();
+        let positions = self.glyph_positions_at_size(font_size, &glyphs);
+        positions
+            .last()
+            .zip(glyphs.last())
+            .map_or(0.0, |(x, glyph)| {
+                x + self.glyph_advance_at_size(*glyph, font_size)
+            })
     }
 
     /// Returns the left side bearing (in design units) for a glyph.
@@ -1374,6 +1447,76 @@ fn glyph_id_from_post_table(post_data: &[u8], name: &str, _glyph_count: u32) -> 
     }
 }
 
+/// Extract a name record from a TrueType 'name' table.
+/// `name_id`: 1=family, 2=subfamily, 4=full name, 6=PostScript name
+fn name_from_table(data: &[u8], name_id: u16) -> Option<String> {
+    if data.len() < 6 {
+        return None;
+    }
+    let count = u16::from_be_bytes([data[2], data[3]]) as usize;
+    let string_offset = u16::from_be_bytes([data[4], data[5]]) as usize;
+
+    let mut best: Option<((u8, u8), String)> = None;
+    for i in 0..count {
+        let record_offset = 6 + i * 12;
+        if data.len() < record_offset + 12 {
+            break;
+        }
+        let platform_id = u16::from_be_bytes([data[record_offset], data[record_offset + 1]]);
+        let encoding_id = u16::from_be_bytes([data[record_offset + 2], data[record_offset + 3]]);
+        let language_id = u16::from_be_bytes([data[record_offset + 4], data[record_offset + 5]]);
+        let nid = u16::from_be_bytes([data[record_offset + 6], data[record_offset + 7]]);
+        let length =
+            u16::from_be_bytes([data[record_offset + 8], data[record_offset + 9]]) as usize;
+        let offset =
+            u16::from_be_bytes([data[record_offset + 10], data[record_offset + 11]]) as usize;
+
+        if nid != name_id {
+            continue;
+        }
+
+        let str_start = string_offset + offset;
+        if str_start + length > data.len() {
+            continue;
+        }
+
+        let raw = &data[str_start..str_start + length];
+
+        // OpenType Unicode and Windows names are UTF-16BE, including
+        // Windows full-repertoire (10) and symbol (0) encodings.
+        // https://learn.microsoft.com/en-us/typography/opentype/spec/name
+        let (decoded, unicode) =
+            if platform_id == 0 || (platform_id == 3 && matches!(encoding_id, 0 | 1 | 10)) {
+                if raw.len() % 2 != 0 {
+                    continue;
+                }
+                let chars: Vec<u16> = raw
+                    .chunks_exact(2)
+                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .collect();
+                (String::from_utf16(&chars).ok(), true)
+            } else if platform_id == 1 && encoding_id == 0 {
+                (
+                    Some(encoding_rs::MACINTOSH.decode(raw).0.into_owned()),
+                    false,
+                )
+            } else {
+                continue;
+            };
+        let Some(decoded) = decoded.filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        let rank = (
+            u8::from(!matches!(language_id, 0 | 0x0409)),
+            u8::from(!unicode),
+        );
+        if best.as_ref().is_none_or(|(previous, _)| rank < *previous) {
+            best = Some((rank, decoded));
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1468,7 +1611,8 @@ mod tests {
             font.glyph_id_for_char('A' as u16),
             font.glyph_id_for_char('V' as u16),
         ];
-        let font_scale = scale(font_size);
+        // Core Text uses the same em-based size as CGFont glyph drawing.
+        let font_scale = font.em_scale(font_size);
         let first_advance = font
             .rt()
             .glyph(glyphs[0])

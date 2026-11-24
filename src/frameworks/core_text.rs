@@ -5,16 +5,9 @@
  */
 //! `CoreText.framework/CoreText`
 //!
-//! CoreText is the C-level text rendering API exposed by macOS and iOS
-//! since iOS 3.2. We don't currently implement layout/glyph metrics
-//! (apps that need full text shaping fall back to UIKit/UIFont), but
-//! many apps reference the framework's exported string constants —
-//! either as attribute keys when constructing font descriptor
-//! dictionaries (`CTFontDescriptorCreateWithAttributes`) or as
-//! attribute keys when building `CFAttributedStringRef` /
-//! `NSAttributedString` instances for `CTFramesetterCreateWithAttributedString`
-//! and friends — purely for `isEqual:` comparisons against keys
-//! returned by the system.
+//! CoreText provides font discovery, descriptors, glyph metrics and drawing,
+//! and attributed-string layout. Complex shaping and multiple attribute runs
+//! are not yet supported by the simple layout engine below.
 //!
 //! Per Apple's `CTFontDescriptor.h`, `CTFont.h`, `CTFontTraits.h` and
 //! `CTStringAttributes.h` headers these are `CFStringRef` constants
@@ -35,16 +28,20 @@
 
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant, HostDylib};
 use crate::font::{Font, TextAlignment, WrapMode};
-use rusttype::GlyphId;
-use crate::frameworks::core_foundation::{cf_array::CFArrayRef, cf_type::CFTypeRef, CFIndex, CFRange};
 use crate::frameworks::core_foundation::cf_attributed_string::CFAttributedStringRef;
 use crate::frameworks::core_foundation::cf_string::CFStringRef;
-use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
+use crate::frameworks::core_foundation::{
+    cf_array::CFArrayRef, cf_type::CFTypeRef, CFIndex, CFRange,
+};
+use crate::frameworks::core_graphics::cg_affine_transform::{
+    CGAffineTransform, CGAffineTransformIdentity,
+};
 use crate::frameworks::core_graphics::cg_bitmap_context::{
     CGBitmapContextDrawer, CGBitmapContextGetHeight,
 };
 use crate::frameworks::core_graphics::cg_context::{
     CGContextConcatCTM, CGContextGetCTM, CGContextRestoreGState, CGContextSaveGState,
+    CGContextSetFont, CGContextSetFontSize, CGContextSetTextMatrix, CGContextShowGlyphsAtPoint,
 };
 use crate::frameworks::core_graphics::cg_font::{
     cg_font_with_font, data_provider_font, CGFontCreateWithFontName, CGFontRef, CGGlyph,
@@ -56,7 +53,7 @@ use crate::frameworks::uikit::ui_font::{
     custom_font_of_uifont, draw_font_glyph, font_for_text, font_from_uifont, is_uifont,
     new_uifont_with_custom_font, new_uifont_with_name,
 };
-use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, Ptr};
+use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
 };
@@ -92,12 +89,17 @@ pub type CTFrameRef = crate::objc::id;
 #[derive(Clone, Default)]
 struct CTFontDescriptorHostObject {
     attrs: id,
+    /// A descriptor copied from a font retains its face even if an
+    /// application subsequently unregisters the font's PostScript name.
+    face: Option<Font>,
 }
 impl HostObject for CTFontDescriptorHostObject {}
 
 #[derive(Clone, Default)]
 struct CTFontHostObject {
     font: id,
+    matrix: Option<CGAffineTransform>,
+    attributes: id,
 }
 impl HostObject for CTFontHostObject {}
 
@@ -112,6 +114,7 @@ struct CTLineHostObject {
     text: id,
     font: id,
     attributes: id,
+    string_range: CFRange,
     /// Buffers handed out by `CTRunGetGlyphsPtr` / `CTRunGetPositionsPtr`,
     /// which must stay valid for as long as the run exists.
     glyphs_ptr: MutPtr<CGGlyph>,
@@ -144,18 +147,26 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @implementation _touchHLE_CTFontDescriptor: NSObject
 - (())dealloc {
+    let attrs = env.objc.borrow::<CTFontDescriptorHostObject>(this).attrs;
+    release(env, attrs);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
 
 @implementation _touchHLE_CTFont: NSObject
 - (())dealloc {
+    let host = env.objc.borrow::<CTFontHostObject>(this);
+    let (font, attributes) = (host.font, host.attributes);
+    release(env, font);
+    release(env, attributes);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
 
 @implementation _touchHLE_CTTypesetter: NSObject
 - (())dealloc {
+    let string = env.objc.borrow::<CTTypesetterHostObject>(this).attr_string;
+    release(env, string);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
@@ -177,12 +188,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @implementation _touchHLE_CTFramesetter: NSObject
 - (())dealloc {
+    let string = env.objc.borrow::<CTFramesetterHostObject>(this).attr_string;
+    release(env, string);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
 
 @implementation _touchHLE_CTFrame: NSObject
 - (())dealloc {
+    let line = env.objc.borrow::<CTFrameHostObject>(this).line;
+    release(env, line);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
@@ -195,15 +210,22 @@ fn alloc_descriptor(env: &mut Environment, attrs: id) -> CTFontDescriptorRef {
         .get_known_class("_touchHLE_CTFontDescriptor", &mut env.mem);
     env.objc.alloc_object(
         class,
-        Box::new(CTFontDescriptorHostObject { attrs }),
+        Box::new(CTFontDescriptorHostObject { attrs, face: None }),
         &mut env.mem,
     )
 }
 
 fn alloc_font(env: &mut Environment, font: id) -> CTFontRef {
     let class = env.objc.get_known_class("_touchHLE_CTFont", &mut env.mem);
-    env.objc
-        .alloc_object(class, Box::new(CTFontHostObject { font }), &mut env.mem)
+    env.objc.alloc_object(
+        class,
+        Box::new(CTFontHostObject {
+            font,
+            matrix: None,
+            attributes: nil,
+        }),
+        &mut env.mem,
+    )
 }
 
 fn alloc_typesetter(env: &mut Environment, attr_string: id) -> CTTypesetterRef {
@@ -218,6 +240,7 @@ fn alloc_typesetter(env: &mut Environment, attr_string: id) -> CTTypesetterRef {
 }
 
 fn alloc_line(env: &mut Environment, text: id, font: id, attributes: id) -> CTLineRef {
+    let length: NSUInteger = msg![env; text length];
     let class = env.objc.get_known_class("_touchHLE_CTLine", &mut env.mem);
     env.objc.alloc_object(
         class,
@@ -225,6 +248,10 @@ fn alloc_line(env: &mut Environment, text: id, font: id, attributes: id) -> CTLi
             text,
             font,
             attributes,
+            string_range: CFRange {
+                location: 0,
+                length: length as CFIndex,
+            },
             glyphs_ptr: Ptr::null(),
             positions_ptr: Ptr::null(),
         }),
@@ -263,6 +290,9 @@ fn font_from_descriptor(
     descriptor: CTFontDescriptorRef,
     size: CGFloat,
 ) -> id {
+    if descriptor == nil {
+        return msg_class![env; UIFont systemFontOfSize:(if size > 0.0 { size } else { 12.0 })];
+    }
     let attrs = descriptor_attrs(env, descriptor);
     if attrs == nil {
         return msg_class![env; UIFont systemFontOfSize:size];
@@ -285,7 +315,7 @@ fn font_from_descriptor(
                 "Courier New" => get_static_str(env, "CourierNewPSMT"),
                 "Helvetica" => get_static_str(env, "Helvetica"),
                 "Times New Roman" => get_static_str(env, "TimesNewRomanPSMT"),
-                _ => nil,
+                _ => family,
             };
         }
     }
@@ -299,6 +329,14 @@ fn font_from_descriptor(
             12.0
         }
     };
+    if let Some(face) = env
+        .objc
+        .borrow::<CTFontDescriptorHostObject>(descriptor)
+        .face
+        .clone()
+    {
+        return new_uifont_with_custom_font(env, face, font_size);
+    }
     if name == nil {
         msg_class![env; UIFont systemFontOfSize:font_size]
     } else {
@@ -361,7 +399,7 @@ fn CTFontDescriptorCreateWithAttributes(
     } else {
         attributes
     };
-    retain(env, attrs);
+    let attrs: id = msg![env; attrs copy];
     alloc_descriptor(env, attrs)
 }
 
@@ -389,35 +427,107 @@ fn CTFontDescriptorCreateWithNameAndSize(
     CTFontDescriptorCreateWithAttributes(env, attributes)
 }
 
-/// `CTFontDescriptorCreateMatchingFontDescriptors` — returns descriptors
-/// matching the given one under `attributes` (a set of mandatory keys).
-/// touchHLE's font stack only exposes the built-in system fonts, so no
-/// additional descriptors can ever match: return an empty (non-null)
-/// CFArray, which is what a real system returns when nothing matches.
-/// Returning NULL here makes some engines treat Core Text as broken and
-/// abort font fallback entirely.
+/// Registered fonts participate in descriptor matching alongside system
+/// fonts. Mandatory keys must match exactly; optional keys choose the face.
+/// https://developer.apple.com/documentation/coretext/ctfontdescriptorcreatematchingfontdescriptors(_:_:)
 fn CTFontDescriptorCreateMatchingFontDescriptors(
     env: &mut Environment,
-    _descriptor: CTFontDescriptorRef,
-    _attributes: CFTypeRef, // CFSetRef of mandatory attribute keys
+    descriptor: CTFontDescriptorRef,
+    attributes: CFTypeRef, // CFSetRef of mandatory attribute keys
 ) -> CFArrayRef {
-    let empty: CFArrayRef = msg_class![env; NSArray array];
-    retain(env, empty);
-    empty
+    if descriptor == nil {
+        return nil;
+    }
+    let requested = descriptor_attrs(env, descriptor);
+    let name_key = get_static_str(env, "NSFontNameAttribute");
+    let family_key = get_static_str(env, "NSFontFamilyAttribute");
+    let requested_name: id = msg![env; requested objectForKey:name_key];
+    let requested_family: id = msg![env; requested objectForKey:family_key];
+    let mandatory: id = msg![env; attributes allObjects];
+    let mandatory_count: NSUInteger = msg![env; mandatory count];
+    let families: id = msg_class![env; UIFont familyNames];
+    let family_count: NSUInteger = msg![env; families count];
+    let results: id = msg_class![env; NSMutableArray new];
+    for family_index in 0..family_count {
+        let family: id = msg![env; families objectAtIndex:family_index];
+        if requested_family != nil && !msg![env; family isEqual:requested_family] {
+            continue;
+        }
+        let names: id = msg_class![env; UIFont fontNamesForFamilyName:family];
+        let name_count: NSUInteger = msg![env; names count];
+        for name_index in 0..name_count {
+            let name: id = msg![env; names objectAtIndex:name_index];
+            if requested_name != nil && !msg![env; name isEqual:requested_name] {
+                continue;
+            }
+            let candidate_attrs: id = if requested == nil {
+                msg_class![env; NSMutableDictionary new]
+            } else {
+                msg![env; requested mutableCopy]
+            };
+            () = msg![env; candidate_attrs setObject:name forKey:name_key];
+            () = msg![env; candidate_attrs setObject:family forKey:family_key];
+            let candidate = CTFontDescriptorCreateWithAttributes(env, candidate_attrs);
+            release(env, candidate_attrs);
+            let font = CTFontCreateWithFontDescriptor(env, candidate, 0.0, Ptr::null());
+            release(env, candidate);
+            let normalized = CTFontCopyFontDescriptor(env, font);
+            release(env, font);
+            let mut matches = true;
+            for index in 0..mandatory_count {
+                let key: id = msg![env; mandatory objectAtIndex:index];
+                let expected: id = msg![env; requested objectForKey:key];
+                let actual = CTFontDescriptorCopyAttribute(env, normalized, key);
+                let same =
+                    expected == actual || (expected != nil && msg![env; expected isEqual:actual]);
+                release(env, actual);
+                if !same {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                () = msg![env; results addObject:normalized];
+            }
+            release(env, normalized);
+        }
+    }
+    let count: NSUInteger = msg![env; results count];
+    if count == 0 && mandatory_count == 0 {
+        let font = CTFontCreateWithFontDescriptor(env, descriptor, 0.0, Ptr::null());
+        let normalized = CTFontCopyFontDescriptor(env, font);
+        release(env, font);
+        if normalized != nil {
+            () = msg![env; results addObject:normalized];
+            release(env, normalized);
+        }
+    }
+    let immutable: id = msg![env; results copy];
+    release(env, results);
+    immutable
 }
 
 /// `CTFontDescriptorCreateMatchingFontDescriptor` — the single best match
-/// for a descriptor. Every name falls back to one of the bundled fonts (see
-/// [CTFontDescriptorCopyAttribute]), so the descriptor matches itself.
+/// for a descriptor, using the same matching and registration rules.
 fn CTFontDescriptorCreateMatchingFontDescriptor(
     env: &mut Environment,
     descriptor: CTFontDescriptorRef,
-    _mandatory_attributes: CFTypeRef, // CFSetRef of attribute keys
+    mandatory_attributes: CFTypeRef, // CFSetRef of attribute keys
 ) -> CTFontDescriptorRef {
     if descriptor == nil {
         return nil;
     }
-    retain(env, descriptor)
+    let matches =
+        CTFontDescriptorCreateMatchingFontDescriptors(env, descriptor, mandatory_attributes);
+    let count: NSUInteger = msg![env; matches count];
+    let matched: id = if count == 0 {
+        nil
+    } else {
+        msg![env; matches objectAtIndex:(0 as NSUInteger)]
+    };
+    retain(env, matched);
+    release(env, matches);
+    matched
 }
 
 /// The file in `/System/Library/Fonts/Cache` (see `fs.rs`) that stands in for
@@ -512,18 +622,25 @@ fn CTFontCreateWithFontDescriptor(
     env: &mut Environment,
     descriptor: CTFontDescriptorRef,
     size: CGFloat,
-    _matrix: ConstVoidPtr,
+    matrix: ConstVoidPtr,
 ) -> CTFontRef {
     let font = font_from_descriptor(env, descriptor, size);
     retain(env, font);
-    alloc_font(env, font)
+    let font = alloc_font(env, font);
+    let attrs = if descriptor == nil {
+        nil
+    } else {
+        descriptor_attrs(env, descriptor)
+    };
+    set_font_matrix(env, font, matrix, attrs);
+    font
 }
 
 fn CTFontCreateWithName(
     env: &mut Environment,
     name: id,
     size: CGFloat,
-    _matrix: ConstVoidPtr,
+    matrix: ConstVoidPtr,
 ) -> CTFontRef {
     if name.is_null() {
         return nil;
@@ -532,7 +649,9 @@ fn CTFontCreateWithName(
     let name = to_rust_string(env, name).into_owned();
     let font = new_uifont_with_name(env, &name, size);
     retain(env, font);
-    alloc_font(env, font)
+    let font = alloc_font(env, font);
+    set_font_matrix(env, font, matrix, nil);
+    font
 }
 
 /// Resolve a `CTFontRef` to the `UIFont` backing it. Also accepts a bare
@@ -562,14 +681,13 @@ fn ui_font_for_ct_font(env: &mut Environment, font: CTFontRef) -> id {
 ///
 /// The original font's name is kept unless `attributes` carries a font name
 /// or family of its own, in which case those win (descriptor attributes
-/// override the original font's, as on iOS). Like the other CTFont
-/// constructors here the transform matrix is not applied: touchHLE's text
-/// renderer only supports untransformed fonts.
+/// override the original font's, as on iOS). An unspecified matrix preserves
+/// the original font's transform.
 fn CTFontCreateCopyWithAttributes(
     env: &mut Environment,
     font: CTFontRef,
     size: CGFloat,
-    _matrix: ConstPtr<CGAffineTransform>,
+    matrix: ConstPtr<CGAffineTransform>,
     attributes: CTFontDescriptorRef,
 ) -> CTFontRef {
     let original = ui_font_for_ct_font(env, font);
@@ -582,32 +700,36 @@ fn CTFontCreateCopyWithAttributes(
         msg![env; original pointSize]
     };
 
-    let overrides_face = attributes != nil && {
-        let attrs = descriptor_attrs(env, attributes);
-        attrs != nil && {
-            let name_key = get_static_str(env, "NSFontNameAttribute");
-            let family_key = get_static_str(env, "NSFontFamilyAttribute");
-            let by_name: id = msg![env; attrs objectForKey:name_key];
-            let by_family: id = msg![env; attrs objectForKey:family_key];
-            by_name != nil || by_family != nil
-        }
-    };
-
-    let new_font: id = if overrides_face {
-        font_from_descriptor(env, attributes, size)
+    let descriptor = CTFontCopyFontDescriptor(env, font);
+    let overrides = if attributes == nil {
+        nil
     } else {
-        msg![env; original fontWithSize:size]
+        descriptor_attrs(env, attributes)
     };
-    let new_font = if new_font == nil { original } else { new_font };
-    retain(env, new_font);
-    alloc_font(env, new_font)
+    let merged = CTFontDescriptorCreateCopyWithAttributes(env, descriptor, overrides);
+    release(env, descriptor);
+    let saved_matrix = if matrix.is_null() {
+        let value = CTFontGetMatrix(env, font);
+        env.mem.alloc_and_write(value)
+    } else {
+        Ptr::null()
+    };
+    let matrix = if matrix.is_null() {
+        saved_matrix.cast_const()
+    } else {
+        matrix
+    };
+    let copy = CTFontCreateWithFontDescriptor(env, merged, size, matrix.cast());
+    env.mem.free(saved_matrix.cast());
+    release(env, merged);
+    copy
 }
 
 fn CTFontGetSize(env: &mut Environment, font: CTFontRef) -> CGFloat {
     if font.is_null() {
         return 0.0;
     }
-    let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
+    let ui_font = ui_font_for_ct_font(env, font);
     if ui_font == nil {
         return 0.0;
     }
@@ -618,45 +740,303 @@ fn CTFontCopyPostScriptName(env: &mut Environment, font: CTFontRef) -> id {
     if font.is_null() {
         return nil;
     }
-    let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
+    let ui_font = ui_font_for_ct_font(env, font);
     if ui_font == nil {
         return nil;
     }
     let name: id = msg![env; ui_font fontName];
-    if name == nil { nil } else { retain(env, name) }
+    if name == nil {
+        nil
+    } else {
+        retain(env, name)
+    }
+}
+
+/// Font-name accessors are Copy operations and return owned strings.
+/// https://developer.apple.com/documentation/coretext/ctfontcopyfamilyname(_:)
+fn CTFontCopyFamilyName(env: &mut Environment, font: CTFontRef) -> id {
+    let font = ui_font_for_ct_font(env, font);
+    if font == nil {
+        return nil;
+    }
+    let name: id = msg![env; font familyName];
+    if name == nil {
+        nil
+    } else {
+        retain(env, name)
+    }
+}
+
+fn CTFontCopyFullName(env: &mut Environment, font: CTFontRef) -> id {
+    let font = ui_font_for_ct_font(env, font);
+    if font == nil {
+        return nil;
+    }
+    if let Some(name) = custom_font_of_uifont(env, font).and_then(|f| f.name(4)) {
+        return from_rust_string(env, name);
+    }
+    let name: id = msg![env; font fontName];
+    if name == nil {
+        nil
+    } else {
+        retain(env, name)
+    }
+}
+
+fn CTFontGetSymbolicTraits(env: &mut Environment, font: CTFontRef) -> u32 {
+    let ui = ui_font_for_ct_font(env, font);
+    font_from_uifont(env, ui).map_or(0, |face| face.symbolic_traits())
+}
+
+fn CTFontGetMatrix(env: &mut Environment, font: CTFontRef) -> CGAffineTransform {
+    if font == nil || is_uifont(env, font) {
+        return CGAffineTransformIdentity;
+    }
+    env.objc
+        .borrow::<CTFontHostObject>(font)
+        .matrix
+        .unwrap_or(CGAffineTransformIdentity)
+}
+
+fn matrix_from_attributes(env: &mut Environment, attrs: id) -> Option<CGAffineTransform> {
+    if attrs == nil {
+        return None;
+    }
+    let key = get_static_str(env, "NSCTFontMatrixAttribute");
+    let data: id = msg![env; attrs objectForKey:key];
+    if data == nil {
+        return None;
+    }
+    let bytes = crate::frameworks::foundation::ns_data::to_rust_slice(env, data);
+    if bytes.len() < 24 {
+        return None;
+    }
+    let values: Vec<f32> = bytes[..24]
+        .chunks_exact(4)
+        .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+        .collect();
+    Some(CGAffineTransform {
+        a: values[0],
+        b: values[1],
+        c: values[2],
+        d: values[3],
+        tx: 0.0,
+        ty: 0.0,
+    })
+}
+
+fn set_font_matrix(env: &mut Environment, font: id, matrix: ConstVoidPtr, attrs: id) {
+    let value = if matrix.is_null() {
+        matrix_from_attributes(env, attrs)
+    } else {
+        Some(env.mem.read(matrix.cast()))
+    };
+    retain(env, attrs);
+    let old = env.objc.borrow::<CTFontHostObject>(font).attributes;
+    release(env, old);
+    let host = env.objc.borrow_mut::<CTFontHostObject>(font);
+    host.matrix = value;
+    host.attributes = attrs;
+}
+
+/// The normalized descriptor keeps the face, name, size, and matrix needed
+/// to recreate a font. Copying/augmenting it must not substitute a system face.
+/// https://developer.apple.com/documentation/coretext/ctfontcopyfontdescriptor(_:)
+fn CTFontCopyFontDescriptor(env: &mut Environment, font: CTFontRef) -> CTFontDescriptorRef {
+    let ui = ui_font_for_ct_font(env, font);
+    if ui == nil {
+        return nil;
+    }
+    let original_attrs = if is_uifont(env, font) {
+        nil
+    } else {
+        env.objc.borrow::<CTFontHostObject>(font).attributes
+    };
+    let attrs: id = if original_attrs == nil {
+        msg_class![env; NSMutableDictionary new]
+    } else {
+        msg![env; original_attrs mutableCopy]
+    };
+    let name_key = get_static_str(env, "NSFontNameAttribute");
+    let family_key = get_static_str(env, "NSFontFamilyAttribute");
+    let size_key = get_static_str(env, "NSFontSizeAttribute");
+    let name: id = msg![env; ui fontName];
+    let family: id = msg![env; ui familyName];
+    let size: CGFloat = msg![env; ui pointSize];
+    let number: id = msg_class![env; NSNumber numberWithFloat:size];
+    () = msg![env; attrs setObject:name forKey:name_key];
+    () = msg![env; attrs setObject:family forKey:family_key];
+    () = msg![env; attrs setObject:number forKey:size_key];
+    let traits_key = get_static_str(env, "NSCTFontTraitsAttribute");
+    let symbolic_key = get_static_str(env, "NSCTFontSymbolicTrait");
+    let symbolic = CTFontGetSymbolicTraits(env, font);
+    let symbolic: id = msg_class![env; NSNumber numberWithUnsignedInt:symbolic];
+    let old_traits: id = msg![env; attrs objectForKey:traits_key];
+    let traits: id = if old_traits == nil {
+        msg_class![env; NSMutableDictionary new]
+    } else {
+        msg![env; old_traits mutableCopy]
+    };
+    () = msg![env; traits setObject:symbolic forKey:symbolic_key];
+    let immutable_traits: id = msg![env; traits copy];
+    () = msg![env; attrs setObject:immutable_traits forKey:traits_key];
+    release(env, immutable_traits);
+    release(env, traits);
+    let matrix = CTFontGetMatrix(env, font);
+    let bytes = env.mem.alloc_and_write(matrix);
+    let data = crate::frameworks::core_foundation::cf_data::CFDataCreate(
+        env,
+        crate::frameworks::core_foundation::cf_allocator::kCFAllocatorDefault,
+        bytes.cast_const().cast(),
+        24,
+    );
+    env.mem.free(bytes);
+    let matrix_key = get_static_str(env, "NSCTFontMatrixAttribute");
+    () = msg![env; attrs setObject:data forKey:matrix_key];
+    release(env, data);
+    let immutable: id = msg![env; attrs copy];
+    release(env, attrs);
+    let face = custom_font_of_uifont(env, ui);
+    let descriptor = alloc_descriptor(env, immutable);
+    env.objc
+        .borrow_mut::<CTFontDescriptorHostObject>(descriptor)
+        .face = face;
+    descriptor
+}
+
+/// https://developer.apple.com/documentation/coretext/ctfontdescriptorcreatecopywithattributes(_:_:)
+fn CTFontDescriptorCreateCopyWithAttributes(
+    env: &mut Environment,
+    original: CTFontDescriptorRef,
+    overrides: id,
+) -> CTFontDescriptorRef {
+    if original == nil {
+        return nil;
+    }
+    let attrs = descriptor_attrs(env, original);
+    let merged: id = if attrs == nil {
+        msg_class![env; NSMutableDictionary new]
+    } else {
+        msg![env; attrs mutableCopy]
+    };
+    if overrides != nil {
+        () = msg![env; merged addEntriesFromDictionary:overrides];
+    }
+    // CTFontDescriptor.h specifies merging these two attributes instead of
+    // replacing them. Variation values are keyed by axis, feature settings
+    // are an array of dictionaries (later settings override earlier ones).
+    if overrides != nil {
+        for (key, dictionary) in [
+            ("NSCTFontVariationAttribute", true),
+            ("NSCTFontFeatureSettingsAttribute", false),
+        ] {
+            let key = get_static_str(env, key);
+            let old: id = msg![env; attrs objectForKey:key];
+            let new: id = msg![env; overrides objectForKey:key];
+            if old == nil || new == nil {
+                continue;
+            }
+            let combined: id = msg![env; old mutableCopy];
+            if dictionary {
+                () = msg![env; combined addEntriesFromDictionary:new];
+            } else {
+                () = msg![env; combined addObjectsFromArray:new];
+            }
+            let immutable: id = msg![env; combined copy];
+            () = msg![env; merged setObject:immutable forKey:key];
+            release(env, immutable);
+            release(env, combined);
+        }
+    }
+    let mut face = env
+        .objc
+        .borrow::<CTFontDescriptorHostObject>(original)
+        .face
+        .clone();
+    if overrides != nil {
+        for key in ["NSFontNameAttribute", "NSFontFamilyAttribute"] {
+            let key = get_static_str(env, key);
+            let new: id = msg![env; overrides objectForKey:key];
+            let old: id = msg![env; attrs objectForKey:key];
+            let equal: bool = msg![env; new isEqual:old];
+            if new != nil && !equal {
+                face = None;
+                let family_key = get_static_str(env, "NSFontFamilyAttribute");
+                if key == family_key {
+                    let name_key = get_static_str(env, "NSFontNameAttribute");
+                    let new_name: id = msg![env; overrides objectForKey:name_key];
+                    if new_name == nil {
+                        () = msg![env; merged removeObjectForKey:name_key];
+                    }
+                }
+            }
+        }
+    }
+    let attrs: id = msg![env; merged copy];
+    release(env, merged);
+    let descriptor = alloc_descriptor(env, attrs);
+    env.objc
+        .borrow_mut::<CTFontDescriptorHostObject>(descriptor)
+        .face = face;
+    descriptor
+}
+
+/// Draw the supplied glyph IDs at user-space positions using their actual
+/// font. As documented by Apple, the font/size/matrix updates are not restored.
+/// https://developer.apple.com/documentation/coretext/ctfontdrawglyphs(_:_:_:_:_:)
+fn CTFontDrawGlyphs(
+    env: &mut Environment,
+    font: CTFontRef,
+    glyphs: ConstPtr<CGGlyph>,
+    positions: ConstPtr<CGPoint>,
+    count: GuestUSize,
+    context: id,
+) {
+    if font == nil || context == nil || glyphs.is_null() || positions.is_null() || count == 0 {
+        return;
+    }
+    let ui = ui_font_for_ct_font(env, font);
+    let Some(face) = font_from_uifont(env, ui) else {
+        return;
+    };
+    let size: CGFloat = msg![env; ui pointSize];
+    let graphics = cg_font_with_font(env, face);
+    CGContextSetFont(env, context, graphics);
+    release(env, graphics);
+    CGContextSetFontSize(env, context, size);
+    if !is_uifont(env, font) {
+        if let Some(matrix) = env.objc.borrow::<CTFontHostObject>(font).matrix {
+            CGContextSetTextMatrix(env, context, matrix);
+        }
+    }
+    for i in 0..count {
+        let point = env.mem.read(positions + i);
+        CGContextShowGlyphsAtPoint(env, context, point.x, point.y, glyphs + i, 1);
+    }
 }
 
 fn CTFontGetAscent(env: &mut Environment, font: CTFontRef) -> CGFloat {
-    if font.is_null() {
+    let ui = ui_font_for_ct_font(env, font);
+    let Some(face) = font_from_uifont(env, ui) else {
         return 0.0;
-    }
-    let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
-    if ui_font == nil {
-        return 0.0;
-    }
-    msg![env; ui_font ascender]
+    };
+    face.design_v_metrics().0 * CTFontGetSize(env, font) / f32::from(face.units_per_em())
 }
 
 fn CTFontGetDescent(env: &mut Environment, font: CTFontRef) -> CGFloat {
-    if font.is_null() {
+    let ui = ui_font_for_ct_font(env, font);
+    let Some(face) = font_from_uifont(env, ui) else {
         return 0.0;
-    }
-    let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
-    if ui_font == nil {
-        return 0.0;
-    }
-    -msg![env; ui_font descender]
+    };
+    -face.design_v_metrics().1 * CTFontGetSize(env, font) / f32::from(face.units_per_em())
 }
 
 fn CTFontGetLeading(env: &mut Environment, font: CTFontRef) -> CGFloat {
-    if font.is_null() {
+    let ui = ui_font_for_ct_font(env, font);
+    let Some(face) = font_from_uifont(env, ui) else {
         return 0.0;
-    }
-    let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
-    if ui_font == nil {
-        return 0.0;
-    }
-    msg![env; ui_font leading]
+    };
+    face.design_v_metrics().2 * CTFontGetSize(env, font) / f32::from(face.units_per_em())
 }
 
 /// `uint32_t CTGetCoreTextVersion(void)`
@@ -684,20 +1064,59 @@ fn CTTypesetterCreateWithAttributedString(
 fn CTTypesetterCreateLine(
     env: &mut Environment,
     typesetter: CTTypesetterRef,
-    _range: NSRange,
+    range: CFRange,
 ) -> CTLineRef {
-    if typesetter.is_null() {
+    if typesetter == nil || range.location < 0 || range.length < 0 {
         return nil;
     }
     let attr_string = env
         .objc
         .borrow::<CTTypesetterHostObject>(typesetter)
         .attr_string;
-    let (text, font, attributes) = string_and_font_from_attr_string(env, attr_string);
-    retain(env, text);
+    let (text, _, _) = string_and_font_from_attr_string(env, attr_string);
+    if text == nil {
+        return nil;
+    }
+    let total: NSUInteger = msg![env; text length];
+    let start = range.location as NSUInteger;
+    if start > total {
+        return nil;
+    }
+    let length = if range.length == 0 {
+        total - start
+    } else {
+        range.length as NSUInteger
+    };
+    if length > total - start {
+        return nil;
+    }
+    let (_, attributes) = if start < total {
+        let range_ptr: MutPtr<NSRange> = Ptr::null();
+        (
+            text,
+            msg![env; attr_string attributesAtIndex:start effectiveRange:range_ptr],
+        )
+    } else {
+        (text, nil)
+    };
+    let font_key = get_static_str(env, "NSFont");
+    let specified: id = msg![env; attributes objectForKey:font_key];
+    let font = ui_font_for_ct_font(env, specified);
+    let font = if font == nil {
+        msg_class![env; UIFont systemFontOfSize:12.0]
+    } else {
+        font
+    };
+    let substring: id = msg![env; text substringWithRange:(NSRange { location: start, length })];
+    retain(env, substring);
     retain(env, font);
     retain(env, attributes);
-    alloc_line(env, text, font, attributes)
+    let line = alloc_line(env, substring, font, attributes);
+    env.objc.borrow_mut::<CTLineHostObject>(line).string_range = CFRange {
+        location: range.location,
+        length: length as CFIndex,
+    };
+    line
 }
 
 fn CTLineCreateWithAttributedString(
@@ -723,39 +1142,124 @@ fn CTLineCreateWithAttributedString(
 /// Metrics come from the same font measurement `CTLineGetTypographicBounds`
 /// uses.
 /// <https://developer.apple.com/documentation/coretext/1509556-cttypesettersuggestclusterbreak>
-fn CTTypesetterSuggestClusterBreak(
+fn text_break(
+    font: &Font,
+    size: f32,
+    text: &str,
+    start: CFIndex,
+    width: f64,
+    words: bool,
+) -> CFIndex {
+    use unicode_segmentation::UnicodeSegmentation;
+    if start < 0 || width.is_nan() || width <= 0.0 {
+        return 0;
+    }
+    let mut units = 0;
+    let mut byte_start = text.len();
+    for (byte, ch) in text.char_indices() {
+        if units == start {
+            byte_start = byte;
+            break;
+        }
+        units += ch.len_utf16() as CFIndex;
+        if units > start {
+            return 0;
+        } // do not split a UTF-16 surrogate pair
+    }
+    let text = &text[byte_start..];
+    let opportunities: std::collections::HashMap<usize, unicode_linebreak::BreakOpportunity> =
+        unicode_linebreak::linebreaks(text).collect();
+    let mut fitted = 0;
+    let mut allowed = 0;
+    for (offset, cluster) in text.grapheme_indices(true) {
+        let end = offset + cluster.len();
+        if cluster.contains(['\n', '\r', '\u{0085}', '\u{2028}', '\u{2029}']) {
+            return text[..end].encode_utf16().count() as CFIndex;
+        }
+        let glyphs: Vec<GlyphId> = text[..end]
+            .chars()
+            .map(|ch| font.glyph_id_for_unicode(ch))
+            .collect();
+        let positions = font.glyph_positions_at_size(size, &glyphs);
+        let measured = positions
+            .last()
+            .zip(glyphs.last())
+            .map_or(0.0, |(x, g)| x + font.glyph_advance_at_size(*g, size));
+        if f64::from(measured) > width && fitted != 0 {
+            let end = if words && allowed != 0 {
+                allowed
+            } else {
+                fitted
+            };
+            return text[..end].encode_utf16().count() as CFIndex;
+        }
+        fitted = end;
+        if opportunities.contains_key(&end) {
+            allowed = end;
+        }
+    }
+    text[..fitted].encode_utf16().count() as CFIndex
+}
+
+fn suggest_break(
     env: &mut Environment,
     typesetter: CTTypesetterRef,
-    start_index: CFIndex,
+    start: CFIndex,
     width: f64,
+    offset: f64,
+    words: bool,
 ) -> CFIndex {
-    if typesetter.is_null() || start_index < 0 || !(width > 0.0) {
+    if typesetter == nil {
         return 0;
     }
     let attr_string = env
         .objc
         .borrow::<CTTypesetterHostObject>(typesetter)
         .attr_string;
-    let (text, font, _attributes) = string_and_font_from_attr_string(env, attr_string);
-    if text == nil || font == nil {
+    let (text, ui, _) = string_and_font_from_attr_string(env, attr_string);
+    if text == nil || ui == nil {
         return 0;
     }
-    let text_str = to_rust_string(env, text).into_owned();
-    let font_size: CGFloat = msg![env; font pointSize];
-    let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
-    let mut count = 0;
-    for (char_index, (byte_offset, ch)) in text_str.char_indices().enumerate() {
-        if char_index < start_index as usize {
-            continue;
-        }
-        let candidate_end = byte_offset + ch.len_utf8();
-        let measured = font_obj.calculate_text_size(font_size, &text_str[..candidate_end], None).0;
-        if measured > width as f32 && count > 0 {
-            break;
-        }
-        count += 1;
-    }
-    count as CFIndex
+    let text = to_rust_string(env, text).into_owned();
+    let size: CGFloat = msg![env; ui pointSize];
+    let font = font_for_text(env, ui, &text).unwrap_or_else(Font::sans_regular);
+    text_break(&font, size, &text, start, width - offset, words)
+}
+
+/// https://developer.apple.com/documentation/coretext/cttypesettersuggestlinebreak(_:_:_:)
+fn CTTypesetterSuggestLineBreak(
+    env: &mut Environment,
+    typesetter: CTTypesetterRef,
+    start: CFIndex,
+    width: f64,
+) -> CFIndex {
+    suggest_break(env, typesetter, start, width, 0.0, true)
+}
+fn CTTypesetterSuggestLineBreakWithOffset(
+    env: &mut Environment,
+    typesetter: CTTypesetterRef,
+    start: CFIndex,
+    width: f64,
+    offset: f64,
+) -> CFIndex {
+    suggest_break(env, typesetter, start, width, offset, true)
+}
+fn CTTypesetterSuggestClusterBreak(
+    env: &mut Environment,
+    typesetter: CTTypesetterRef,
+    start: CFIndex,
+    width: f64,
+) -> CFIndex {
+    suggest_break(env, typesetter, start, width, 0.0, false)
+}
+fn CTTypesetterSuggestClusterBreakWithOffset(
+    env: &mut Environment,
+    typesetter: CTTypesetterRef,
+    start: CFIndex,
+    width: f64,
+    offset: f64,
+) -> CFIndex {
+    suggest_break(env, typesetter, start, width, offset, false)
 }
 
 /// Longest prefix of `text` whose measured width does not exceed `budget`.
@@ -810,7 +1314,7 @@ fn CTLineCreateTruncatedLine(
     let text_str = to_rust_string(env, text).into_owned();
     let font_size: CGFloat = msg![env; font pointSize];
     let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
-    let measure = |s: &str| font_obj.calculate_text_size(font_size, s, None).0;
+    let measure = |s: &str| font_obj.text_advance_at_size(font_size, s);
     let new_text = if measure(&text_str) as f64 <= width {
         text_str
     } else {
@@ -862,29 +1366,28 @@ fn CTLineGetTypographicBounds(
     ascent: MutPtr<CGFloat>,
     descent: MutPtr<CGFloat>,
     leading: MutPtr<CGFloat>,
-) -> CGFloat {
+) -> f64 {
     if line.is_null() {
         return 0.0;
     }
     let text = line_text(env, line);
     let font = line_font(env, line);
     let size: CGFloat = msg![env; font pointSize];
-    let ascent_val: CGFloat = msg![env; font ascender];
-    let descender_val: CGFloat = msg![env; font descender];
-    let leading_val: CGFloat = msg![env; font leading];
     let text_str = to_rust_string(env, text).into_owned();
     let font_obj = font_for_text(env, font, &text_str).unwrap_or_else(Font::sans_regular);
-    let width = font_obj.calculate_text_size(size, &text_str, None).0;
+    let (ascent_val, descender_val, leading_val) = font_obj.design_v_metrics();
+    let factor = size / f32::from(font_obj.units_per_em());
+    let width = font_obj.text_advance_at_size(size, &text_str);
     if !ascent.is_null() {
-        env.mem.write(ascent, ascent_val);
+        env.mem.write(ascent, ascent_val * factor);
     }
     if !descent.is_null() {
-        env.mem.write(descent, -descender_val);
+        env.mem.write(descent, -descender_val * factor);
     }
     if !leading.is_null() {
-        env.mem.write(leading, leading_val);
+        env.mem.write(leading, leading_val * factor);
     }
-    width
+    f64::from(width)
 }
 
 fn CTLineGetImageBounds(env: &mut Environment, line: CTLineRef, _context: id) -> CGRect {
@@ -956,8 +1459,8 @@ fn CTLineDraw(env: &mut Environment, line: CTLineRef, context: id) {
 ///
 /// Returns the total glyph count for the line. We map the line's text to
 /// glyphs through the backing font's cmap (one glyph per UTF-16 code unit,
-/// which matches CoreText for the simple Latin/Cyrillic text these apps lay
-/// out), so callers that size buffers off this count get a usable value.
+/// Supplementary Unicode scalars occupy two UTF-16 string indices but map
+/// to one glyph. Complex shaping is not yet handled by this layout engine.
 ///
 /// Reference: <https://developer.apple.com/documentation/coretext/1509609-ctlinegetglyphcount>
 fn CTLineGetGlyphCount(env: &mut Environment, line: CTLineRef) -> i32 {
@@ -968,8 +1471,7 @@ fn CTLineGetGlyphCount(env: &mut Environment, line: CTLineRef) -> i32 {
     if text == nil {
         return 0;
     }
-    let len: NSUInteger = msg![env; text length];
-    len as i32
+    to_rust_string(env, text).chars().count() as CFIndex
 }
 
 /// `CFArrayRef CTLineGetGlyphRuns(CTLineRef line)`
@@ -1016,8 +1518,8 @@ fn glyph_range_for_run(range: CFRange, glyph_count: CFIndex) -> Option<(u32, u32
     if start > total {
         return None;
     }
-    let length = if range.location == 0 && range.length == 0 {
-        total
+    let length = if range.length == 0 {
+        total - start
     } else {
         u32::try_from(range.length).ok()?
     };
@@ -1025,8 +1527,7 @@ fn glyph_range_for_run(range: CFRange, glyph_count: CFIndex) -> Option<(u32, u32
 }
 
 fn glyph_for_code_unit(font: &Font, code_unit: unichar) -> CGGlyph {
-    let character = char::from_u32(code_unit as u32).unwrap_or(char::REPLACEMENT_CHARACTER);
-    font.glyph_id_for_char(character as u16).0
+    char::from_u32(code_unit as u32).map_or(0, |character| font.glyph_id_for_unicode(character).0)
 }
 
 /// `void CTRunGetGlyphs(CTRunRef run, CFRange range, CGGlyph buffer[])`
@@ -1047,9 +1548,16 @@ fn CTRunGetGlyphs(env: &mut Environment, run: CTRunRef, range: CFRange, buffer: 
     };
     let text_str = to_rust_string(env, text).into_owned();
     let font = font_for_text(env, ui_font, &text_str).unwrap_or_else(Font::sans_regular);
-    for (output_index, text_index) in (start..end).enumerate() {
-        let character: unichar = msg![env; text characterAtIndex:(text_index as NSUInteger)];
-        env.mem.write(buffer + output_index as u32, glyph_for_code_unit(&font, character));
+    for (output_index, character) in text_str
+        .chars()
+        .skip(start as usize)
+        .take((end - start) as usize)
+        .enumerate()
+    {
+        env.mem.write(
+            buffer + output_index as u32,
+            font.glyph_id_for_unicode(character).0,
+        );
     }
 }
 
@@ -1135,11 +1643,10 @@ fn CTRunGetPositions(env: &mut Environment, run: CTRunRef, range: CFRange, buffe
     let text_str = to_rust_string(env, text).into_owned();
     let font = font_for_text(env, ui_font, &text_str).unwrap_or_else(Font::sans_regular);
     let size: CGFloat = msg![env; ui_font pointSize];
-    let glyphs: Vec<GlyphId> = (0..end)
-        .map(|text_index| {
-            let character: unichar = msg![env; text characterAtIndex:(text_index as NSUInteger)];
-            GlyphId(glyph_for_code_unit(&font, character))
-        })
+    let glyphs: Vec<GlyphId> = text_str
+        .chars()
+        .take(end as usize)
+        .map(|character| font.glyph_id_for_unicode(character))
         .collect();
     let positions = font.glyph_positions_at_size(size, &glyphs);
     for text_index in start..end {
@@ -1150,6 +1657,72 @@ fn CTRunGetPositions(env: &mut Environment, run: CTRunRef, range: CFRange, buffe
                 y: 0.0,
             },
         );
+    }
+}
+
+/// Run positions, advances and source indices must describe the same glyphs.
+fn CTRunGetAdvances(env: &mut Environment, run: CTRunRef, range: CFRange, buffer: MutPtr<CGSize>) {
+    if run == nil || buffer.is_null() {
+        return;
+    }
+    let (text, ui) = {
+        let host = env.objc.borrow::<CTLineHostObject>(run);
+        (host.text, host.font)
+    };
+    let count = CTRunGetGlyphCount(env, run);
+    let Some((start, end)) = glyph_range_for_run(range, count) else {
+        return;
+    };
+    let text_str = to_rust_string(env, text).into_owned();
+    let font = font_for_text(env, ui, &text_str).unwrap_or_else(Font::sans_regular);
+    let size: CGFloat = msg![env; ui pointSize];
+    let glyphs: Vec<GlyphId> = text_str
+        .chars()
+        .map(|character| font.glyph_id_for_unicode(character))
+        .collect();
+    let positions = font.glyph_positions_at_size(size, &glyphs);
+    for index in start..end {
+        let i = index as usize;
+        let advance = positions.get(i + 1).map_or_else(
+            || font.glyph_advance_at_size(glyphs[i], size),
+            |next| next - positions[i],
+        );
+        env.mem.write(
+            buffer + (index - start),
+            CGSize {
+                width: advance,
+                height: 0.0,
+            },
+        );
+    }
+}
+
+fn CTRunGetStringIndices(
+    env: &mut Environment,
+    run: CTRunRef,
+    range: CFRange,
+    buffer: MutPtr<CFIndex>,
+) {
+    if run == nil || buffer.is_null() {
+        return;
+    }
+    let count = CTRunGetGlyphCount(env, run);
+    let Some((start, end)) = glyph_range_for_run(range, count) else {
+        return;
+    };
+    let offset = env
+        .objc
+        .borrow::<CTLineHostObject>(run)
+        .string_range
+        .location;
+    let text = env.objc.borrow::<CTLineHostObject>(run).text;
+    let string = to_rust_string(env, text).into_owned();
+    let mut units = offset;
+    for (index, ch) in string.chars().enumerate().take(end as usize) {
+        if index >= start as usize {
+            env.mem.write(buffer + (index as u32 - start), units);
+        }
+        units += ch.len_utf16() as CFIndex;
     }
 }
 
@@ -1174,15 +1747,19 @@ fn CTFontGetAdvancesForGlyphs(
     if font.is_null() || glyphs.is_null() || count <= 0 {
         return 0.0;
     }
-    let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
+    let ui_font = ui_font_for_ct_font(env, font);
     let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);
     let size = CTFontGetSize(env, font);
     let mut total = 0.0f64;
     for i in 0..count as u32 {
         let glyph_id: CGGlyph = env.mem.read(glyphs + i);
-        let advance_pt = font_obj.glyph_advance_at_size(GlyphId(glyph_id), size) as f64;
+        let advance = CTFontGetMatrix(env, font).apply_to_size(CGSize {
+            width: font_obj.glyph_advance_at_size(GlyphId(glyph_id), size),
+            height: 0.0,
+        });
+        let advance_pt = advance.width as f64;
         if !advances.is_null() {
-            env.mem.write(advances + i, CGSize { width: advance_pt as CGFloat, height: 0.0 });
+            env.mem.write(advances + i, advance);
         }
         total += advance_pt;
     }
@@ -1206,17 +1783,17 @@ fn CTFontGetBoundingRectsForGlyphs(
     if font.is_null() || glyphs.is_null() || count <= 0 {
         return empty;
     }
-    let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
+    let ui_font = ui_font_for_ct_font(env, font);
     let font_obj = font_from_uifont(env, ui_font).unwrap_or_else(Font::sans_regular);
     let size = CTFontGetSize(env, font);
     let mut union: Option<CGRect> = None;
     for index in 0..count as u32 {
         let glyph = env.mem.read(glyphs + index);
         let (x, y, width, height) = font_obj.glyph_bbox_at_size(GlyphId(glyph), size);
-        let rect = CGRect {
+        let rect = CTFontGetMatrix(env, font).apply_to_rect(CGRect {
             origin: CGPoint { x, y },
             size: CGSize { width, height },
-        };
+        });
         if !bounding_rects.is_null() {
             env.mem.write(bounding_rects + index, rect);
         }
@@ -1256,24 +1833,35 @@ fn CTFontGetGlyphsForCharacters(
         return false;
     }
     // Resolve the backing UIFont, then its rasterizable Font.
-    let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
-    let mut text = String::new();
-    for index in 0..count as u32 {
-        let code_unit: unichar = env.mem.read(characters + index);
-        if let Some(character) = char::from_u32(code_unit as u32) {
-            text.push(character);
-        }
-    }
-    let font_obj = font_for_text(env, ui_font, &text).unwrap_or_else(Font::sans_regular);
+    let ui_font = ui_font_for_ct_font(env, font);
+    let Some(font_obj) = font_from_uifont(env, ui_font) else {
+        return false;
+    };
     let mut all_mapped = true;
-    for i in 0..count as u32 {
+    let mut i = 0;
+    while i < count as u32 {
         let c: unichar = env.mem.read(characters + i);
-        let glyph_id = font_obj.glyph_id_for_char(c);
+        let paired = (0xd800..=0xdbff).contains(&c) && i + 1 < count as u32 && {
+            let next: unichar = env.mem.read(characters + i + 1);
+            (0xdc00..=0xdfff).contains(&next)
+        };
+        let glyph_id = if paired {
+            let next: unichar = env.mem.read(characters + i + 1);
+            let scalar = 0x10000 + ((u32::from(c) - 0xd800) << 10) + (u32::from(next) - 0xdc00);
+            font_obj.glyph_id_for_unicode(char::from_u32(scalar).unwrap())
+        } else {
+            GlyphId(glyph_for_code_unit(&font_obj, c))
+        };
         let g = glyph_id.0;
         if g == 0 {
             all_mapped = false;
         }
         env.mem.write(glyphs + i, g);
+        if paired {
+            i += 1;
+            env.mem.write(glyphs + i, 0);
+        }
+        i += 1;
     }
     all_mapped
 }
@@ -1291,13 +1879,17 @@ fn CTFontCopyGraphicsFont(
     font: CTFontRef,
     attributes: MutPtr<CTFontDescriptorRef>,
 ) -> CGFontRef {
-    if !attributes.is_null() {
-        env.mem.write(attributes, nil);
-    }
     if font.is_null() {
+        if !attributes.is_null() {
+            env.mem.write(attributes, nil);
+        }
         return Ptr::null();
     }
-    let ui_font = env.objc.borrow::<CTFontHostObject>(font).font;
+    if !attributes.is_null() {
+        let descriptor = CTFontCopyFontDescriptor(env, font);
+        env.mem.write(attributes, descriptor);
+    }
+    let ui_font = ui_font_for_ct_font(env, font);
     if let Some(custom) = custom_font_of_uifont(env, ui_font) {
         return cg_font_with_font(env, custom);
     }
@@ -1557,8 +2149,8 @@ fn CTFontCreateWithGraphicsFont(
     env: &mut Environment,
     graphics_font: id, // CGFontRef
     size: CGFloat,
-    _matrix: ConstVoidPtr, // const CGAffineTransform*
-    _attributes: id,       // CTFontDescriptorRef
+    matrix: ConstVoidPtr, // const CGAffineTransform*
+    attributes: id,       // CTFontDescriptorRef
 ) -> CTFontRef {
     let font_size = if size > 0.0 { size } else { 12.0 };
     // Keep the typeface the CGFont was made from. Apps load their own font
@@ -1573,21 +2165,60 @@ fn CTFontCreateWithGraphicsFont(
         msg_class![env; UIFont systemFontOfSize:font_size]
     };
     retain(env, ui_font);
-    alloc_font(env, ui_font)
+    let font = alloc_font(env, ui_font);
+    let attrs = if attributes == nil {
+        nil
+    } else {
+        descriptor_attrs(env, attributes)
+    };
+    set_font_matrix(env, font, matrix, attrs);
+    font
 }
 
 /// `bool CTFontManagerRegisterGraphicsFont(CGFontRef font, CFErrorRef *error)`
 ///
 /// Reference: <https://developer.apple.com/documentation/coretext/1499468-ctfontmanagerregistergraphicsfon>
+fn font_registration_error(env: &mut Environment, error: MutPtr<id>, code: i32) {
+    if error.is_null() {
+        return;
+    }
+    let domain = get_static_str(env, "com.apple.CoreText.CTFontManagerErrorDomain");
+    let value: id = msg_class![env; NSError errorWithDomain:domain code:code userInfo:nil];
+    retain(env, value);
+    env.mem.write(error, value);
+}
+
 fn CTFontManagerRegisterGraphicsFont(
     env: &mut Environment,
-    font: ConstVoidPtr,             // CGFontRef
-    error: MutPtr<crate::objc::id>, // CFErrorRef*
+    font: CGFontRef,
+    error: MutPtr<id>,
 ) -> bool {
-    if !error.is_null() {
-        env.mem.write(error, crate::objc::nil);
+    let Some(face) = data_provider_font(env, font) else {
+        font_registration_error(env, error, 104);
+        return false;
+    };
+    if face.name(6).is_none_or(|name| name.is_empty()) {
+        font_registration_error(env, error, 104);
+        return false;
     }
-    if font.is_null() {
+    if !crate::frameworks::uikit::ui_font::register_graphics_font(env, face) {
+        font_registration_error(env, error, 105);
+        return false;
+    }
+    true
+}
+
+fn CTFontManagerUnregisterGraphicsFont(
+    env: &mut Environment,
+    font: CGFontRef,
+    error: MutPtr<id>,
+) -> bool {
+    let Some(face) = data_provider_font(env, font) else {
+        font_registration_error(env, error, 104);
+        return false;
+    };
+    if !crate::frameworks::uikit::ui_font::unregister_graphics_font(env, &face) {
+        font_registration_error(env, error, 201);
         return false;
     }
     true
@@ -1644,17 +2275,12 @@ fn CTParagraphStyleGetValueForSpecifier(
 
 fn line_string_range(env: &mut Environment, line: CTLineRef) -> CFRange {
     if line.is_null() {
-        return CFRange { location: 0, length: 0 };
+        return CFRange {
+            location: 0,
+            length: 0,
+        };
     }
-    let text = line_text(env, line);
-    if text == nil {
-        return CFRange { location: 0, length: 0 };
-    }
-    let length: NSUInteger = msg![env; text length];
-    CFRange {
-        location: 0,
-        length: length as CFIndex,
-    }
+    env.objc.borrow::<CTLineHostObject>(line).string_range
 }
 
 /// `CFRange CTLineGetStringRange(CTLineRef line)`
@@ -1670,7 +2296,7 @@ fn line_measure(env: &mut Environment, line: CTLineRef, text: &str) -> f32 {
     }
     let size: CGFloat = msg![env; font pointSize];
     let font_obj = font_for_text(env, font, text).unwrap_or_else(Font::sans_regular);
-    font_obj.calculate_text_size(size, text, None).0
+    font_obj.text_advance_at_size(size, text)
 }
 
 /// `CFIndex CTLineGetStringIndexForPosition(CTLineRef line, CGPoint position)`
@@ -1693,19 +2319,19 @@ fn CTLineGetStringIndexForPosition(
         return 0;
     }
     let text_str = to_rust_string(env, text).into_owned();
-    let mut utf16_index = 0usize;
+    let mut utf16_index = line_string_range(env, line).location;
     let mut prefix = String::new();
     for ch in text_str.chars() {
         let mut candidate = prefix.clone();
         candidate.push(ch);
         let width = line_measure(env, line, &candidate);
         if position.x < width {
-            return utf16_index as CFIndex;
+            return utf16_index;
         }
         prefix = candidate;
-        utf16_index += ch.len_utf16();
+        utf16_index += ch.len_utf16() as CFIndex;
     }
-    utf16_index as CFIndex
+    utf16_index
 }
 
 /// `CGFloat CTLineGetOffsetForStringIndex(CTLineRef line, CFIndex charIndex,
@@ -1717,7 +2343,8 @@ fn CTLineGetOffsetForStringIndex(
     char_index: CFIndex,
     secondary_offset: MutPtr<CGFloat>,
 ) -> CGFloat {
-    if line.is_null() || char_index <= 0 {
+    let location = line_string_range(env, line).location;
+    if line.is_null() || char_index <= location {
         if !secondary_offset.is_null() {
             env.mem.write(secondary_offset, 0.0);
         }
@@ -1731,7 +2358,7 @@ fn CTLineGetOffsetForStringIndex(
     let mut utf16_seen = 0usize;
     let mut prefix = String::new();
     for ch in text_str.chars() {
-        if utf16_seen >= char_index as usize {
+        if utf16_seen + ch.len_utf16() > (char_index - location) as usize {
             break;
         }
         prefix.push(ch);
@@ -1785,12 +2412,36 @@ fn CTRunGetStringRange(env: &mut Environment, run: CTRunRef) -> CFRange {
 fn CTRunGetTypographicBounds(
     env: &mut Environment,
     run: CTRunRef,
-    _range: CFRange,
+    range: CFRange,
     ascent: MutPtr<CGFloat>,
     descent: MutPtr<CGFloat>,
     leading: MutPtr<CGFloat>,
 ) -> f64 {
-    CTLineGetTypographicBounds(env, run, ascent, descent, leading) as f64
+    if run == nil {
+        return 0.0;
+    }
+    let total = CTRunGetGlyphCount(env, run);
+    let Some((start, end)) = glyph_range_for_run(range, total) else {
+        return 0.0;
+    };
+    CTLineGetTypographicBounds(env, run, ascent, descent, leading);
+    let text = line_text(env, run);
+    let string = to_rust_string(env, text).into_owned();
+    let ui = line_font(env, run);
+    let font = font_for_text(env, ui, &string).unwrap_or_else(Font::sans_regular);
+    let size: CGFloat = msg![env; ui pointSize];
+    let glyphs: Vec<_> = string
+        .chars()
+        .map(|ch| font.glyph_id_for_unicode(ch))
+        .collect();
+    let positions = font.glyph_positions_at_size(size, &glyphs);
+    if start == end {
+        return 0.0;
+    }
+    let right = positions.get(end as usize).copied().unwrap_or_else(|| {
+        positions.last().unwrap() + font.glyph_advance_at_size(*glyphs.last().unwrap(), size)
+    });
+    f64::from(right - positions[start as usize])
 }
 
 /// `CGFloat CTFontGetUnderlineThickness(CTFontRef font)`
@@ -1852,6 +2503,19 @@ fn CTFontCopyName(env: &mut Environment, font: CTFontRef, name_key: CFStringRef)
 }
 
 pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(CTTypesetterSuggestLineBreak(_, _, _)),
+    export_c_func!(CTTypesetterSuggestLineBreakWithOffset(_, _, _, _)),
+    export_c_func!(CTTypesetterSuggestClusterBreakWithOffset(_, _, _, _)),
+    export_c_func!(CTRunGetAdvances(_, _, _)),
+    export_c_func!(CTRunGetStringIndices(_, _, _)),
+    export_c_func!(CTFontCopyFamilyName(_)),
+    export_c_func!(CTFontCopyFullName(_)),
+    export_c_func!(CTFontCopyFontDescriptor(_)),
+    export_c_func!(CTFontDescriptorCreateCopyWithAttributes(_, _)),
+    export_c_func!(CTFontGetSymbolicTraits(_)),
+    export_c_func!(CTFontGetMatrix(_)),
+    export_c_func!(CTFontDrawGlyphs(_, _, _, _, _)),
+    export_c_func!(CTFontManagerUnregisterGraphicsFont(_, _)),
     export_c_func!(CTGetCoreTextVersion()),
     export_c_func!(CTFontCreateWithGraphicsFont(_, _, _, _)),
     export_c_func!(CTFontCreateWithName(_, _, _)),
@@ -1911,6 +2575,14 @@ pub const FUNCTIONS: FunctionExports = &[
 ];
 
 pub const CONSTANTS: ConstantExports = &[
+    (
+        "_kCTFontManagerErrorDomain",
+        HostConstant::NSString("com.apple.CoreText.CTFontManagerErrorDomain"),
+    ),
+    (
+        "_kCTFontVariationAttribute",
+        HostConstant::NSString("NSCTFontVariationAttribute"),
+    ),
     // CTFontDescriptor.h
     (
         "_kCTFontNameAttribute",
@@ -2143,7 +2815,51 @@ pub const DYLIB: HostDylib = HostDylib {
 
 #[cfg(test)]
 mod tests {
-    use super::system_font_file;
+    use super::{system_font_file, text_break};
+    use crate::font::Font;
+
+    #[test]
+    fn breaks_use_utf16_indices_and_do_not_measure_the_preceding_prefix() {
+        let font = Font::mono_regular();
+        assert_eq!(
+            text_break(&font, 20.0, "wide prefix x😀yz", 13, f64::INFINITY, false),
+            4
+        );
+        assert_eq!(
+            text_break(&font, 20.0, "prefix x😀yz", 8, f64::INFINITY, true),
+            4
+        );
+        assert_eq!(text_break(&font, 20.0, "x😀yz", 2, f64::INFINITY, false), 0);
+    }
+
+    #[test]
+    fn breaks_preserve_graphemes_and_stop_at_hard_line_breaks() {
+        let font = Font::mono_regular();
+        let one_cluster = f64::from(font.text_advance_at_size(20.0, "A\u{301}")) + 0.01;
+        assert_eq!(
+            text_break(&font, 20.0, "A\u{301}bc", 0, one_cluster, false),
+            2
+        );
+        assert_eq!(
+            text_break(&font, 20.0, "x😀\r\ny", 1, f64::INFINITY, true),
+            4
+        );
+        assert_eq!(
+            text_break(&font, 20.0, "xy\u{2028}z", 0, f64::INFINITY, true),
+            3
+        );
+    }
+
+    #[test]
+    fn word_break_uses_the_last_line_break_opportunity() {
+        let font = Font::mono_regular();
+        let budget = f64::from(font.text_advance_at_size(20.0, "one tw")) + 0.01;
+        assert_eq!(text_break(&font, 20.0, "one two three", 0, budget, true), 4);
+        assert_eq!(
+            text_break(&font, 20.0, "one two three", 0, budget, false),
+            6
+        );
+    }
 
     #[test]
     fn font_names_map_to_bundled_files() {

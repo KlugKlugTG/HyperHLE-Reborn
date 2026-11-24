@@ -21,6 +21,7 @@ use std::ops::Range;
 
 #[derive(Default)]
 pub(super) struct State {
+    registered_fonts: HashMap<String, Font>,
     fonts: HashMap<FontKind, Font>,
     sans_regular_ja: Option<Font>,
     sans_bold_ja: Option<Font>,
@@ -98,6 +99,17 @@ fn resolve_legacy_chinese_font_face(name: &str) -> FontFace {
 }
 
 fn resolve_font_name(env: &mut Environment, name: &str) -> (FontKind, Option<Font>) {
+    let registered = &env.framework_state.uikit.ui_font.registered_fonts;
+    if let Some(font) = registered.get(name).cloned().or_else(|| {
+        registered
+            .values()
+            .find(|font| {
+                font.name(1).as_deref() == Some(name) || font.name(4).as_deref() == Some(name)
+            })
+            .cloned()
+    }) {
+        return (FontKind::SansRegular, Some(font));
+    }
     match resolve_legacy_chinese_font_face(name) {
         FontFace::BuiltIn(kind) => (kind, None),
         FontFace::SimplifiedChinese => {
@@ -232,11 +244,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 // iPhone OS 2.x default set (Helvetica, Times New Roman, Courier New) which
 // is what touchHLE actually has fallback glyph tables for.
 + (id)familyNames {
-    let names = ["Courier New", "Helvetica", "Times New Roman"];
+    let mut names: Vec<String> = ["Courier New", "Helvetica", "Times New Roman"].into_iter().map(str::to_owned).collect();
+    names.extend(env.framework_state.uikit.ui_font.registered_fonts.values().filter_map(|font| font.name(1)));
+    names.sort();
+    names.dedup();
     let arr: id = msg_class![env; NSMutableArray new];
     for name in names {
-        let ns = get_static_str(env, name);
+        let ns = from_rust_string(env, name);
         let _: () = msg![env; arr addObject:ns];
+        crate::objc::release(env, ns);
     }
     autorelease(env, arr)
 }
@@ -270,6 +286,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     for &name in names {
         let ns = get_static_str(env, name);
         let _: () = msg![env; arr addObject:ns];
+    }
+    let mut registered: Vec<String> = env.framework_state.uikit.ui_font.registered_fonts.values()
+        .filter(|font| font.name(1).as_deref() == Some(s.as_str()))
+        .filter_map(|font| font.name(6)).collect();
+    registered.sort();
+    registered.dedup();
+    for name in registered {
+        let ns = from_rust_string(env, name);
+        () = msg![env; arr addObject:ns];
+        crate::objc::release(env, ns);
     }
     autorelease(env, arr)
 }
@@ -395,15 +421,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     let other_class: id = msg![env; other class];
     let is_font: bool = msg![env; other_class isSubclassOfClass:ui_font_class];
     if !is_font { return false; }
-    let (a_kind, a_size) = {
+    let (a_kind, a_size, a_custom) = {
         let a = env.objc.borrow::<UIFontHostObject>(this);
-        (a.kind, a.size)
+        (a.kind, a.size, a.custom.clone())
     };
-    let (b_kind, b_size) = {
+    let (b_kind, b_size, b_custom) = {
         let b = env.objc.borrow::<UIFontHostObject>(other);
-        (b.kind, b.size)
+        (b.kind, b.size, b.custom.clone())
     };
-    a_kind == b_kind && (a_size - b_size).abs() < 0.001
+    let same_face = match (a_custom, b_custom) {
+        (Some(a), Some(b)) => a.raw_data() == b.raw_data(),
+        (None, None) => a_kind == b_kind,
+        _ => false,
+    };
+    same_face && a_size == b_size
 }
 
 - (CGFloat)pointSize {
@@ -452,16 +483,18 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)fontName {
-    let kind = env.objc.borrow::<UIFontHostObject>(this).kind;
-    let name = font_kind_to_name(kind);
-    let ns = from_rust_string(env, name.to_string());
+    let host = env.objc.borrow::<UIFontHostObject>(this);
+    let name = host.custom.as_ref().and_then(|font| font.name(6))
+        .unwrap_or_else(|| font_kind_to_name(host.kind).to_string());
+    let ns = from_rust_string(env, name);
     autorelease(env, ns)
 }
 
 - (id)familyName {
-    let kind = env.objc.borrow::<UIFontHostObject>(this).kind;
-    let family = font_kind_to_family(kind);
-    let ns = from_rust_string(env, family.to_string());
+    let host = env.objc.borrow::<UIFontHostObject>(this);
+    let family = host.custom.as_ref().and_then(|font| font.name(1))
+        .unwrap_or_else(|| font_kind_to_family(host.kind).to_string());
+    let ns = from_rust_string(env, family);
     autorelease(env, ns)
 }
 
@@ -526,6 +559,31 @@ pub fn new_uifont_with_custom_font(env: &mut Environment, font: Font, size: CGFl
         .objc
         .alloc_object(class, Box::new(host_object), &mut env.mem);
     autorelease(env, new)
+}
+
+/// Process-scoped registration retains the font data independently of its
+/// CGFont reference, matching CTFontManagerRegisterGraphicsFont.
+pub(crate) fn register_graphics_font(env: &mut Environment, font: Font) -> bool {
+    let Some(name) = font.name(6) else {
+        return false;
+    };
+    let fonts = &mut env.framework_state.uikit.ui_font.registered_fonts;
+    if fonts.contains_key(&name) {
+        return false;
+    }
+    fonts.insert(name, font);
+    true
+}
+
+pub(crate) fn unregister_graphics_font(env: &mut Environment, font: &Font) -> bool {
+    font.name(6).is_some_and(|name| {
+        env.framework_state
+            .uikit
+            .ui_font
+            .registered_fonts
+            .remove(&name)
+            .is_some()
+    })
 }
 
 fn convert_line_break_mode(ui_mode: UILineBreakMode) -> WrapMode {
