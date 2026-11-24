@@ -8423,14 +8423,9 @@ fn glGetTransformFeedbackVarying(
     }
 }
 
-/// `void glGetBufferPointerv(GLenum target, GLenum pname, void **params)` —
-/// ES 3.0 §6.1.15. The only valid `pname` is `GL_BUFFER_MAP_POINTER`, which
-/// is NULL unless the buffer is currently mapped. touchHLE exposes buffer
-/// mappings to the guest via glMapBufferOES (which hands the app a *guest*
-/// pointer and keeps its own host<->guest mirror), so the raw host pointer
-/// the driver returns is not meaningful in the guest address space. We still
-/// forward the real query, and report the guest-visible result, which is NULL
-/// when no guest-visible mapping is active — the GL default and common case.
+/// Return the guest address belonging to the current buffer's mapping.
+/// The core and OES queries share this state; a host driver pointer cannot
+/// be represented directly in the 32-bit guest address space.
 fn glGetBufferPointerv(
     env: &mut Environment,
     target: GLenum,

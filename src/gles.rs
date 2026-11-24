@@ -361,6 +361,9 @@ impl<'a> GLES for LoggingGLES<'a> {
     }
 
     unsafe fn BindBuffer(&mut self, target: GLenum, buffer: GLuint) {
+        if self.verbose {
+            log_file_only!("glBindBuffer(target={:#x}, buffer={})", target, buffer);
+        }
         self.inner.BindBuffer(target, buffer);
     }
 
@@ -685,11 +688,41 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn DeleteBuffers(&mut self, _n: GLsizei, _buffers: *const GLuint) {
         self.inner.DeleteBuffers(_n, _buffers);
     }
-    unsafe fn BufferData( &mut self, _target: GLenum, _size: GLsizeiptr, _data: *const GLvoid, _usage: GLenum, ) {
-        self.inner.BufferData(_target, _size, _data, _usage);
+    unsafe fn BufferData(
+        &mut self,
+        target: GLenum,
+        size: GLsizeiptr,
+        data: *const GLvoid,
+        usage: GLenum,
+    ) {
+        if self.verbose {
+            log_file_only!(
+                "glBufferData(target={:#x}, size={}, data={:?}, usage={:#x})",
+                target,
+                size,
+                data,
+                usage
+            );
+        }
+        self.inner.BufferData(target, size, data, usage);
     }
-    unsafe fn BufferSubData( &mut self, _target: GLenum, _offset: GLintptr, _size: GLsizeiptr, _data: *const GLvoid, ) {
-        self.inner.BufferSubData(_target, _offset, _size, _data);
+    unsafe fn BufferSubData(
+        &mut self,
+        target: GLenum,
+        offset: GLintptr,
+        size: GLsizeiptr,
+        data: *const GLvoid,
+    ) {
+        if self.verbose {
+            log_file_only!(
+                "glBufferSubData(target={:#x}, offset={}, size={}, data={:?})",
+                target,
+                offset,
+                size,
+                data
+            );
+        }
+        self.inner.BufferSubData(target, offset, size, data);
     }
     unsafe fn Color4x(&mut self, _red: GLfixed, _green: GLfixed, _blue: GLfixed, _alpha: GLfixed) {
         self.inner.Color4x(_red, _green, _blue, _alpha);
@@ -1033,8 +1066,20 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn DisableVertexAttribArray(&mut self, _index: GLuint) {
         self.inner.DisableVertexAttribArray(_index);
     }
-    unsafe fn VertexAttribPointer( &mut self, _index: GLuint, _size: GLint, _type_: GLenum, _normalized: GLboolean, _stride: GLsizei, _pointer: *const GLvoid, ) {
-        self.inner.VertexAttribPointer(_index, _size, _type_, _normalized, _stride, _pointer);
+    unsafe fn VertexAttribPointer(
+        &mut self,
+        index: GLuint,
+        size: GLint,
+        type_: GLenum,
+        normalized: GLboolean,
+        stride: GLsizei,
+        pointer: *const GLvoid,
+    ) {
+        if self.verbose {
+            log_file_only!("glVertexAttribPointer(index={}, size={}, type={:#x}, normalized={}, stride={}, pointer={:?})", index, size, type_, normalized, stride, pointer);
+        }
+        self.inner
+            .VertexAttribPointer(index, size, type_, normalized, stride, pointer);
     }
     unsafe fn VertexAttrib1f(&mut self, _index: GLuint, _x: GLfloat) {
         self.inner.VertexAttrib1f(_index, _x);
@@ -1192,11 +1237,38 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn IsVertexArrayOES(&mut self, _array: GLuint) -> GLboolean {
         self.inner.IsVertexArrayOES(_array)
     }
-    unsafe fn MapBufferRange( &mut self, _target: GLenum, _offset: GLintptr, _length: GLsizeiptr, _access: GLbitfield, ) -> *mut GLvoid {
-        self.inner.MapBufferRange(_target, _offset, _length, _access)
+    unsafe fn MapBufferRange(
+        &mut self,
+        target: GLenum,
+        offset: GLintptr,
+        length: GLsizeiptr,
+        access: GLbitfield,
+    ) -> *mut GLvoid {
+        if self.verbose {
+            log_file_only!(
+                "glMapBufferRange(target={:#x}, offset={}, length={}, access={:#x})",
+                target,
+                offset,
+                length,
+                access
+            );
+        }
+        let pointer = self.inner.MapBufferRange(target, offset, length, access);
+        if self.verbose {
+            log_file_only!("glMapBufferRange returned {:?}", pointer);
+        }
+        pointer
     }
-    unsafe fn FlushMappedBufferRange( &mut self, _target: GLenum, _offset: GLintptr, _length: GLsizeiptr, ) {
-        self.inner.FlushMappedBufferRange(_target, _offset, _length);
+    unsafe fn FlushMappedBufferRange(&mut self, target: GLenum, offset: GLintptr, length: GLsizeiptr) {
+        if self.verbose {
+            log_file_only!(
+                "glFlushMappedBufferRange(target={:#x}, offset={}, length={})",
+                target,
+                offset,
+                length
+            );
+        }
+        self.inner.FlushMappedBufferRange(target, offset, length);
     }
     unsafe fn GetBufferPointerv( &mut self, _target: GLenum, _pname: GLenum, _params: *mut *mut GLvoid, ) {
         self.inner.GetBufferPointerv(_target, _pname, _params);
@@ -1213,8 +1285,12 @@ impl<'a> GLES for LoggingGLES<'a> {
     unsafe fn BindBufferRange( &mut self, _target: GLenum, _index: GLuint, _buffer: GLuint, _offset: GLintptr, _size: GLsizeiptr, ) {
         self.inner.BindBufferRange(_target, _index, _buffer, _offset, _size);
     }
-    unsafe fn UnmapBuffer(&mut self, _target: GLenum) -> GLboolean {
-        self.inner.UnmapBuffer(_target)
+    unsafe fn UnmapBuffer(&mut self, target: GLenum) -> GLboolean {
+        let result = self.inner.UnmapBuffer(target);
+        if self.verbose {
+            log_file_only!("glUnmapBuffer(target={:#x}) returned {}", target, result);
+        }
+        result
     }
     unsafe fn TexImage3D( &mut self, _target: GLenum, _level: GLint, _internalformat: GLint, _width: GLsizei, _height: GLsizei, _depth: GLsizei, _border: GLint, _format: GLenum, _type_: GLenum, _pixels: *const GLvoid, ) {
         self.inner.TexImage3D(_target, _level, _internalformat, _width, _height, _depth, _border, _format, _type_, _pixels);

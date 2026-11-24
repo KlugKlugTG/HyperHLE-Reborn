@@ -292,6 +292,8 @@ def main():
     p.add_argument("--exe", default=str(default_exe))
     p.add_argument("--cwd", default=str(repo_root))
     p.add_argument("--out", default="tap-test-out")
+    p.add_argument("--window-title", default="touchHLE",
+                   help="Fallback window title when --exe launches an emulator child")
     p.add_argument("--step", action="append", default=[])
     p.add_argument("--final-wait", type=float, default=10.0)
     p.add_argument("--require-touch-delivery", action="store_true")
@@ -360,7 +362,7 @@ def main():
 
     hwnd = None
     for _ in range(60):
-        hwnd = find_window(proc.pid)
+        hwnd = find_window(proc.pid, pid_hint_title=args.window_title)
         if hwnd or proc.poll() is not None:
             break
         time.sleep(0.5)
