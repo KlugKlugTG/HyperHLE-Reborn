@@ -270,6 +270,14 @@ fn delete_drawable(env: &mut Environment, view: id) {
         gles.DeleteFramebuffersOES(2, framebuffers.as_ptr());
         gles.DeleteRenderbuffersOES(3, buffers.as_ptr());
     });
+    crate::frameworks::opengles::forget_renderbuffer_drawables(
+        env,
+        &[
+            drawable.color,
+            drawable.multisample_color,
+            drawable.depth_stencil,
+        ],
+    );
     let _: bool = msg_class![env; EAGLContext setCurrentContext:previous];
     release(env, previous);
 }
@@ -553,6 +561,22 @@ fn configure_view(env: &mut Environment, controller: id, view: id) {
     }
 }
 
+fn detach_view(env: &mut Environment, controller: id) {
+    let loaded: bool = msg![env; controller isViewLoaded];
+    if !loaded {
+        return;
+    }
+    let view: id = msg![env; controller view];
+    let class: Class = msg_class![env; GLKView class];
+    let is_glk: bool = msg![env; view isKindOfClass:class];
+    if is_glk {
+        let delegate: id = msg![env; view delegate];
+        if delegate == controller {
+            () = msg![env; view setDelegate:nil];
+        }
+    }
+}
+
 struct GLKViewHostObject {
     superclass: UIViewHostObject,
     /// `EAGLContext*` — retained (documented as a strong property).
@@ -793,8 +817,31 @@ pub const CLASSES: ClassExports = objc_classes! {
     let factor = env.options.scale_hack.get() as i32;
     let (width, height) = (drawable.width * factor, drawable.height * factor);
     let mut pixels = vec![0; width as usize * height as usize * 4];
+    let context = env.objc.borrow::<GLKViewHostObject>(this).context;
+    let api: u32 = msg![env; context API];
     with_ctx_and_mem(env, |gles, _| unsafe {
+        let mut alignment = 0;
+        gles.GetIntegerv(gl::PACK_ALIGNMENT, &mut alignment);
+        gles.PixelStorei(gl::PACK_ALIGNMENT, 1);
+        // ReadPixels takes a byte offset when an ES 3 pixel-pack buffer is
+        // bound. Reset row/skip state too so the snapshot fits this buffer.
+        let mut pack_buffer = 0;
+        let mut pack_layout = [0; 3];
+        let layout_keys = [0x0d02, 0x0d03, 0x0d04];
+        if api == 3 {
+            gles.GetIntegerv(0x88ed, &mut pack_buffer);
+            gles.BindBuffer(0x88eb, 0);
+            for (key, value) in layout_keys.iter().zip(&mut pack_layout) {
+                gles.GetIntegerv(*key, value);
+                gles.PixelStorei(*key, 0);
+            }
+        }
         gles.ReadPixels(0, 0, width, height, gl::RGBA, gl::UNSIGNED_BYTE, pixels.as_mut_ptr().cast());
+        if api == 3 {
+            for (key, value) in layout_keys.iter().zip(pack_layout) { gles.PixelStorei(*key, value); }
+            gles.BindBuffer(0x88eb, pack_buffer as u32);
+        }
+        gles.PixelStorei(gl::PACK_ALIGNMENT, alignment);
     });
     let stride = width as usize * 4;
     for y in 0..height as usize / 2 {
@@ -906,6 +953,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setView:(id)view {
+    detach_view(env, this);
     () = msg_super![env; this setView:view];
     configure_view(env, this, view);
 }
@@ -947,6 +995,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg_super![env; this viewWillDisappear:animated];
     env.objc.borrow_mut::<GLKViewControllerHostObject>(this).visible = false;
     () = msg![env; this setPaused:true];
+}
+- (())viewDidUnload {
+    stop_display_link(env, this);
+    detach_view(env, this);
+    () = msg_super![env; this viewDidUnload];
 }
 - (())_touchHLE_glkResignActive:(id)_notification {
     if env.objc.borrow::<GLKViewControllerHostObject>(this).pause_on_will_resign_active {
@@ -991,6 +1044,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())glkView:(id)_view drawInRect:(CGRect)_rect { }
 - (())dealloc {
     stop_display_link(env, this);
+    detach_view(env, this);
     let center: id = msg_class![env; NSNotificationCenter defaultCenter];
     () = msg![env; center removeObserver:this];
     () = msg_super![env; this dealloc];

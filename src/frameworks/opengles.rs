@@ -15,6 +15,7 @@ mod gles_guest;
 mod software_vao;
 
 pub(crate) use gles_guest::{glBindFramebuffer, glViewport, with_ctx_and_mem};
+pub(crate) use eagl::forget_renderbuffer_drawables;
 
 use touchHLE_gl_bindings::gles11::types::{GLenum, GLint, GLsizei, GLuint};
 

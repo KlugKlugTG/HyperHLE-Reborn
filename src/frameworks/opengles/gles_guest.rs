@@ -4212,11 +4212,17 @@ fn glDeleteFramebuffersOES(env: &mut Environment, n: GLsizei, framebuffers: Cons
     })
 }
 fn glDeleteRenderbuffersOES(env: &mut Environment, n: GLsizei, renderbuffers: ConstPtr<GLuint>) {
+    if n < 0 {
+        with_ctx_and_mem(env, |gles, _| unsafe { gles.DeleteRenderbuffersOES(n, std::ptr::null()) });
+        return;
+    }
+    let deleted = (0..n as GuestUSize).map(|i| env.mem.read(renderbuffers + i)).collect::<Vec<_>>();
     with_ctx_and_mem(env, |gles, mem| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let renderbuffers = mem.ptr_at(renderbuffers, n_usize);
         unsafe { gles.DeleteRenderbuffersOES(n, renderbuffers) }
-    })
+    });
+    super::eagl::forget_renderbuffer_drawables(env, &deleted);
 }
 fn glGenerateMipmapOES(env: &mut Environment, target: GLenum) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.GenerateMipmapOES(target) })

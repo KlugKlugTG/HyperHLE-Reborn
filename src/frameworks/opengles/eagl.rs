@@ -441,6 +441,23 @@ pub(super) struct EAGLContextHostObject {
 }
 impl HostObject for EAGLContextHostObject {}
 
+/// Deleting a renderbuffer also drops its retained EAGLDrawable association.
+/// The mapping is shared by all contexts in the EAGLSharegroup, just like GL
+/// renderbuffer names. Otherwise resizing a GLKView leaks each previous layer.
+pub(crate) fn forget_renderbuffer_drawables(env: &mut Environment, renderbuffers: &[GLuint]) {
+    let Some(context) = *env.framework_state.opengles.current_ctx_for_thread(env.current_thread) else {
+        return;
+    };
+    let drawables = {
+        let host = env.objc.borrow::<EAGLContextHostObject>(context);
+        let mut bindings = host.renderbuffer_drawable_bindings.borrow_mut();
+        renderbuffers.iter().filter_map(|buffer| bindings.remove(buffer)).collect::<Vec<_>>()
+    };
+    for drawable in drawables {
+        release(env, drawable);
+    }
+}
+
 #[derive(Default)]
 struct EAGLSharegroupHostObject {
     /// Weak context references avoid a cycle with contexts retaining the group.
@@ -910,20 +927,23 @@ pub const CLASSES: ClassExports = objc_classes! {
     let format_key = get_static_str(env, kEAGLDrawablePropertyColorFormat);
     let format_rgba8 = get_static_str(env, kEAGLColorFormatRGBA8);
     let format_rgb565 = get_static_str(env, kEAGLColorFormatRGB565);
+    let format_srgba8 = get_static_str(env, kEAGLColorFormatSRGBA8);
 
     let format: id = msg![env; props objectForKey:format_key];
-    // Theoretically this should map formats like:
-    // - kColorFormatRGBA8 => RGBA8_OES
-    // - kColorFormatRGB565 => RGB565_OES
-    // However, the specification of EXT_framebuffer_object allows the
-    // implementation to arbitrarily restrict which formats can be rendered to,
-    // and it seems like RGB565 isn't supported, at least on a machine with
-    // Intel HD Graphics 615 running macOS Monterey. I don't think RGBA8 is
-    // guaranteed either, but it at least seems to work.
-    if !msg![env; format isEqual:format_rgba8] && !msg![env; format isEqual:format_rgb565] {
-        log!("[renderbufferStorage:{:?} fromDrawable:{:?}] Warning: unhandled format {:?}, using RGBA8", target, drawable, format);
-    }
-    let internalformat = gles11::RGBA8_OES;
+    // EAGLDrawable.h specifies RGBA8 as the default, RGB565, and (iOS 7+)
+    // SRGBA8. Keep the resolve buffer's format consistent with GLKit's MSAA
+    // buffer; silently forcing RGBA8 makes RGB565/sRGB resolves invalid.
+    // https://developer.apple.com/documentation/opengles/eagldrawable
+    let internalformat = if format == nil || msg![env; format isEqual:format_rgba8] {
+        gles11::RGBA8_OES
+    } else if msg![env; format isEqual:format_rgb565] {
+        0x8d62 // GL_RGB565
+    } else if msg![env; format isEqual:format_srgba8] {
+        0x8c43 // GL_SRGB8_ALPHA8
+    } else {
+        log!("Unsupported EAGL drawable color format {:?}", format);
+        return false;
+    };
 
     let (width, height) = {
         // ULTRAHLE_MINIONJUMP_RENDERBUFFER_BEGIN
