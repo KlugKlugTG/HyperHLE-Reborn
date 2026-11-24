@@ -337,7 +337,7 @@ fn bind_drawable(env: &mut Environment, view: id) -> bool {
         }
         env.objc.borrow_mut::<GLKViewHostObject>(view).drawable = drawable;
         let allocated: bool =
-            msg![env; context renderbufferStorage:gl::RENDERBUFFER_OES fromDrawable:layer];
+            msg![env; context renderbufferStorage:(gl::RENDERBUFFER_OES) fromDrawable:layer];
         if !allocated {
             delete_drawable(env, view);
             return false;
@@ -796,7 +796,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if drawable.framebuffer != 0 {
         resolve_drawable(env, drawable);
         with_ctx_and_mem(env, |gles, _| unsafe { gles.BindRenderbufferOES(gl::RENDERBUFFER_OES, drawable.color) });
-        let _: bool = msg![env; context presentRenderbuffer:gl::RENDERBUFFER_OES];
+        let _: bool = msg![env; context presentRenderbuffer:(gl::RENDERBUFFER_OES)];
     }
     env.objc.borrow_mut::<GLKViewHostObject>(this).drawing = false;
     release(env, this);
@@ -891,7 +891,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         .borrow_mut::<GLKViewControllerHostObject>(this)
         .preferred_frames_per_second = fps;
     let link = env.objc.borrow::<GLKViewControllerHostObject>(this).display_link;
-    if link != nil { () = msg![env; link setFrameInterval:frame_interval(fps)]; }
+    if link != nil { () = msg![env; link setFrameInterval:(frame_interval(fps))]; }
 }
 - (NSInteger)framesPerSecond {
     60 / frame_interval(env.objc.borrow::<GLKViewControllerHostObject>(this).preferred_frames_per_second)
