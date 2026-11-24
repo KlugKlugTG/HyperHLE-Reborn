@@ -1194,7 +1194,7 @@ fn CGContextSetTextDrawingMode(_env: &mut Environment, _context: CGContextRef, _
 fn CGContextSetCharacterSpacing(_env: &mut Environment, _context: CGContextRef, _spacing: CGFloat) {
 }
 
-fn CGContextSetTextMatrix(
+pub fn CGContextSetTextMatrix(
     env: &mut Environment,
     context: CGContextRef,
     transform: CGAffineTransform,
@@ -1242,7 +1242,7 @@ fn CGContextShowText(
 ) {
 }
 
-fn CGContextSetFontSize(env: &mut Environment, context: CGContextRef, size: CGFloat) {
+pub fn CGContextSetFontSize(env: &mut Environment, context: CGContextRef, size: CGFloat) {
     if context.is_null() {
         return;
     }
@@ -1251,7 +1251,7 @@ fn CGContextSetFontSize(env: &mut Environment, context: CGContextRef, size: CGFl
         .font_size = size;
 }
 
-fn CGContextSetFont(env: &mut Environment, context: CGContextRef, font: CGFontRef) {
+pub fn CGContextSetFont(env: &mut Environment, context: CGContextRef, font: CGFontRef) {
     if context.is_null() {
         return;
     }
@@ -1297,7 +1297,7 @@ fn CGContextSetFont(env: &mut Environment, context: CGContextRef, font: CGFontRe
 
 /// `void CGContextShowGlyphsAtPoint(CGContextRef c, CGFloat x, CGFloat y,
 ///                                  const CGGlyph *glyphs, size_t count)`
-fn CGContextShowGlyphsAtPoint(
+pub fn CGContextShowGlyphsAtPoint(
     env: &mut Environment,
     context: CGContextRef,
     x: CGFloat,

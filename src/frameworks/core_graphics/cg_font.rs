@@ -155,14 +155,8 @@ fn CGFontCreateWithDataProvider(env: &mut Environment, provider: CGDataProviderR
     let font = match Font::from_vec(bytes) {
         Some(f) => f,
         None => {
-            // The font data could not be parsed — most likely a CFF/OTTO OpenType
-            // font, which rusttype does not support. Fall back to the bundled
-            // sans-serif font so text is at least visible rather than invisible.
-            log!(
-                "CGFontCreateWithDataProvider: could not parse font data (possibly CFF/OTTO); \
-                  falling back to Liberation Sans"
-            );
-            Font::sans_regular()
+            log!("CGFontCreateWithDataProvider: invalid font data");
+            return Ptr::null();
         }
     };
     cg_font_with_font(env, font)
@@ -312,16 +306,8 @@ fn CGFontCopyPostScriptName(env: &mut Environment, font: CGFontRef) -> CFStringR
         return nil;
     }
     if is_data_provider_font(env, font) {
-        // Try to extract PostScript name from the 'name' table (nameID=6).
-        let name_data = env
-            .objc
-            .borrow::<CGFontHostObject>(font)
-            .font
-            .table_data(0x6E616D65 /* 'name' */);
-        if let Some(data) = name_data {
-            if let Some(ps_name) = extract_name_from_name_table(&data, 6) {
-                return ns_string::from_rust_string(env, ps_name);
-            }
+        if let Some(name) = env.objc.borrow::<CGFontHostObject>(font).font.name(6) {
+            return ns_string::from_rust_string(env, name);
         }
         return nil;
     }
@@ -339,78 +325,12 @@ fn CGFontCopyFullName(env: &mut Environment, font: CGFontRef) -> CFStringRef {
         return nil;
     }
     if is_data_provider_font(env, font) {
-        // Full name is nameID=4 in the 'name' table.
-        let name_data = env
-            .objc
-            .borrow::<CGFontHostObject>(font)
-            .font
-            .table_data(0x6E616D65 /* 'name' */);
-        if let Some(data) = name_data {
-            if let Some(full_name) = extract_name_from_name_table(&data, 4) {
-                return ns_string::from_rust_string(env, full_name);
-            }
+        if let Some(name) = env.objc.borrow::<CGFontHostObject>(font).font.name(4) {
+            return ns_string::from_rust_string(env, name);
         }
         return nil;
     }
     CGFontCopyPostScriptName(env, font)
-}
-
-/// Extract a name record from a TrueType 'name' table.
-/// `name_id`: 1=family, 2=subfamily, 4=full name, 6=PostScript name
-fn extract_name_from_name_table(data: &[u8], name_id: u16) -> Option<String> {
-    if data.len() < 6 {
-        return None;
-    }
-    let count = u16::from_be_bytes([data[2], data[3]]) as usize;
-    let string_offset = u16::from_be_bytes([data[4], data[5]]) as usize;
-
-    for i in 0..count {
-        let record_offset = 6 + i * 12;
-        if data.len() < record_offset + 12 {
-            break;
-        }
-        let platform_id = u16::from_be_bytes([data[record_offset], data[record_offset + 1]]);
-        let encoding_id = u16::from_be_bytes([data[record_offset + 2], data[record_offset + 3]]);
-        let _language_id = u16::from_be_bytes([data[record_offset + 4], data[record_offset + 5]]);
-        let nid = u16::from_be_bytes([data[record_offset + 6], data[record_offset + 7]]);
-        let length =
-            u16::from_be_bytes([data[record_offset + 8], data[record_offset + 9]]) as usize;
-        let offset =
-            u16::from_be_bytes([data[record_offset + 10], data[record_offset + 11]]) as usize;
-
-        if nid != name_id {
-            continue;
-        }
-
-        let str_start = string_offset + offset;
-        if str_start + length > data.len() {
-            continue;
-        }
-
-        let raw = &data[str_start..str_start + length];
-
-        // Platform 3 (Windows) encoding 1 (Unicode BMP) — UTF-16BE
-        if platform_id == 3 && encoding_id == 1 {
-            let chars: Vec<u16> = raw
-                .chunks_exact(2)
-                .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                .collect();
-            return String::from_utf16(&chars).ok();
-        }
-        // Platform 1 (Macintosh) encoding 0 (Roman) — ASCII/Latin-1
-        if platform_id == 1 && encoding_id == 0 {
-            return Some(String::from_utf8_lossy(raw).into_owned());
-        }
-        // Platform 0 (Unicode) — UTF-16BE
-        if platform_id == 0 {
-            let chars: Vec<u16> = raw
-                .chunks_exact(2)
-                .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                .collect();
-            return String::from_utf16(&chars).ok();
-        }
-    }
-    None
 }
 
 // =========================================================================
