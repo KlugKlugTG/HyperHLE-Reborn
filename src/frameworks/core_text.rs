@@ -58,6 +58,7 @@ use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
 };
 use crate::Environment;
+use rusttype::GlyphId;
 
 /// Opaque CoreText font reference.
 pub type CTFontRef = crate::objc::id;
@@ -890,7 +891,7 @@ fn CTFontCopyFontDescriptor(env: &mut Environment, font: CTFontRef) -> CTFontDes
         bytes.cast_const().cast(),
         24,
     );
-    env.mem.free(bytes);
+    env.mem.free(bytes.cast());
     let matrix_key = get_static_str(env, "NSCTFontMatrixAttribute");
     () = msg![env; attrs setObject:data forKey:matrix_key];
     release(env, data);
