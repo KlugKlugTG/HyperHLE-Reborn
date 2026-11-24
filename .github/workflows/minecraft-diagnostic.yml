@@ -2,7 +2,7 @@ name: Emulator diagnostics
 
 on:
   push:
-    branches: ["fix/minecraft-story-mode-startup", "fix/infinity-blade-display", "fix/general-launch-compatibility", "fix/general-startup-stability", "fix/gameloft-video-menu", "fix/backstab-gameplay", "fix/bowmasters-startup", "fix/brawlstars-3d-rendering", "fix/brawlstars-text-and-symbols"]
+    branches: ["fix/minecraft-story-mode-startup", "fix/infinity-blade-display", "fix/general-launch-compatibility", "fix/general-startup-stability", "fix/gameloft-video-menu", "fix/backstab-gameplay", "fix/bowmasters-startup", "fix/brawlstars-3d-rendering", "fix/brawlstars-text-and-symbols", "fix/glkit-render-loop"]
   workflow_dispatch:
 
 permissions:
@@ -98,6 +98,10 @@ jobs:
         env:
           ALSOFT_DRIVERS: "null"
         run: cargo test --locked
+      - name: GLKit graphics regression probe
+        run: |
+          sudo apt-get install -y -qq xvfb xauth
+          xvfb-run -a -s '-screen 0 1280x960x24' env ALSOFT_DRIVERS=null timeout 60s target/debug/touchHLE tests/TestApp.app --overlay=off --args --glkit-drawable-probe
       - uses: actions/upload-artifact@v4
         if: always()
         with:

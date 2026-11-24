@@ -15,6 +15,7 @@
 #include <string.h>
 
 int TestApp_cli_tests_main(void);
+int test_GLKView_drawable_graphics(void);
 int TestApp_gui_tests_main(int argc, char **argv);
 void TestApp_uncaught_objc_exception_probe(void);
 int TestApp_status_bar_launch_probe(int argc, char **argv, int hidden);
@@ -35,6 +36,8 @@ int main(int argc, char **argv) {
   } else if (argc == 2 && !strcmp(argv[1], "--objc-terminate-probe")) {
     objc_terminate();
     __builtin_trap();
+  } else if (argc == 2 && !strcmp(argv[1], "--glkit-drawable-probe")) {
+    return test_GLKView_drawable_graphics();
   } else if (argc == 2 && !strcmp(argv[1], "--status-bar-hidden-probe")) {
     return TestApp_status_bar_launch_probe(argc, argv, 1);
   } else if (argc == 2 && !strcmp(argv[1], "--status-bar-visible-probe")) {

@@ -1623,6 +1623,16 @@ impl GLES for GLES3OnGL3<'_> {
     ) {
         gl33::RenderbufferStorageMultisample(target, samples, internalformat, width, height)
     }
+    unsafe fn RenderbufferStorageMultisampleAPPLE(
+        &mut self,
+        target: GLenum,
+        samples: GLsizei,
+        internalformat: GLenum,
+        width: GLsizei,
+        height: GLsizei,
+    ) {
+        gl33::RenderbufferStorageMultisample(target, samples, internalformat, width, height)
+    }
     unsafe fn ResolveMultisampleFramebufferAPPLE(&mut self) {
         let mut color_rb: GLint = 0;
         gl33::GetFramebufferAttachmentParameteriv(

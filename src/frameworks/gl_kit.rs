@@ -11,25 +11,26 @@
 //! <https://developer.apple.com/documentation/glkit/glkview>
 //! <https://developer.apple.com/documentation/glkit/glkviewcontroller>
 //!
-//! touchHLE does not implement the full GLKit stack, but apps built against
-//! iOS 5+ commonly link the framework and allocate these classes at startup
-//! (previously this hit the `UnimplementedClass` "SUPER HACK" warning and
-//! left the app without a working render loop). This module provides real
-//! class implementations with the documented inheritance (`GLKView:
-//! UIView`, `GLKViewController: UIViewController`) and the documented
-//! properties, plus the `GLKMatrix4Identity` constant that math-only users
-//! of GLKit import.
+//! GLKit owns the drawable buffers, sets the current context and viewport,
+//! invokes update/draw callbacks, and presents through EAGL. Its animation
+//! loop uses the same CADisplayLink/run-loop clock as other iOS frameworks.
+//! Public contracts and callback precedence are also described in Apple's
+//! SDK headers:
+//! <https://github.com/xybp888/iOS-SDKs/tree/master/iPhoneOS9.3.sdk/System/Library/Frameworks/GLKit.framework/Headers>
 
 use crate::abi::{impl_GuestRet_for_large_struct, GuestArg};
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_graphics::{CGFloat, CGRect};
+use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval};
+use crate::frameworks::opengles::{glBindFramebuffer, glViewport, with_ctx_and_mem};
 use crate::frameworks::uikit::ui_view::UIViewHostObject;
 use crate::frameworks::uikit::ui_view_controller::UIViewControllerHostObject;
+use crate::gles::gles11_raw as gl;
 use crate::mem::{ConstVoidPtr, MutPtr, SafeRead};
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg, nil, objc_classes, release, retain, ClassExports,
-    NSZonePtr,
+    id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes, release,
+    retain, Class, ClassExports, HostObject, NSZonePtr, ObjC,
 };
 use crate::Environment;
 
@@ -239,6 +240,343 @@ pub const FUNCTIONS: FunctionExports = &[export_c_func!(GLKMatrix4Invert(_, _))]
 /// "FormatNone" defaults of the depth/stencil/multisample properties.
 type GLKViewDrawableFormat = NSInteger;
 
+#[derive(Clone, Copy, Default)]
+struct Drawable {
+    framebuffer: u32,
+    color: u32,
+    multisample_framebuffer: u32,
+    multisample_color: u32,
+    depth_stencil: u32,
+    width: i32,
+    height: i32,
+}
+
+fn delete_drawable(env: &mut Environment, view: id) {
+    let drawable = std::mem::take(&mut env.objc.borrow_mut::<GLKViewHostObject>(view).drawable);
+    if drawable.framebuffer == 0 {
+        return;
+    }
+    let context = env.objc.borrow::<GLKViewHostObject>(view).context;
+    let previous: id = msg_class![env; EAGLContext currentContext];
+    retain(env, previous);
+    let _: bool = msg_class![env; EAGLContext setCurrentContext:context];
+    with_ctx_and_mem(env, |gles, _| unsafe {
+        let framebuffers = [drawable.framebuffer, drawable.multisample_framebuffer];
+        let buffers = [
+            drawable.color,
+            drawable.multisample_color,
+            drawable.depth_stencil,
+        ];
+        gles.DeleteFramebuffersOES(2, framebuffers.as_ptr());
+        gles.DeleteRenderbuffersOES(3, buffers.as_ptr());
+    });
+    crate::frameworks::opengles::forget_renderbuffer_drawables(
+        env,
+        &[
+            drawable.color,
+            drawable.multisample_color,
+            drawable.depth_stencil,
+        ],
+    );
+    let _: bool = msg_class![env; EAGLContext setCurrentContext:previous];
+    release(env, previous);
+}
+
+fn bind_drawable(env: &mut Environment, view: id) -> bool {
+    let context = env.objc.borrow::<GLKViewHostObject>(view).context;
+    if context == nil {
+        return false;
+    }
+    let _: bool = msg_class![env; EAGLContext setCurrentContext:context];
+    let bounds: CGRect = msg![env; view bounds];
+    let scale: CGFloat = msg![env; view contentScaleFactor];
+    let width = (bounds.size.width * scale).round() as i32;
+    let height = (bounds.size.height * scale).round() as i32;
+    if width <= 0 || height <= 0 {
+        delete_drawable(env, view);
+        return false;
+    }
+    let old = env.objc.borrow::<GLKViewHostObject>(view).drawable;
+    if old.width != width || old.height != height {
+        delete_drawable(env, view);
+    }
+    if env
+        .objc
+        .borrow::<GLKViewHostObject>(view)
+        .drawable
+        .framebuffer
+        == 0
+    {
+        let host = env.objc.borrow::<GLKViewHostObject>(view);
+        let (color, depth, stencil, multisample) = (
+            host.drawable_color_format,
+            host.drawable_depth_format,
+            host.drawable_stencil_format,
+            host.drawable_multisample,
+        );
+        let layer: id = msg![env; view layer];
+        let format = get_static_str(
+            env,
+            match color {
+                1 => "RGB565",
+                2 => "SRGBA8",
+                _ => "RGBA8",
+            },
+        );
+        let key = get_static_str(env, "ColorFormat");
+        let properties: id = msg_class![env; NSDictionary dictionaryWithObject:format forKey:key];
+        () = msg![env; layer setDrawableProperties:properties];
+        let mut drawable = Drawable::default();
+        with_ctx_and_mem(env, |gles, _| unsafe {
+            gles.GenFramebuffersOES(1, &mut drawable.framebuffer);
+            gles.GenRenderbuffersOES(1, &mut drawable.color);
+            gles.BindRenderbufferOES(gl::RENDERBUFFER_OES, drawable.color);
+        });
+        if drawable.framebuffer == 0 {
+            return false;
+        }
+        env.objc.borrow_mut::<GLKViewHostObject>(view).drawable = drawable;
+        let allocated: bool =
+            msg![env; context renderbufferStorage:(gl::RENDERBUFFER_OES) fromDrawable:layer];
+        if !allocated {
+            delete_drawable(env, view);
+            return false;
+        }
+        let factor = env.options.scale_hack.get() as i32;
+        with_ctx_and_mem(env, |gles, _| unsafe {
+            let mut pixel_width = 0;
+            let mut pixel_height = 0;
+            gles.GetRenderbufferParameterivOES(
+                gl::RENDERBUFFER_OES,
+                gl::RENDERBUFFER_WIDTH_OES,
+                &mut pixel_width,
+            );
+            gles.GetRenderbufferParameterivOES(
+                gl::RENDERBUFFER_OES,
+                gl::RENDERBUFFER_HEIGHT_OES,
+                &mut pixel_height,
+            );
+            drawable.width = pixel_width / factor;
+            drawable.height = pixel_height / factor;
+            gles.BindFramebufferOES(gl::FRAMEBUFFER_OES, drawable.framebuffer);
+            gles.FramebufferRenderbufferOES(
+                gl::FRAMEBUFFER_OES,
+                gl::COLOR_ATTACHMENT0_OES,
+                gl::RENDERBUFFER_OES,
+                drawable.color,
+            );
+            if multisample != 0 {
+                gles.GenFramebuffersOES(1, &mut drawable.multisample_framebuffer);
+                gles.GenRenderbuffersOES(1, &mut drawable.multisample_color);
+                gles.BindFramebufferOES(gl::FRAMEBUFFER_OES, drawable.multisample_framebuffer);
+                gles.BindRenderbufferOES(gl::RENDERBUFFER_OES, drawable.multisample_color);
+                let color_format = match color {
+                    1 => 0x8d62,
+                    2 => 0x8c43,
+                    _ => gl::RGBA8_OES,
+                };
+                gles.RenderbufferStorageMultisampleAPPLE(
+                    gl::RENDERBUFFER_OES,
+                    4,
+                    color_format,
+                    pixel_width,
+                    pixel_height,
+                );
+                gles.FramebufferRenderbufferOES(
+                    gl::FRAMEBUFFER_OES,
+                    gl::COLOR_ATTACHMENT0_OES,
+                    gl::RENDERBUFFER_OES,
+                    drawable.multisample_color,
+                );
+            }
+            if depth != 0 || stencil != 0 {
+                // Packed depth/stencil avoids unsupported separate attachments
+                // on ES 2 drivers. GLKit may promote the requested depth size.
+                let format = if stencil != 0 && depth != 0 {
+                    0x88f0
+                } else if stencil != 0 {
+                    0x8d48
+                } else if depth == 2 {
+                    0x81a6
+                } else {
+                    gl::DEPTH_COMPONENT16_OES
+                };
+                gles.GenRenderbuffersOES(1, &mut drawable.depth_stencil);
+                gles.BindRenderbufferOES(gl::RENDERBUFFER_OES, drawable.depth_stencil);
+                if multisample != 0 {
+                    gles.RenderbufferStorageMultisampleAPPLE(
+                        gl::RENDERBUFFER_OES,
+                        4,
+                        format,
+                        pixel_width,
+                        pixel_height,
+                    );
+                } else {
+                    gles.RenderbufferStorageOES(
+                        gl::RENDERBUFFER_OES,
+                        format,
+                        pixel_width,
+                        pixel_height,
+                    );
+                }
+                if depth != 0 {
+                    gles.FramebufferRenderbufferOES(
+                        gl::FRAMEBUFFER_OES,
+                        gl::DEPTH_ATTACHMENT_OES,
+                        gl::RENDERBUFFER_OES,
+                        drawable.depth_stencil,
+                    );
+                }
+                if stencil != 0 {
+                    gles.FramebufferRenderbufferOES(
+                        gl::FRAMEBUFFER_OES,
+                        gl::STENCIL_ATTACHMENT_OES,
+                        gl::RENDERBUFFER_OES,
+                        drawable.depth_stencil,
+                    );
+                }
+            }
+            let status = gles.CheckFramebufferStatusOES(gl::FRAMEBUFFER_OES);
+            assert_eq!(
+                status,
+                gl::FRAMEBUFFER_COMPLETE_OES,
+                "GLKit drawable framebuffer is incomplete"
+            );
+        });
+        env.objc.borrow_mut::<GLKViewHostObject>(view).drawable = drawable;
+        log!(
+            "GLKView {:?} allocated drawable {}x{} depth={} stencil={} msaa={}",
+            view,
+            drawable.width,
+            drawable.height,
+            depth,
+            stencil,
+            multisample
+        );
+    }
+    let drawable = env.objc.borrow::<GLKViewHostObject>(view).drawable;
+    let framebuffer = if drawable.multisample_framebuffer != 0 {
+        drawable.multisample_framebuffer
+    } else {
+        drawable.framebuffer
+    };
+    glBindFramebuffer(env, gl::FRAMEBUFFER_OES, framebuffer);
+    true
+}
+
+fn resolve_drawable(env: &mut Environment, drawable: Drawable) {
+    if drawable.multisample_framebuffer != 0 {
+        glBindFramebuffer(env, 0x8ca8, drawable.multisample_framebuffer);
+        glBindFramebuffer(env, 0x8ca9, drawable.framebuffer);
+        with_ctx_and_mem(env, |gles, _| unsafe {
+            gles.ResolveMultisampleFramebufferAPPLE()
+        });
+    }
+    glBindFramebuffer(env, gl::FRAMEBUFFER_OES, drawable.framebuffer);
+}
+
+/// Choose the closest integral display interval, as specified in GLKViewController.h.
+fn frame_interval(preferred: NSInteger) -> NSInteger {
+    let preferred = if preferred <= 0 { 30 } else { preferred };
+    (1..=60)
+        .min_by_key(|interval| (60 / interval - preferred).abs())
+        .unwrap()
+}
+
+#[derive(Default)]
+struct DisplayLinkMessenger {
+    controller: id,
+}
+impl HostObject for DisplayLinkMessenger {}
+
+fn start_display_link(env: &mut Environment, controller: id) {
+    let host = env.objc.borrow::<GLKViewControllerHostObject>(controller);
+    if host.display_link != nil || !host.visible || host.paused {
+        return;
+    }
+    // The display link retains its target. A messenger with a weak controller
+    // reference avoids a controller -> link -> controller retain cycle.
+    let messenger: id = msg_class![env; _touchHLE_GLKDisplayLinkMessenger new];
+    env.objc
+        .borrow_mut::<DisplayLinkMessenger>(messenger)
+        .controller = controller;
+    let selector = env
+        .objc
+        .lookup_selector("_touchHLE_glkDisplayLink:")
+        .unwrap();
+    let link: id = msg_class![env; CADisplayLink displayLinkWithTarget:messenger selector:selector];
+    release(env, messenger);
+    retain(env, link);
+    env.objc
+        .borrow_mut::<GLKViewControllerHostObject>(controller)
+        .display_link = link;
+    let interval = frame_interval(
+        env.objc
+            .borrow::<GLKViewControllerHostObject>(controller)
+            .preferred_frames_per_second,
+    );
+    () = msg![env; link setFrameInterval:interval];
+    let run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
+    let mode = get_static_str(env, "NSRunLoopCommonModes");
+    () = msg![env; link addToRunLoop:run_loop forMode:mode];
+    let now = crate::frameworks::core_animation::CACurrentMediaTime(env);
+    let host = env
+        .objc
+        .borrow_mut::<GLKViewControllerHostObject>(controller);
+    host.first_resume.get_or_insert(now);
+    host.last_resume = Some(now);
+    log_dbg!(
+        "GLKViewController {:?} started display link {:?}",
+        controller,
+        link
+    );
+}
+
+fn stop_display_link(env: &mut Environment, controller: id) {
+    let link = std::mem::replace(
+        &mut env
+            .objc
+            .borrow_mut::<GLKViewControllerHostObject>(controller)
+            .display_link,
+        nil,
+    );
+    if link != nil {
+        () = msg![env; link invalidate];
+        release(env, link);
+    }
+}
+
+fn configure_view(env: &mut Environment, controller: id, view: id) {
+    if view == nil {
+        return;
+    }
+    let class: Class = msg_class![env; GLKView class];
+    let is_glk: bool = msg![env; view isKindOfClass:class];
+    if is_glk {
+        () = msg![env; view setEnableSetNeedsDisplay:false];
+        let delegate: id = msg![env; view delegate];
+        if delegate == nil {
+            () = msg![env; view setDelegate:controller];
+        }
+    }
+}
+
+fn detach_view(env: &mut Environment, controller: id) {
+    let loaded: bool = msg![env; controller isViewLoaded];
+    if !loaded {
+        return;
+    }
+    let view: id = msg![env; controller view];
+    let class: Class = msg_class![env; GLKView class];
+    let is_glk: bool = msg![env; view isKindOfClass:class];
+    if is_glk {
+        let delegate: id = msg![env; view delegate];
+        if delegate == controller {
+            () = msg![env; view setDelegate:nil];
+        }
+    }
+}
+
 struct GLKViewHostObject {
     superclass: UIViewHostObject,
     /// `EAGLContext*` — retained (documented as a strong property).
@@ -251,6 +589,8 @@ struct GLKViewHostObject {
     drawable_stencil_format: GLKViewDrawableFormat,
     drawable_multisample: GLKViewDrawableFormat,
     enable_set_needs_display: bool,
+    drawable: Drawable,
+    drawing: bool,
 }
 impl_HostObject_with_superclass!(GLKViewHostObject);
 impl Default for GLKViewHostObject {
@@ -267,6 +607,8 @@ impl Default for GLKViewHostObject {
             drawable_multisample: 0,
             // Apple docs: "the default value is YES".
             enable_set_needs_display: true,
+            drawable: Drawable::default(),
+            drawing: false,
         }
     }
 }
@@ -281,6 +623,15 @@ struct GLKViewControllerHostObject {
     resume_on_did_become_active: bool,
     paused: bool,
     frames_displayed: NSInteger,
+    display_link: id,
+    visible: bool,
+    observing: bool,
+    first_resume: Option<f64>,
+    last_resume: Option<f64>,
+    last_update: Option<f64>,
+    last_draw: Option<f64>,
+    update_delta: f64,
+    draw_delta: f64,
 }
 impl_HostObject_with_superclass!(GLKViewControllerHostObject);
 impl Default for GLKViewControllerHostObject {
@@ -296,6 +647,15 @@ impl Default for GLKViewControllerHostObject {
             resume_on_did_become_active: true,
             paused: false,
             frames_displayed: 0,
+            display_link: nil,
+            visible: false,
+            observing: false,
+            first_resume: None,
+            last_resume: None,
+            last_update: None,
+            last_draw: None,
+            update_delta: 0.0,
+            draw_delta: 0.0,
         }
     }
 }
@@ -305,6 +665,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 (env, this, _cmd);
 
 @implementation GLKView: UIView
+
++ (Class)layerClass { msg_class![env; CAEAGLLayer class] }
 
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::<GLKViewHostObject>::default();
@@ -322,6 +684,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setContext:(id)context { // EAGLContext*
     let old = env.objc.borrow::<GLKViewHostObject>(this).context;
+    if context == old { return; }
+    delete_drawable(env, this);
     if context != nil {
         retain(env, context);
     }
@@ -343,36 +707,46 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow::<GLKViewHostObject>(this).drawable_color_format
 }
 - (())setDrawableColorFormat:(GLKViewDrawableFormat)format {
-    env.objc.borrow_mut::<GLKViewHostObject>(this).drawable_color_format = format;
+    if env.objc.borrow::<GLKViewHostObject>(this).drawable_color_format != format {
+        delete_drawable(env, this);
+        env.objc.borrow_mut::<GLKViewHostObject>(this).drawable_color_format = format;
+    }
 }
 - (GLKViewDrawableFormat)drawableDepthFormat {
     env.objc.borrow::<GLKViewHostObject>(this).drawable_depth_format
 }
 - (())setDrawableDepthFormat:(GLKViewDrawableFormat)format {
-    env.objc.borrow_mut::<GLKViewHostObject>(this).drawable_depth_format = format;
+    if env.objc.borrow::<GLKViewHostObject>(this).drawable_depth_format != format {
+        delete_drawable(env, this);
+        env.objc.borrow_mut::<GLKViewHostObject>(this).drawable_depth_format = format;
+    }
 }
 - (GLKViewDrawableFormat)drawableStencilFormat {
     env.objc.borrow::<GLKViewHostObject>(this).drawable_stencil_format
 }
 - (())setDrawableStencilFormat:(GLKViewDrawableFormat)format {
-    env.objc.borrow_mut::<GLKViewHostObject>(this).drawable_stencil_format = format;
+    if env.objc.borrow::<GLKViewHostObject>(this).drawable_stencil_format != format {
+        delete_drawable(env, this);
+        env.objc.borrow_mut::<GLKViewHostObject>(this).drawable_stencil_format = format;
+    }
 }
 - (GLKViewDrawableFormat)drawableMultisample {
     env.objc.borrow::<GLKViewHostObject>(this).drawable_multisample
 }
 - (())setDrawableMultisample:(GLKViewDrawableFormat)format {
-    env.objc.borrow_mut::<GLKViewHostObject>(this).drawable_multisample = format;
+    if env.objc.borrow::<GLKViewHostObject>(this).drawable_multisample != format {
+        delete_drawable(env, this);
+        env.objc.borrow_mut::<GLKViewHostObject>(this).drawable_multisample = format;
+    }
 }
 
 - (NSInteger)drawableWidth {
-    let bounds: CGRect = msg![env; this bounds];
-    let scale: CGFloat = msg![env; this contentScaleFactor];
-    (bounds.size.width * scale) as NSInteger
+    bind_drawable(env, this);
+    env.objc.borrow::<GLKViewHostObject>(this).drawable.width
 }
 - (NSInteger)drawableHeight {
-    let bounds: CGRect = msg![env; this bounds];
-    let scale: CGFloat = msg![env; this contentScaleFactor];
-    (bounds.size.height * scale) as NSInteger
+    bind_drawable(env, this);
+    env.objc.borrow::<GLKViewHostObject>(this).drawable.height
 }
 
 - (bool)enableSetNeedsDisplay {
@@ -382,39 +756,111 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<GLKViewHostObject>(this).enable_set_needs_display = value;
 }
 
-- (())bindDrawable {
-    // Apple docs: binds the underlying framebuffer object so the app can
-    // render into it. touchHLE's EAGL path renders straight into the
-    // app's own framebuffer/renderbuffer objects, so there is no separate
-    // GLKit-managed FBO to bind here.
-    log_dbg!("[(GLKView*){:?} bindDrawable] (no-op)", this);
-}
+- (())bindDrawable { bind_drawable(env, this); }
+- (())deleteDrawable { delete_drawable(env, this); }
 
-- (())deleteDrawable {
-    log_dbg!("[(GLKView*){:?} deleteDrawable] (no-op)", this);
+- (())setNeedsDisplay {
+    if env.objc.borrow::<GLKViewHostObject>(this).enable_set_needs_display {
+        let layer: id = msg![env; this layer];
+        () = msg![env; layer setNeedsDisplay];
+    }
+}
+- (())setNeedsDisplayInRect:(CGRect)_rect { () = msg![env; this setNeedsDisplay]; }
+- (())displayLayer:(id)_layer {
+    if env.objc.borrow::<GLKViewHostObject>(this).enable_set_needs_display {
+        () = msg![env; this display];
+    }
 }
 
 - (())display {
-    // Apple docs: GLKView "uses the regular view drawing cycle…, calling
-    // its drawRect: method whenever the contents of the view need to be
-    // updated" and apps either override drawRect: in a subclass or
-    // implement the delegate's glkView:drawInRect:.
+    if env.objc.borrow::<GLKViewHostObject>(this).drawing || !bind_drawable(env, this) { return; }
+    retain(env, this);
+    env.objc.borrow_mut::<GLKViewHostObject>(this).drawing = true;
     let bounds: CGRect = msg![env; this bounds];
+    let drawable = env.objc.borrow::<GLKViewHostObject>(this).drawable;
+    glViewport(env, 0, 0, drawable.width, drawable.height);
+    // A subclass drawRect: takes precedence over the delegate (GLKView.h).
+    let class = ObjC::read_isa(this, &env.mem);
+    let base = env.objc.get_known_class("UIView", &mut env.mem);
+    let selector = env.objc.lookup_selector("drawRect:").unwrap();
     let delegate = env.objc.borrow::<GLKViewHostObject>(this).delegate;
-    if delegate != nil {
-        () = msg![env; delegate glkView:this drawInRect:bounds];
-    } else {
+    if env.objc.class_overrides_method_of_superclass(class, selector, base) {
         () = msg![env; this drawRect:bounds];
+    } else if delegate != nil {
+        () = msg![env; delegate glkView:this drawInRect:bounds];
     }
+    // Drawing code may bind another FBO or context. Present our color buffer.
+    let context = env.objc.borrow::<GLKViewHostObject>(this).context;
+    let _: bool = msg_class![env; EAGLContext setCurrentContext:context];
+    let drawable = env.objc.borrow::<GLKViewHostObject>(this).drawable;
+    if drawable.framebuffer != 0 {
+        resolve_drawable(env, drawable);
+        with_ctx_and_mem(env, |gles, _| unsafe { gles.BindRenderbufferOES(gl::RENDERBUFFER_OES, drawable.color) });
+        let _: bool = msg![env; context presentRenderbuffer:(gl::RENDERBUFFER_OES)];
+    }
+    env.objc.borrow_mut::<GLKViewHostObject>(this).drawing = false;
+    release(env, this);
+}
+
+- (id)snapshot {
+    assert!(!env.objc.borrow::<GLKViewHostObject>(this).drawing, "GLKView snapshot during drawing");
+    let previous: id = msg_class![env; EAGLContext currentContext];
+    retain(env, previous);
+    () = msg![env; this display];
+    if !bind_drawable(env, this) {
+        let _: bool = msg_class![env; EAGLContext setCurrentContext:previous];
+        release(env, previous);
+        return nil;
+    }
+    let drawable = env.objc.borrow::<GLKViewHostObject>(this).drawable;
+    resolve_drawable(env, drawable);
+    let factor = env.options.scale_hack.get() as i32;
+    let (width, height) = (drawable.width * factor, drawable.height * factor);
+    let mut pixels = vec![0; width as usize * height as usize * 4];
+    let context = env.objc.borrow::<GLKViewHostObject>(this).context;
+    let api: u32 = msg![env; context API];
+    with_ctx_and_mem(env, |gles, _| unsafe {
+        let mut alignment = 0;
+        gles.GetIntegerv(gl::PACK_ALIGNMENT, &mut alignment);
+        gles.PixelStorei(gl::PACK_ALIGNMENT, 1);
+        // ReadPixels takes a byte offset when an ES 3 pixel-pack buffer is
+        // bound. Reset row/skip state too so the snapshot fits this buffer.
+        let mut pack_buffer = 0;
+        let mut pack_layout = [0; 3];
+        let layout_keys = [0x0d02, 0x0d03, 0x0d04];
+        if api == 3 {
+            gles.GetIntegerv(0x88ed, &mut pack_buffer);
+            gles.BindBuffer(0x88eb, 0);
+            for (key, value) in layout_keys.iter().zip(&mut pack_layout) {
+                gles.GetIntegerv(*key, value);
+                gles.PixelStorei(*key, 0);
+            }
+        }
+        gles.ReadPixels(0, 0, width, height, gl::RGBA, gl::UNSIGNED_BYTE, pixels.as_mut_ptr().cast());
+        if api == 3 {
+            for (key, value) in layout_keys.iter().zip(pack_layout) { gles.PixelStorei(*key, value); }
+            gles.BindBuffer(0x88eb, pack_buffer as u32);
+        }
+        gles.PixelStorei(gl::PACK_ALIGNMENT, alignment);
+    });
+    let stride = width as usize * 4;
+    for y in 0..height as usize / 2 {
+        for x in 0..stride { pixels.swap(y * stride + x, (height as usize - 1 - y) * stride + x); }
+    }
+    let cg_image = crate::frameworks::core_graphics::cg_image::from_image(env, crate::image::Image::from_pixels(width as u32, height as u32, pixels));
+    let scale: CGFloat = msg![env; this contentScaleFactor];
+    let image: id = msg_class![env; UIImage imageWithCGImage:cg_image scale:(scale * factor as CGFloat) orientation:0i32];
+    crate::frameworks::core_graphics::cg_image::CGImageRelease(env, cg_image);
+    let _: bool = msg_class![env; EAGLContext setCurrentContext:previous];
+    release(env, previous);
+    image
 }
 
 - (())dealloc {
+    delete_drawable(env, this);
     let context = env.objc.borrow::<GLKViewHostObject>(this).context;
-    if context != nil {
-        release(env, context);
-    }
-    // delegate is unowned: nothing to release.
-    env.objc.dealloc_object(this, &mut env.mem);
+    release(env, context);
+    () = msg_super![env; this dealloc];
 }
 
 @end
@@ -444,12 +890,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc
         .borrow_mut::<GLKViewControllerHostObject>(this)
         .preferred_frames_per_second = fps;
+    let link = env.objc.borrow::<GLKViewControllerHostObject>(this).display_link;
+    if link != nil { () = msg![env; link setFrameInterval:(frame_interval(fps))]; }
 }
 - (NSInteger)framesPerSecond {
-    // "The actual rate that the view controller attempts to call the view
-    // to update its contents" — we don't decimate, so report the
-    // preferred rate.
-    env.objc.borrow::<GLKViewControllerHostObject>(this).preferred_frames_per_second
+    60 / frame_interval(env.objc.borrow::<GLKViewControllerHostObject>(this).preferred_frames_per_second)
 }
 
 - (bool)isPaused {
@@ -462,6 +907,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if was_paused == paused {
         return;
     }
+    if paused { stop_display_link(env, this); } else { start_display_link(env, this); }
     // Apple docs (GLKViewControllerDelegate): the delegate receives
     // glkViewController:willPause: when the pause state changes.
     let delegate = env.objc.borrow::<GLKViewControllerHostObject>(this).delegate;
@@ -495,25 +941,125 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (NSInteger)framesDisplayed {
     env.objc.borrow::<GLKViewControllerHostObject>(this).frames_displayed
 }
-- (NSTimeInterval)timeSinceLastUpdate {
-    // We do not drive the GLKit animation loop yet; report a plausible
-    // single-frame delta so dt-based game logic keeps advancing.
-    let fps = env.objc.borrow::<GLKViewControllerHostObject>(this).preferred_frames_per_second;
-    1.0 / (fps.max(1) as NSTimeInterval)
-}
-- (NSTimeInterval)timeSinceLastDraw {
-    let fps = env.objc.borrow::<GLKViewControllerHostObject>(this).preferred_frames_per_second;
-    1.0 / (fps.max(1) as NSTimeInterval)
-}
+- (NSTimeInterval)timeSinceLastUpdate { env.objc.borrow::<GLKViewControllerHostObject>(this).update_delta }
+- (NSTimeInterval)timeSinceLastDraw { env.objc.borrow::<GLKViewControllerHostObject>(this).draw_delta }
 - (NSTimeInterval)timeSinceFirstResume {
-    let frames = env.objc.borrow::<GLKViewControllerHostObject>(this).frames_displayed;
-    let fps = env.objc.borrow::<GLKViewControllerHostObject>(this).preferred_frames_per_second;
-    (frames as NSTimeInterval) / (fps.max(1) as NSTimeInterval)
+    let now = crate::frameworks::core_animation::CACurrentMediaTime(env);
+    env.objc.borrow::<GLKViewControllerHostObject>(this).first_resume.map_or(0.0, |start| now - start)
 }
 - (NSTimeInterval)timeSinceLastResume {
-    msg![env; this timeSinceFirstResume]
+    let now = crate::frameworks::core_animation::CACurrentMediaTime(env);
+    env.objc.borrow::<GLKViewControllerHostObject>(this).last_resume.map_or(0.0, |start| now - start)
 }
 
+- (())setView:(id)view {
+    detach_view(env, this);
+    () = msg_super![env; this setView:view];
+    configure_view(env, this, view);
+}
+- (())loadView {
+    () = msg_super![env; this loadView];
+    let view: id = msg![env; this view];
+    let class: Class = msg_class![env; GLKView class];
+    let is_glk: bool = msg![env; view isKindOfClass:class];
+    if !is_glk {
+        let frame: CGRect = msg![env; view frame];
+        let view: id = msg_class![env; GLKView alloc];
+        let view: id = msg![env; view initWithFrame:frame];
+        () = msg![env; this setView:view];
+        release(env, view);
+    }
+}
+- (())viewDidLoad {
+    () = msg_super![env; this viewDidLoad];
+    let view: id = msg![env; this view];
+    configure_view(env, this, view);
+    if !env.objc.borrow::<GLKViewControllerHostObject>(this).observing {
+        env.objc.borrow_mut::<GLKViewControllerHostObject>(this).observing = true;
+        let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+        let pause = env.objc.lookup_selector("_touchHLE_glkResignActive:").unwrap();
+        let resume = env.objc.lookup_selector("_touchHLE_glkBecomeActive:").unwrap();
+        let pause_name = get_static_str(env, "UIApplicationWillResignActiveNotification");
+        let resume_name = get_static_str(env, "UIApplicationDidBecomeActiveNotification");
+        () = msg![env; center addObserver:this selector:pause name:pause_name object:nil];
+        () = msg![env; center addObserver:this selector:resume name:resume_name object:nil];
+    }
+}
+- (())viewWillAppear:(bool)animated {
+    () = msg_super![env; this viewWillAppear:animated];
+    env.objc.borrow_mut::<GLKViewControllerHostObject>(this).visible = true;
+    () = msg![env; this setPaused:false];
+    start_display_link(env, this);
+}
+- (())viewWillDisappear:(bool)animated {
+    () = msg_super![env; this viewWillDisappear:animated];
+    env.objc.borrow_mut::<GLKViewControllerHostObject>(this).visible = false;
+    () = msg![env; this setPaused:true];
+}
+- (())viewDidUnload {
+    stop_display_link(env, this);
+    detach_view(env, this);
+    () = msg_super![env; this viewDidUnload];
+}
+- (())_touchHLE_glkResignActive:(id)_notification {
+    if env.objc.borrow::<GLKViewControllerHostObject>(this).pause_on_will_resign_active {
+        () = msg![env; this setPaused:true];
+    }
+    let view: id = msg![env; this view];
+    () = msg![env; view deleteDrawable];
+}
+- (())_touchHLE_glkBecomeActive:(id)_notification {
+    if env.objc.borrow::<GLKViewControllerHostObject>(this).resume_on_did_become_active {
+        () = msg![env; this setPaused:false];
+    }
+}
+- (())_touchHLE_glkUpdateAndDraw {
+    let host = env.objc.borrow::<GLKViewControllerHostObject>(this);
+    if host.paused || !host.visible { return; }
+    retain(env, this);
+    let now = crate::frameworks::core_animation::CACurrentMediaTime(env);
+    let host = env.objc.borrow_mut::<GLKViewControllerHostObject>(this);
+    host.update_delta = host.last_update.map_or(0.0, |last| now - last);
+    host.last_update = Some(now);
+    let delegate = host.delegate;
+    let class = ObjC::read_isa(this, &env.mem);
+    if env.objc.class_has_method_named(class, "update") {
+        () = msg![env; this update];
+    } else if delegate != nil {
+        () = msg![env; delegate glkViewControllerUpdate:this];
+    }
+    // update may hide the controller or pause the loop.
+    if !env.objc.borrow::<GLKViewControllerHostObject>(this).paused {
+        let view: id = msg![env; this view];
+        let now = crate::frameworks::core_animation::CACurrentMediaTime(env);
+        let host = env.objc.borrow_mut::<GLKViewControllerHostObject>(this);
+        host.draw_delta = host.last_draw.map_or(0.0, |last| now - last);
+        host.last_draw = Some(now);
+        () = msg![env; view display];
+        env.objc.borrow_mut::<GLKViewControllerHostObject>(this).frames_displayed += 1;
+        log_once!("GLKViewController delivered its first update/draw frame");
+    }
+    release(env, this);
+}
+- (())glkView:(id)_view drawInRect:(CGRect)_rect { }
+- (())dealloc {
+    stop_display_link(env, this);
+    detach_view(env, this);
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    () = msg![env; center removeObserver:this];
+    () = msg_super![env; this dealloc];
+}
+
+@end
+
+@implementation _touchHLE_GLKDisplayLinkMessenger: NSObject
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(this, Box::<DisplayLinkMessenger>::default(), &mut env.mem)
+}
+- (())_touchHLE_glkDisplayLink:(id)_link {
+    let controller = env.objc.borrow::<DisplayLinkMessenger>(this).controller;
+    () = msg![env; controller _touchHLE_glkUpdateAndDraw];
+}
 @end
 
 };

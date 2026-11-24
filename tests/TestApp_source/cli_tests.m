@@ -51,6 +51,7 @@
 int test_UITableViewCell_nib_controls(void);
 int test_ObjC_exception_catch_rethrow_cleanup(void);
 int test_ObjC_exception_nested_message_dispatch(void);
+int test_GLKViewController_render_loop(void);
 
 @interface NSObject (PerformSelectorOnMainThreadTest)
 - (void)performSelectorOnMainThread:(SEL)selector
@@ -7569,6 +7570,7 @@ struct {
     FUNC_DEF(test_dispatch_sync_after_barrier),
     FUNC_DEF(test_dispatch_deferred_queue_lifetime),
     FUNC_DEF(test_CADisplayLink_refresh_clock),
+    FUNC_DEF(test_GLKViewController_render_loop),
     FUNC_DEF(test_NSLock_deadlines),
     FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),

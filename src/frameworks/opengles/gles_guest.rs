@@ -101,7 +101,7 @@ fn pvrtc_subimage_matches_level(
 }
 
 #[track_caller]
-fn with_ctx_and_mem<T, U: Default>(env: &mut Environment, f: T) -> U
+pub(crate) fn with_ctx_and_mem<T, U: Default>(env: &mut Environment, f: T) -> U
 where
     T: FnOnce(&mut dyn GLES, &mut Mem) -> U,
 {
@@ -821,7 +821,7 @@ fn glScissor(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height: 
         gles.Scissor(x, y, width, height)
     })
 }
-fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height: GLsizei) {
+pub(crate) fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height: GLsizei) {
     // ULTRAHLE_MINIONJUMP_VIEWPORT_BEGIN
     let (x, y, width, height) = if matches!(
         env.bundle.bundle_identifier(),
@@ -4212,11 +4212,17 @@ fn glDeleteFramebuffersOES(env: &mut Environment, n: GLsizei, framebuffers: Cons
     })
 }
 fn glDeleteRenderbuffersOES(env: &mut Environment, n: GLsizei, renderbuffers: ConstPtr<GLuint>) {
+    if n < 0 {
+        with_ctx_and_mem(env, |gles, _| unsafe { gles.DeleteRenderbuffersOES(n, std::ptr::null()) });
+        return;
+    }
+    let deleted = (0..n as GuestUSize).map(|i| env.mem.read(renderbuffers + i)).collect::<Vec<_>>();
     with_ctx_and_mem(env, |gles, mem| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let renderbuffers = mem.ptr_at(renderbuffers, n_usize);
         unsafe { gles.DeleteRenderbuffersOES(n, renderbuffers) }
-    })
+    });
+    super::eagl::forget_renderbuffer_drawables(env, &deleted);
 }
 fn glGenerateMipmapOES(env: &mut Environment, target: GLenum) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.GenerateMipmapOES(target) })
@@ -4276,7 +4282,7 @@ pub fn dump_rgb_ppm(pix: &[u8], width: u32, height: u32, format: u32, type_: u32
     }
 }
 
-fn glBindFramebuffer(env: &mut Environment, target: GLenum, framebuffer: GLuint) {
+pub(crate) fn glBindFramebuffer(env: &mut Environment, target: GLenum, framebuffer: GLuint) {
     glBindFramebufferOES(env, target, framebuffer)
 }
 fn glBindRenderbuffer(env: &mut Environment, target: GLenum, renderbuffer: GLuint) {
