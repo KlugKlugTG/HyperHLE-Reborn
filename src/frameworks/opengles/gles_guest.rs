@@ -289,7 +289,10 @@ fn with_ctx_mem_and_buffers<T, U: Default>(env: &mut Environment, f: T) -> U
 where
     T: FnOnce(&mut dyn GLES, &mut Mem, &mut GLShadowState, &mut BufferObjects) -> Result<U, GLenum>,
 {
-    let Some(current_ctx) = *env.framework_state.opengles.current_ctx_for_thread(env.current_thread)
+    let Some(current_ctx) = *env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread)
     else {
         return U::default();
     };
@@ -304,12 +307,19 @@ where
     // Clearing a prior driver error must not hide it from the app.
     loop {
         let error = unsafe { gles.GetError() };
-        if error == gles11::NO_ERROR { break; }
+        if error == gles11::NO_ERROR {
+            break;
+        }
         shadow.record_error(error);
     }
     let result = {
         let _guard = GuestGlesCallGuard::enter();
-        f(gles.as_mut(), &mut env.mem, shadow, &mut host.buffers.borrow_mut())
+        f(
+            gles.as_mut(),
+            &mut env.mem,
+            shadow,
+            &mut host.buffers.borrow_mut(),
+        )
     };
     let result = match result {
         Ok(value) => value,
@@ -324,7 +334,9 @@ where
     };
     loop {
         let error = unsafe { gles.GetError() };
-        if error == gles11::NO_ERROR { break; }
+        if error == gles11::NO_ERROR {
+            break;
+        }
         shadow.record_error(error);
         if trace {
             log!("[--trace-gl-errors] buffer call reported glGetError() = {:#x} dispatched from {}:{}",
@@ -337,7 +349,10 @@ where
 fn glGetError(env: &mut Environment) -> GLenum {
     let ignore_gl_errors = env.options.ignore_gl_errors;
     with_ctx_mem_and_shadow(env, |gles, _mem, shadow| {
-        let err = shadow.errors.pop_front().unwrap_or_else(|| unsafe { gles.GetError() });
+        let err = shadow
+            .errors
+            .pop_front()
+            .unwrap_or_else(|| unsafe { gles.GetError() });
         if err != 0 {
             if ignore_gl_errors {
                 return 0;
@@ -1268,7 +1283,9 @@ fn glBufferSubData(
         let range = objects.validate_sub_data(gles, target, buffer, offset, size)?;
         let guest_data = data;
         debug_log_buffer_upload(gles, mem, "BufferSubData", target, offset, size, data);
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && target == ARRAY_BUFFER && !data.is_null()
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW")
+            && target == ARRAY_BUFFER
+            && !data.is_null()
         {
             let mut bound: GLint = 0;
             gles.GetIntegerv(0x8894 /*ARRAY_BUFFER_BINDING*/, &mut bound);
@@ -1277,7 +1294,10 @@ fn glBufferSubData(
                 let mut cache = diag_buffer_cache().lock().unwrap();
                 let buf = cache.entry(bound as GLuint).or_default();
                 let start = offset as usize;
-                if let Some(end) = start.checked_add(size as usize).filter(|end| *end <= 4_194_304) {
+                if let Some(end) = start
+                    .checked_add(size as usize)
+                    .filter(|end| *end <= 4_194_304)
+                {
                     if buf.len() < end {
                         buf.resize(end, 0);
                     }
@@ -1297,8 +1317,11 @@ fn glBufferSubData(
             return Err(error);
         }
         if !guest_data.is_null() {
-            objects.sub_data(buffer, range.start,
-                mem.bytes_at(guest_data.cast(), size as GuestUSize));
+            objects.sub_data(
+                buffer,
+                range.start,
+                mem.bytes_at(guest_data.cast(), size as GuestUSize),
+            );
         }
         Ok(())
     })
@@ -2037,10 +2060,13 @@ fn glGetBufferPointervOES(
 ) {
     with_ctx_mem_and_buffers(env, |gles, mem, _shadow, objects| {
         let buffer = buffer_mapping::binding(gles, target)?;
-        if pname != 0x88bd { // GL_BUFFER_MAP_POINTER[_OES]
+        if pname != 0x88bd {
+            // GL_BUFFER_MAP_POINTER[_OES]
             return Err(gles11::INVALID_ENUM);
         }
-        let pointer = objects.mapping(buffer).map_or(Ptr::null(), |m| m.guest.cast_const());
+        let pointer = objects
+            .mapping(buffer)
+            .map_or(Ptr::null(), |m| m.guest.cast_const());
         mem.write(params, pointer);
         Ok(())
     });
@@ -4348,7 +4374,8 @@ fn unmap_buffer(env: &mut Environment, target: GLenum, _oes: bool) -> GLboolean 
                     let bytes = cache.entry(buffer).or_default();
                     bytes.resize(bytes.len().max(mapping.offset + mapping.length), 0);
                     bytes[mapping.offset..mapping.offset + mapping.length].copy_from_slice(
-                        mem.bytes_at(mapping.guest.cast(), mapping.length as GuestUSize));
+                        mem.bytes_at(mapping.guest.cast(), mapping.length as GuestUSize),
+                    );
                 }
             }
         }

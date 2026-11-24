@@ -43,6 +43,7 @@ pub struct GLES2NativeContext {
     /// Whether the host driver advertises `GL_OES_texture_3D`.
     texture_3d_ext_supported: bool,
     map_buffer_range_supported: bool,
+    native_es3: bool,
 }
 
 impl GLESContext for GLES2NativeContext {
@@ -60,6 +61,7 @@ impl GLESContext for GLES2NativeContext {
             shadow_samplers_ext_supported: false,
             texture_3d_ext_supported: false,
             map_buffer_range_supported: false,
+            native_es3: false,
         })
     }
 
@@ -75,6 +77,7 @@ impl GLESContext for GLES2NativeContext {
                 shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
                 texture_3d_ext_supported: self.texture_3d_ext_supported,
                 map_buffer_range_supported: self.map_buffer_range_supported,
+                native_es3: self.native_es3,
                 map_buffer_stagings: Vec::new(),
             });
         }
@@ -93,6 +96,7 @@ impl GLESContext for GLES2NativeContext {
             self.shadow_samplers_ext_supported = unsafe { detect_shadow_samplers_ext_support() };
             self.texture_3d_ext_supported = unsafe { detect_texture_3d_ext_support() };
             self.map_buffer_range_supported = unsafe { detect_map_buffer_range_support() };
+            self.native_es3 = unsafe { detect_native_es3() };
             self.pvrtc_native_checked = true;
         }
         crate::gles::CurrentGLES::NativeES2(GLES2Native {
@@ -102,6 +106,7 @@ impl GLESContext for GLES2NativeContext {
             shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
             texture_3d_ext_supported: self.texture_3d_ext_supported,
             map_buffer_range_supported: self.map_buffer_range_supported,
+            native_es3: self.native_es3,
             map_buffer_stagings: Vec::new(),
         })
     }
@@ -119,6 +124,7 @@ impl GLESContext for GLES2NativeContext {
                 shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
                 texture_3d_ext_supported: self.texture_3d_ext_supported,
                 map_buffer_range_supported: self.map_buffer_range_supported,
+                native_es3: self.native_es3,
                 map_buffer_stagings: Vec::new(),
             });
         }
@@ -132,6 +138,7 @@ impl GLESContext for GLES2NativeContext {
             self.shadow_samplers_ext_supported = detect_shadow_samplers_ext_support();
             self.texture_3d_ext_supported = detect_texture_3d_ext_support();
             self.map_buffer_range_supported = detect_map_buffer_range_support();
+            self.native_es3 = detect_native_es3();
             self.pvrtc_native_checked = true;
         }
         crate::gles::CurrentGLES::NativeES2(GLES2Native {
@@ -141,6 +148,7 @@ impl GLESContext for GLES2NativeContext {
             shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
             texture_3d_ext_supported: self.texture_3d_ext_supported,
             map_buffer_range_supported: self.map_buffer_range_supported,
+            native_es3: self.native_es3,
             map_buffer_stagings: Vec::new(),
         })
     }
@@ -516,12 +524,8 @@ unsafe fn detect_map_buffer_range_support() -> bool {
     {
         return false;
     }
-    let version = gles2::GetString(gles2::VERSION);
-    if !version.is_null() {
-        let version = CStr::from_ptr(version.cast()).to_bytes();
-        if version.starts_with(b"OpenGL ES 3.") {
-            return true;
-        }
+    if detect_native_es3() {
+        return true;
     }
     let extensions = gles2::GetString(gles2::EXTENSIONS);
     !extensions.is_null()
@@ -529,6 +533,14 @@ unsafe fn detect_map_buffer_range_support() -> bool {
             .to_bytes()
             .split(|b| b.is_ascii_whitespace())
             .any(|e| e == b"GL_EXT_map_buffer_range")
+}
+
+unsafe fn detect_native_es3() -> bool {
+    let version = gles2::GetString(gles2::VERSION);
+    !version.is_null()
+        && CStr::from_ptr(version.cast())
+            .to_bytes()
+            .starts_with(b"OpenGL ES 3.")
 }
 
 pub struct GLES2Native<'gl_ctx> {
@@ -539,6 +551,7 @@ pub struct GLES2Native<'gl_ctx> {
     shadow_samplers_ext_supported: bool,
     texture_3d_ext_supported: bool,
     map_buffer_range_supported: bool,
+    native_es3: bool,
     /// CPU staging buffers for the `glMapBufferOES` fallback (see below).
     ///
     /// Games can legitimately have more than one buffer mapped at a time
@@ -1625,21 +1638,11 @@ impl GLES for GLES2Native<'_> {
         stride: GLsizei,
         pointer: *const GLvoid,
     ) {
-        // GL_HALF_FLOAT_OES (0x8D61) is the ES 2.0 OES-extension token for
-        // 16-bit floats in vertex attributes (GL_OES_vertex_half_float).
-        // In ES 3.0+ and desktop OpenGL the core token is GL_HALF_FLOAT
-        // (0x140B) — a different numeric value.  AMD's native GLES 3.x
-        // driver on Windows only accepts the core token, so passing 0x8D61
-        // yields GL_INVALID_ENUM every frame, breaking the stage render.
-        // We translate here so that apps using GLES 2.0 half-float vertex
-        // data (e.g. the Supercell SC3D engine used by Brawl Stars) work
-        // correctly on any host driver.
-        //
-        // Reference: https://registry.khronos.org/OpenGL/extensions/OES/OES_vertex_half_float.txt
-        const GL_HALF_FLOAT_OES: GLenum = 0x8D61;
-        const GL_HALF_FLOAT: GLenum = 0x140B;
-        let type_ = if type_ == GL_HALF_FLOAT_OES {
-            GL_HALF_FLOAT
+        // A real ES 2.0 driver requires HALF_FLOAT_OES; ES 3.x hosts
+        // (including an ES 3.x driver serving this ES 2.0 backend) use the
+        // core token. Query the host version, not the guest context API.
+        let type_ = if self.native_es3 {
+            super::util::core_vertex_attrib_type(type_)
         } else {
             type_
         };

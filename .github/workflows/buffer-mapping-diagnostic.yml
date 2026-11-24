@@ -92,6 +92,14 @@ jobs:
           gdb -q -nx -batch -return-child-result -x "$GITHUB_WORKSPACE/results/crash.gdb" --args "$GITHUB_WORKSPACE/emulator/touchHLE" "$@" &
           debugger=$!
           echo "$debugger" > "$GITHUB_WORKSPACE/results/gdb.pid"
+          wrapper=$$
+          # The tap script kills its executable after a successful run.
+          # Interrupt GDB when that wrapper exits, so it records a live stack
+          # and closes the output pipe instead of leaving the reader blocked.
+          (
+            while kill -0 "$wrapper" 2>/dev/null; do sleep 0.25; done
+            kill -INT "$debugger" 2>/dev/null || true
+          ) </dev/null >/dev/null 2>&1 &
           for attempt in $(seq 1 120); do
             window=$(xdotool search --onlyvisible --name HyperHLE | head -n 1 || true)
             if [ -n "$window" ]; then

@@ -1165,6 +1165,7 @@ impl GLES for GLES3Native<'_> {
         stride: GLsizei,
         pointer: *const GLvoid,
     ) {
+        let type_ = super::util::core_vertex_attrib_type(type_);
         gles30::VertexAttribPointer(index, size, type_, normalized, stride, pointer)
     }
     unsafe fn VertexAttrib1f(&mut self, index: GLuint, x: GLfloat) {

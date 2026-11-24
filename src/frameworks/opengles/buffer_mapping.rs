@@ -392,7 +392,11 @@ mod tests {
         let driver = driver(native);
         let mut buffers = BufferObjects::default();
         buffers.contents.insert(7, driver.data.clone());
-        (driver, Mem::new(), buffers)
+        let mut mem = Mem::new();
+        // Like a loaded app's __PAGEZERO, reserve NULL before allocating
+        // guest buffers. Large allocations otherwise legitimately start at 0.
+        mem.set_null_segment_size(0x1000);
+        (driver, mem, buffers)
     }
 
     #[test]

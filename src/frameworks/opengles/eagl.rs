@@ -543,6 +543,7 @@ fn sharegroup_preserves_type_identity_and_resources() {
         &first_host.renderbuffer_drawable_bindings,
         &second_host.renderbuffer_drawable_bindings
     ));
+    assert!(Rc::ptr_eq(&first_host.buffers, &second_host.buffers));
     assert_eq!(detach_sharegroup(&mut objc, first), group);
     assert!(!objc.decrement_refcount(group));
     objc.dealloc_object(first, &mut mem);
