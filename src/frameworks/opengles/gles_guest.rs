@@ -14,6 +14,7 @@ use crate::mem::{ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, Mem, MutPtr, Mu
 use crate::objc::nil;
 use crate::window::DeviceFamily;
 use crate::Environment;
+use super::buffer_mapping::{self, BufferObjects};
 use std::collections::HashMap;
 use std::slice::from_raw_parts;
 use touchHLE_gl_bindings::gles11::{
@@ -281,10 +282,62 @@ where
     res
 }
 
+/// Dispatch buffer operations while preserving driver errors and the shared
+/// mapping state. Validation errors remain visible to the guest's glGetError.
+#[track_caller]
+fn with_ctx_mem_and_buffers<T, U: Default>(env: &mut Environment, f: T) -> U
+where
+    T: FnOnce(&mut dyn GLES, &mut Mem, &mut GLShadowState, &mut BufferObjects) -> Result<U, GLenum>,
+{
+    let Some(current_ctx) = *env.framework_state.opengles.current_ctx_for_thread(env.current_thread)
+    else {
+        return U::default();
+    };
+    let caller = std::panic::Location::caller();
+    let trace = env.options.trace_gl_errors;
+    let host = env.objc.borrow_mut::<EAGLContextHostObject>(current_ctx);
+    let Some(context) = host.gles_ctx.as_deref_mut() else {
+        return U::default();
+    };
+    let mut gles = context.make_current(env.window.as_mut().expect("OpenGL ES needs a window"));
+    let shadow = &mut host.shadow;
+    // Clearing a prior driver error must not hide it from the app.
+    loop {
+        let error = unsafe { gles.GetError() };
+        if error == gles11::NO_ERROR { break; }
+        shadow.record_error(error);
+    }
+    let result = {
+        let _guard = GuestGlesCallGuard::enter();
+        f(gles.as_mut(), &mut env.mem, shadow, &mut host.buffers.borrow_mut())
+    };
+    let result = match result {
+        Ok(value) => value,
+        Err(error) => {
+            shadow.record_error(error);
+            if trace {
+                log!("[--trace-gl-errors] buffer call reported glGetError() = {:#x} dispatched from {}:{}",
+                    error, caller.file(), caller.line());
+            }
+            U::default()
+        }
+    };
+    loop {
+        let error = unsafe { gles.GetError() };
+        if error == gles11::NO_ERROR { break; }
+        shadow.record_error(error);
+        if trace {
+            log!("[--trace-gl-errors] buffer call reported glGetError() = {:#x} dispatched from {}:{}",
+                error, caller.file(), caller.line());
+        }
+    }
+    result
+}
+
 fn glGetError(env: &mut Environment) -> GLenum {
     let ignore_gl_errors = env.options.ignore_gl_errors;
-    with_ctx_and_mem(env, |gles, _mem| {
-        let err = unsafe { gles.GetError() };
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| {
+        let err = shadow.errors.pop_front().unwrap_or_else(|| unsafe { gles.GetError() });
         if err != 0 {
             if ignore_gl_errors {
                 return 0;
@@ -1027,14 +1080,16 @@ fn glDeleteBuffers(env: &mut Environment, n: GLsizei, buffers: ConstPtr<GLuint>)
     if n <= 0 || buffers.is_null() {
         return;
     }
-    with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
+    with_ctx_mem_and_buffers(env, |gles, mem, shadow, objects| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let deleted: Vec<GLuint> = (0..n_usize).map(|i| mem.read(buffers + i)).collect();
         for buffer in &deleted {
             shadow.on_buffers_deleted(*buffer);
+            objects.delete(mem, *buffer);
         }
         unsafe { gles.DeleteBuffers(n, deleted.as_ptr()) };
         crate::gles::perf_overlay::delete_gl_buffers(shadow.resource_group_token, &deleted);
+        Ok(())
     })
 }
 fn glBindBuffer(env: &mut Environment, target: GLenum, buffer: GLuint) {
@@ -1127,7 +1182,12 @@ fn glBufferData(
     data: ConstPtr<GLvoid>,
     usage: GLenum,
 ) {
-    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+    with_ctx_mem_and_buffers(env, |gles, mem, shadow, objects| unsafe {
+        let buffer = buffer_mapping::binding(gles, target)?;
+        if size < 0 {
+            return Err(gles11::INVALID_VALUE);
+        }
+        let guest_data = data;
         debug_log_buffer_upload(gles, mem, "BufferData", target, 0, size, data);
         if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && target == ARRAY_BUFFER && !data.is_null()
         {
@@ -1181,6 +1241,11 @@ fn glBufferData(
                 .cast()
         };
         gles.BufferData(target, size as HostGLsizeiptr, data, usage);
+        let error = gles.GetError();
+        if error != gles11::NO_ERROR {
+            return Err(error);
+        }
+        objects.data(gles, mem, buffer, size, guest_data);
         if bound_buffer > 0 && size >= 0 {
             crate::gles::perf_overlay::record_gl_buffer_allocation(
                 shadow.resource_group_token,
@@ -1188,6 +1253,7 @@ fn glBufferData(
                 size as u64,
             );
         }
+        Ok(())
     })
 }
 fn glBufferSubData(
@@ -1197,7 +1263,10 @@ fn glBufferSubData(
     size: GuestGLsizeiptr,
     data: ConstPtr<GLvoid>,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_buffers(env, |gles, mem, _shadow, objects| unsafe {
+        let buffer = buffer_mapping::binding(gles, target)?;
+        let range = objects.validate_sub_data(gles, target, buffer, offset, size)?;
+        let guest_data = data;
         debug_log_buffer_upload(gles, mem, "BufferSubData", target, offset, size, data);
         if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && target == ARRAY_BUFFER && !data.is_null()
         {
@@ -1222,7 +1291,16 @@ fn glBufferSubData(
             mem.ptr_at(data.cast::<u8>(), size.try_into().unwrap())
                 .cast()
         };
-        gles.BufferSubData(target, offset as HostGLintptr, size as HostGLsizeiptr, data)
+        gles.BufferSubData(target, offset as HostGLintptr, size as HostGLsizeiptr, data);
+        let error = gles.GetError();
+        if error != gles11::NO_ERROR {
+            return Err(error);
+        }
+        if !guest_data.is_null() {
+            objects.sub_data(buffer, range.start,
+                mem.bytes_at(guest_data.cast(), size as GuestUSize));
+        }
+        Ok(())
     })
 }
 
@@ -1953,11 +2031,19 @@ fn glWeightPointerOES(
 }
 fn glGetBufferPointervOES(
     env: &mut Environment,
-    _target: GLenum,
-    _pname: GLenum,
+    target: GLenum,
+    pname: GLenum,
     params: MutPtr<ConstVoidPtr>,
 ) {
-    env.mem.write(params, Ptr::null());
+    with_ctx_mem_and_buffers(env, |gles, mem, _shadow, objects| {
+        let buffer = buffer_mapping::binding(gles, target)?;
+        if pname != 0x88bd { // GL_BUFFER_MAP_POINTER[_OES]
+            return Err(gles11::INVALID_ENUM);
+        }
+        let pointer = objects.mapping(buffer).map_or(Ptr::null(), |m| m.guest.cast_const());
+        mem.write(params, pointer);
+        Ok(())
+    });
 }
 
 /// Guard against a whole-emulator crash caused by enabled *client-side* vertex
@@ -4228,243 +4314,45 @@ fn glGenerateMipmap(env: &mut Environment, target: GLenum) {
     glGenerateMipmapOES(env, target)
 }
 
-fn _get_currently_bound_buffer_object_name(env: &mut Environment, target: GLenum) -> GLuint {
-    let binding = match target {
-        ARRAY_BUFFER => gles11::ARRAY_BUFFER_BINDING,
-        ELEMENT_ARRAY_BUFFER => ELEMENT_ARRAY_BUFFER_BINDING,
-        other => {
-            // Anything else is a malformed call from the guest. Real GL
-            // would set GL_INVALID_ENUM; we have nothing sensible to bind
-            // against so just report "no object bound" and continue.
-            log!(
-                "Warning: _get_currently_bound_buffer_object_name(): unsupported buffer target {:#x}; returning 0.",
-                other
-            );
-            return 0;
-        }
-    };
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        let mut name: GLint = 0;
-        gles.GetIntegerv(binding, &mut name);
-        name as GLuint
-    })
-}
-
-fn _get_buffer_size(env: &mut Environment, target: GLenum) -> GLint {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        let mut size: GLint = 0;
-        gles.GetBufferParameteriv(target, gles11::BUFFER_SIZE, &mut size);
-        size
-    })
-}
-
 fn glGetBufferParameteriv(
     env: &mut Environment,
     target: GLenum,
     pname: GLenum,
     params: MutPtr<GLint>,
 ) {
-    let params = env.mem.ptr_at_mut(params, 1);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.GetBufferParameteriv(target, pname, params)
+    with_ctx_mem_and_buffers(env, |gles, mem, _shadow, objects| {
+        let buffer = buffer_mapping::binding(gles, target)?;
+        if let Some(value) = objects.parameter(buffer, pname) {
+            mem.write(params, value as GLint);
+        } else {
+            let params = mem.ptr_at_mut(params, 1);
+            unsafe { gles.GetBufferParameteriv(target, pname, params) };
+        }
+        Ok(())
+    });
+}
+
+fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutPtr<GLvoid> {
+    with_ctx_mem_and_buffers(env, |gles, mem, _shadow, objects| {
+        objects.map_oes(gles, mem, target, access)
     })
 }
-fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutPtr<GLvoid> {
-    // Real drivers accept the three buffer-access modes; only the target and
-    // the access value have to be legal. Returning nil for anything else (the
-    // previous behaviour) made the caller write vertex/index data through a
-    // NULL pointer, which is exactly the silent nil-page write flood seen in
-    // Asphalt 8's drift events. Accept the full set instead of WRITE_ONLY.
-    const READ_ONLY: GLenum = 0x88B8;
-    const READ_WRITE: GLenum = 0x88BA;
-    if !matches!(target, ARRAY_BUFFER | ELEMENT_ARRAY_BUFFER)
-        || !matches!(access, WRITE_ONLY_OES | READ_ONLY | READ_WRITE)
-    {
-        log!(
-            "Warning: glMapBufferOES(target={:#x}, access={:#x}) is not a supported \
-             combination; returning NULL. If the app then writes through it, expect \
-             nil-page writes.",
-            target,
-            access
-        );
-        return nil.cast();
-    }
-    // glMapBufferOES requires a current context (Apple: "An EAGLContext must
-    // be current on the thread before any GL calls"). Without one the call
-    // fails and glMapBufferOES returns NULL.
-    let Some(current_ctx) = *env
-        .framework_state
-        .opengles
-        .current_ctx_for_thread(env.current_thread)
-    else {
-        log!(
-            "Warning: glMapBufferOES on thread {} with no current EAGLContext; \
-             returning NULL.",
-            env.current_thread
-        );
-        return nil.cast();
-    };
-    let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
-    let buffer_size = match usize::try_from(_get_buffer_size(env, target)) {
-        Ok(size) if size > 0 => size,
-        _ => {
-            // GL_OES_mapbuffer: mapping succeeds only if the buffer has a
-            // data store; a buffer created with size 0 has none.
-            log!(
-                "Warning: glMapBufferOES(target={:#x}, access={:#x}) on buffer {} whose \
-                 data store is empty or unreadable; returning NULL.",
-                target,
-                access,
-                buffer_object_name
-            );
-            return nil.cast();
-        }
-    };
-    // The mapping the guest sees is a mirror in guest memory, uploaded to the
-    // buffer object by glUnmapBufferOES. The driver's own mapping is never
-    // held across a guest call, because the driver is free to invalidate it
-    // whenever the buffer is re-specified, re-mapped or deleted, and writing
-    // through the stale pointer afterwards corrupted the heap and killed the
-    // emulator with a SIGSEGV at a garbage address (Republique, Unity 4.5).
-    let guest_buffer: MutVoidPtr = env.mem.alloc(buffer_size as GuestUSize).cast();
-    // Mirror the buffer's current contents only when the app is allowed to
-    // read them. With GL_WRITE_ONLY_OES the contents are undefined until the
-    // app writes them, so the read would be pure overhead. Either way the
-    // map/copy/unmap happens here, with no guest code in between, so the
-    // driver pointer cannot outlive this function.
-    if access != WRITE_ONLY_OES {
-        let host_buffer = with_ctx_and_mem(env, |gles, _mem| unsafe {
-            gles.MapBufferOES(target, access)
-        });
-        if !host_buffer.is_null() {
-            unsafe {
-                env.mem
-                    .bytes_at_mut(guest_buffer.cast(), buffer_size as GuestUSize)
-                    .copy_from_slice(from_raw_parts(host_buffer as *const u8, buffer_size));
+
+fn unmap_buffer(env: &mut Environment, target: GLenum, _oes: bool) -> GLboolean {
+    with_ctx_mem_and_buffers(env, |gles, mem, _shadow, objects| {
+        let buffer = buffer_mapping::binding(gles, target)?;
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && target == ARRAY_BUFFER {
+            if let Some(mapping) = objects.mapping(buffer) {
+                if mapping.offset + mapping.length <= 4_194_304 {
+                    let mut cache = diag_buffer_cache().lock().unwrap();
+                    let bytes = cache.entry(buffer).or_default();
+                    bytes.resize(bytes.len().max(mapping.offset + mapping.length), 0);
+                    bytes[mapping.offset..mapping.offset + mapping.length].copy_from_slice(
+                        mem.bytes_at(mapping.guest.cast(), mapping.length as GuestUSize));
+                }
             }
-            with_ctx_and_mem(env, |gles, _mem| unsafe {
-                gles.UnmapBufferOES(target);
-            });
         }
-    }
-    let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(current_ctx);
-    // Per the GL_OES_mapbuffer spec, calling glMapBufferOES while a buffer is
-    // already mapped is a GL_INVALID_OPERATION and returns NULL. Some apps
-    // (e.g. ZAS) accidentally re-map without unmapping first; the previous
-    // guest mirror is still owned by the guest, so we drop it and install the
-    // new one so the app can continue uploading data instead of crashing.
-    if let Some((stale_guest_buffer, _stale_host_ptr, _stale_size)) = host_object
-        .mapped_buffers
-        .remove(&(target, buffer_object_name))
-    {
-        log!(
-            "Warning: glMapBufferOES called on buffer {} that was already mapped; \
-             discarding the previous mapping (the previous pointer is no longer valid).",
-            buffer_object_name
-        );
-        env.mem.free(stale_guest_buffer);
-    }
-    host_object
-        .mapped_buffers
-        .insert((target, buffer_object_name), (guest_buffer, None, buffer_size));
-    guest_buffer
-}
-fn unmap_buffer(env: &mut Environment, target: GLenum, oes: bool) -> GLboolean {
-    let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
-    let Some(current_ctx) = env
-        .framework_state
-        .opengles
-        .current_ctx_for_thread(env.current_thread)
-        .as_ref()
-        .copied()
-    else {
-        return gles11::FALSE;
-    };
-    let mapping = env
-        .objc
-        .borrow_mut::<EAGLContextHostObject>(current_ctx)
-        .mapped_buffers
-        .remove(&(target, buffer_object_name));
-    let Some((guest_buffer, host_ptr, buffer_size)) = mapping else {
-        // An unbalanced unmap (no guest mapping recorded for this buffer):
-        // every driver-side mapping is owned by a recorded guest mapping, so
-        // the buffer cannot be driver-mapped here. Forwarding the call would
-        // only raise a spurious GL_INVALID_OPERATION (seen with Asphalt 8's
-        // Jet engine, which unmaps buffers it failed to map). Treat it as a
-        // no-op reporting success, matching Apple's lenient behaviour.
-        log_dbg!(
-            "glUnmapBuffer{} on buffer {} with no matching mapping; ignoring",
-            if oes { "OES" } else { "" },
-            buffer_object_name
-        );
-        return gles11::TRUE;
-    };
-    // Upload the guest's mirror to the buffer object. A mapping recorded by
-    // glMapBufferRange still owns a real driver mapping, so it is filled and
-    // then unmapped; a mapping recorded by glMapBufferOES has no driver
-    // pointer (see the comment there) and is uploaded with glBufferSubData.
-    // Either way the guest never gets to see, or write through, a driver
-    // pointer that may have been invalidated in the meantime.
-    match host_ptr {
-        Some(host_ptr) => unsafe {
-            host_ptr.copy_from(
-                env.mem
-                    .bytes_at(guest_buffer.cast(), buffer_size as GuestUSize)
-                    .as_ptr() as *mut GLvoid,
-                buffer_size,
-            );
-        },
-        None => {
-            with_ctx_and_mem(env, |gles, mem| unsafe {
-                let data = mem
-                    .bytes_at(guest_buffer.cast(), buffer_size as GuestUSize)
-                    .as_ptr() as *const GLvoid;
-                gles.BufferSubData(target, 0, buffer_size as HostGLsizeiptr, data);
-            });
-        }
-    }
-    // DIAG: cache the unmapped buffer content so TOUCHHLE_TRACE_DRAW can read
-    // texcoords at draw time (the game streams its vertex data via map/unmap,
-    // not glBufferData, so it was otherwise invisible to the cache).
-    if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && target == ARRAY_BUFFER {
-        let bytes = env
-            .mem
-            .bytes_at(guest_buffer.cast(), buffer_size as GuestUSize)
-            .to_vec();
-        if bytes.len() <= 4_194_304 {
-            diag_buffer_cache()
-                .lock()
-                .unwrap()
-                .insert(buffer_object_name, bytes);
-        }
-    }
-    env.mem.free(guest_buffer);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        let result = if host_ptr.is_none() {
-            // The data was already uploaded with glBufferSubData above and no
-            // driver mapping is open, so there is nothing left to unmap.
-            gles11::TRUE
-        } else if oes {
-            gles.UnmapBufferOES(target)
-        } else {
-            gles.UnmapBuffer(target)
-        };
-        // Strict drivers (e.g. Qualcomm Adreno) can raise GL_INVALID_OPERATION
-        // here even for mappings we believe are balanced, poisoning the error
-        // queue for the app's own glGetError() polling. Apple's unmap never
-        // surfaces such phantom errors, so purge whatever this call raised and
-        // keep reporting success (same lenient philosophy as the unbalanced
-        // unmap path above).
-        let raised = gles.GetError();
-        if raised != 0 {
-            log_dbg!(
-                "glUnmapBuffer{}: driver raised error {:#x} on unmap of target {:#x}; purging (treated as benign)",
-                if oes { "OES" } else { "" },
-                raised,
-                target
-            );
-        }
-        result
+        objects.unmap(gles, mem, target)
     })
 }
 
@@ -7380,6 +7268,8 @@ fn glUnmapBuffer(env: &mut Environment, target: GLenum) -> GLboolean {
 // the host driver sees host addresses.
 
 // -- Buffer object operations --
+/// GL_EXT_map_buffer_range is available to ES 2.0 apps as well as ES 3.0.
+/// All mappings expose guest memory, never an untranslated driver pointer.
 fn glMapBufferRange(
     env: &mut Environment,
     target: GLenum,
@@ -7387,73 +7277,9 @@ fn glMapBufferRange(
     length: GuestGLsizeiptr,
     access: GLbitfield,
 ) -> MutVoidPtr {
-    let host_ptr: *mut GLvoid = with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.MapBufferRange(
-            target,
-            offset as HostGLintptr,
-            length as HostGLsizeiptr,
-            access,
-        )
-    });
-    // The host pointer cannot be observed by the guest directly. EAGL
-    // tracks pending mappings in `EAGLContextHostObject::mapped_buffers`;
-    // the matching `glUnmapBuffer` consults that table. Allocate a guest
-    // buffer of `length` bytes, copy the contents from the host pointer,
-    // and remember the pairing.
-    if host_ptr.is_null() || length == 0 {
-        log!(
-            "Warning: glMapBufferRange(target={:#x}, offset={}, length={}, access={:#x}) \
-             produced a NULL host pointer or zero length; returning NULL.",
-            target,
-            offset,
-            length,
-            access
-        );
-        return Ptr::null();
-    }
-    let length_usize = match usize::try_from(length) {
-        Ok(size) => size,
-        Err(_) => {
-            log!(
-                "Warning: glMapBufferRange with negative/overflowing length {}; returning NULL.",
-                length
-            );
-            return Ptr::null();
-        }
-    };
-    let guest_buf: MutPtr<GLvoid> = env.mem.alloc(length_usize as GuestUSize).cast();
-    unsafe {
-        let host_slice = from_raw_parts(host_ptr as *const u8, length_usize);
-        let guest_slice = env
-            .mem
-            .bytes_at_mut(guest_buf.cast(), length_usize as GuestUSize);
-        guest_slice.copy_from_slice(host_slice);
-    }
-    let current_ctx: Option<crate::objc::id> = *env
-        .framework_state
-        .opengles
-        .current_ctx_for_thread(env.current_thread);
-    let Some(ctx) = current_ctx else {
-        log!(
-            "Warning: glMapBufferRange on thread {} with no current EAGLContext; \
-             returning NULL.",
-            env.current_thread
-        );
-        env.mem.free(guest_buf);
-        with_ctx_and_mem(env, |gles, _mem| unsafe {
-            gles.UnmapBuffer(target);
-        });
-        return Ptr::null();
-    };
-    let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
-    let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(ctx);
-    if let Some((old_guest_buf, _, _)) = host_obj.mapped_buffers.insert(
-        (target, buffer_object_name),
-        (guest_buf, Some(host_ptr), length_usize),
-    ) {
-        env.mem.free(old_guest_buf);
-    }
-    guest_buf.cast()
+    with_ctx_mem_and_buffers(env, |gles, mem, _shadow, objects| {
+        objects.map(gles, mem, target, offset, length, access)
+    })
 }
 
 fn glFlushMappedBufferRange(
@@ -7462,66 +7288,8 @@ fn glFlushMappedBufferRange(
     offset: GuestGLintptr,
     length: GuestGLsizeiptr,
 ) {
-    // Copy the relevant slice of the guest-visible buffer back to the
-    // host-mapped buffer so the driver sees the writes.
-    let current_ctx: Option<crate::objc::id> = *env
-        .framework_state
-        .opengles
-        .current_ctx_for_thread(env.current_thread);
-    if let Some(ctx) = current_ctx {
-        let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
-        let mapping = env
-            .objc
-            .borrow::<EAGLContextHostObject>(ctx)
-            .mapped_buffers
-            .get(&(target, buffer_object_name))
-            .copied();
-        if let Some((guest_buf, host_ptr, mapped_size)) = mapping {
-            let offset_usize = match usize::try_from(offset) {
-                Ok(value) => value,
-                Err(_) => return,
-            };
-            let length_usize = match usize::try_from(length) {
-                Ok(value) => value,
-                Err(_) => return,
-            };
-            let end = match offset_usize.checked_add(length_usize) {
-                Some(value) if value <= mapped_size => value,
-                _ => return,
-            };
-            match host_ptr {
-                Some(host_ptr) => {
-                    let guest_slice = env.mem.bytes_at(guest_buf.cast(), end as GuestUSize);
-                    unsafe {
-                        let host_slice = std::slice::from_raw_parts_mut(
-                            (host_ptr as *mut u8).add(offset_usize),
-                            length_usize,
-                        );
-                        host_slice.copy_from_slice(&guest_slice[offset_usize..end]);
-                    }
-                }
-                None => {
-                    // A glMapBufferOES mapping has no driver pointer; flushing
-                    // it means uploading the requested range. No driver-side
-                    // mapping exists, so there is nothing to forward the flush
-                    // to either.
-                    with_ctx_and_mem(env, |gles, mem| unsafe {
-                        let data = mem.bytes_at(guest_buf.cast(), end as GuestUSize).as_ptr()
-                            .add(offset_usize) as *const GLvoid;
-                        gles.BufferSubData(
-                            target,
-                            offset as HostGLintptr,
-                            length_usize as HostGLsizeiptr,
-                            data,
-                        );
-                    });
-                    return;
-                }
-            }
-        }
-    }
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.FlushMappedBufferRange(target, offset as HostGLintptr, length as HostGLsizeiptr)
+    with_ctx_mem_and_buffers(env, |gles, mem, _shadow, objects| {
+        objects.flush(gles, mem, target, offset, length)
     });
 }
 
@@ -8384,9 +8152,15 @@ fn glGetBufferParameteri64v(
     pname: GLenum,
     params: MutPtr<i64>,
 ) {
-    let params = env.mem.ptr_at_mut(params, 1);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.GetBufferParameteri64v(target, pname, params)
+    with_ctx_mem_and_buffers(env, |gles, mem, _shadow, objects| {
+        let buffer = buffer_mapping::binding(gles, target)?;
+        if let Some(value) = objects.parameter(buffer, pname) {
+            mem.write(params, value);
+        } else {
+            let params = mem.ptr_at_mut(params, 1);
+            unsafe { gles.GetBufferParameteri64v(target, pname, params) };
+        }
+        Ok(())
     });
 }
 
@@ -8636,12 +8410,7 @@ fn glGetBufferPointerv(
     pname: GLenum,
     params: MutPtr<MutVoidPtr>,
 ) {
-    let mut host_ptr: *mut GLvoid = std::ptr::null_mut();
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.GetBufferPointerv(target, pname, &mut host_ptr);
-    });
-    let _ = host_ptr;
-    env.mem.write(params, Ptr::null());
+    glGetBufferPointervOES(env, target, pname, params.cast());
 }
 
 // -- Integer uniforms --

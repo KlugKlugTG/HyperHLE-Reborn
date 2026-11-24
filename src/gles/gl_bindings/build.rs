@@ -75,7 +75,7 @@ fn main() {
         Api::Gles2,
         (2, 0),
         Profile::Core,
-        Fallbacks::None,
+        Fallbacks::All,
         [
             "GL_OES_rgb8_rgba8",
             "GL_OES_depth24",
@@ -85,6 +85,9 @@ fn main() {
             "GL_EXT_discard_framebuffer",
             "GL_EXT_texture_format_BGRA8888",
             "GL_OES_mapbuffer",
+            // ES 2.0's range mapping extension. Core aliases also handle
+            // drivers exporting the promoted ES 3.0 names only.
+            "GL_EXT_map_buffer_range",
             "GL_OES_vertex_array_object",
             // ES 2.0 query objects are exposed by this extension on drivers
             // that support boolean occlusion queries.

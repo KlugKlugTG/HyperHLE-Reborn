@@ -42,6 +42,7 @@ pub struct GLES2NativeContext {
     shadow_samplers_ext_supported: bool,
     /// Whether the host driver advertises `GL_OES_texture_3D`.
     texture_3d_ext_supported: bool,
+    map_buffer_range_supported: bool,
 }
 
 impl GLESContext for GLES2NativeContext {
@@ -58,6 +59,7 @@ impl GLESContext for GLES2NativeContext {
             texture_lod_ext_supported: false,
             shadow_samplers_ext_supported: false,
             texture_3d_ext_supported: false,
+            map_buffer_range_supported: false,
         })
     }
 
@@ -72,6 +74,7 @@ impl GLESContext for GLES2NativeContext {
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
                 shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
                 texture_3d_ext_supported: self.texture_3d_ext_supported,
+                map_buffer_range_supported: self.map_buffer_range_supported,
                 map_buffer_stagings: Vec::new(),
             });
         }
@@ -89,6 +92,7 @@ impl GLESContext for GLES2NativeContext {
             self.texture_lod_ext_supported = unsafe { detect_texture_lod_ext_support() };
             self.shadow_samplers_ext_supported = unsafe { detect_shadow_samplers_ext_support() };
             self.texture_3d_ext_supported = unsafe { detect_texture_3d_ext_support() };
+            self.map_buffer_range_supported = unsafe { detect_map_buffer_range_support() };
             self.pvrtc_native_checked = true;
         }
         crate::gles::CurrentGLES::NativeES2(GLES2Native {
@@ -97,6 +101,7 @@ impl GLESContext for GLES2NativeContext {
             texture_lod_ext_supported: self.texture_lod_ext_supported,
             shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
             texture_3d_ext_supported: self.texture_3d_ext_supported,
+            map_buffer_range_supported: self.map_buffer_range_supported,
             map_buffer_stagings: Vec::new(),
         })
     }
@@ -113,6 +118,7 @@ impl GLESContext for GLES2NativeContext {
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
                 shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
                 texture_3d_ext_supported: self.texture_3d_ext_supported,
+                map_buffer_range_supported: self.map_buffer_range_supported,
                 map_buffer_stagings: Vec::new(),
             });
         }
@@ -125,6 +131,7 @@ impl GLESContext for GLES2NativeContext {
             self.texture_lod_ext_supported = detect_texture_lod_ext_support();
             self.shadow_samplers_ext_supported = detect_shadow_samplers_ext_support();
             self.texture_3d_ext_supported = detect_texture_3d_ext_support();
+            self.map_buffer_range_supported = detect_map_buffer_range_support();
             self.pvrtc_native_checked = true;
         }
         crate::gles::CurrentGLES::NativeES2(GLES2Native {
@@ -133,6 +140,7 @@ impl GLESContext for GLES2NativeContext {
             texture_lod_ext_supported: self.texture_lod_ext_supported,
             shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
             texture_3d_ext_supported: self.texture_3d_ext_supported,
+            map_buffer_range_supported: self.map_buffer_range_supported,
             map_buffer_stagings: Vec::new(),
         })
     }
@@ -499,6 +507,30 @@ mod tests {
     }
 }
 
+/// A loader can return a dispatch stub even for an unsupported API. Require
+/// the current context's version/extension as well as the entry points.
+unsafe fn detect_map_buffer_range_support() -> bool {
+    if !gles2::MapBufferRangeEXT::is_loaded()
+        || !gles2::FlushMappedBufferRangeEXT::is_loaded()
+        || !gles2::UnmapBufferOES::is_loaded()
+    {
+        return false;
+    }
+    let version = gles2::GetString(gles2::VERSION);
+    if !version.is_null() {
+        let version = CStr::from_ptr(version.cast()).to_bytes();
+        if version.starts_with(b"OpenGL ES 3.") {
+            return true;
+        }
+    }
+    let extensions = gles2::GetString(gles2::EXTENSIONS);
+    !extensions.is_null()
+        && CStr::from_ptr(extensions.cast())
+            .to_bytes()
+            .split(|b| b.is_ascii_whitespace())
+            .any(|e| e == b"GL_EXT_map_buffer_range")
+}
+
 pub struct GLES2Native<'gl_ctx> {
     _gl_lifetime: PhantomData<&'gl_ctx ()>,
     pvrtc_native: bool,
@@ -506,6 +538,7 @@ pub struct GLES2Native<'gl_ctx> {
     texture_lod_ext_supported: bool,
     shadow_samplers_ext_supported: bool,
     texture_3d_ext_supported: bool,
+    map_buffer_range_supported: bool,
     /// CPU staging buffers for the `glMapBufferOES` fallback (see below).
     ///
     /// Games can legitimately have more than one buffer mapped at a time
@@ -1189,6 +1222,29 @@ impl GLES for GLES2Native<'_> {
     // games (e.g. LEGO Ninjago Spinjitzu Scavenger Hunt) call these even when
     // they asked EAGL for an ES 1.1 context — combined with
     // `--prefer-gles2-context`, they end up here.
+    fn supports_map_buffer_range(&self) -> bool {
+        self.map_buffer_range_supported
+    }
+    unsafe fn MapBufferRange(
+        &mut self,
+        target: GLenum,
+        offset: GLintptr,
+        length: GLsizeiptr,
+        access: GLbitfield,
+    ) -> *mut GLvoid {
+        gles2::MapBufferRangeEXT(target, offset, length, access)
+    }
+    unsafe fn FlushMappedBufferRange(
+        &mut self,
+        target: GLenum,
+        offset: GLintptr,
+        length: GLsizeiptr,
+    ) {
+        gles2::FlushMappedBufferRangeEXT(target, offset, length)
+    }
+    unsafe fn UnmapBuffer(&mut self, target: GLenum) -> GLboolean {
+        gles2::UnmapBufferOES(target)
+    }
     unsafe fn MapBufferOES(&mut self, target: GLenum, access: GLenum) -> *mut GLvoid {
         if gles2::MapBufferOES::is_loaded() {
             let mapped = gles2::MapBufferOES(target, access);

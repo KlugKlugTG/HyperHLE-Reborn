@@ -173,6 +173,8 @@ fn effective_eagl_api(
 /// context (the presenter) always restores what it found, so the mirror stays
 /// valid across presents.
 pub(super) struct GLShadowState {
+    /// Errors raised while emulating operations outside the host driver.
+    pub(super) errors: std::collections::VecDeque<GLenum>,
     pub(super) resource_group_token: usize,
     /// `GL_ARRAY_BUFFER_BINDING`.
     pub(super) array_buffer: GLuint,
@@ -217,6 +219,7 @@ pub(super) struct GLShadowState {
 impl Default for GLShadowState {
     fn default() -> Self {
         GLShadowState {
+            errors: std::collections::VecDeque::new(),
             resource_group_token: 0,
             array_buffer: 0,
             element_array_buffer: Some(0),
@@ -239,6 +242,11 @@ impl Default for GLShadowState {
     }
 }
 impl GLShadowState {
+    pub(super) fn record_error(&mut self, error: GLenum) {
+        if error != gles11::NO_ERROR && !self.errors.contains(&error) {
+            self.errors.push_back(error);
+        }
+    }
     /// Forget everything that is stored in vertex array object state.
     pub(super) fn invalidate_vao_state(&mut self) {
         self.element_array_buffer = None;
@@ -428,15 +436,8 @@ pub(super) struct EAGLContextHostObject {
     next_frame_due: Option<Instant>,
     last_profiled_frame: Option<Instant>,
     profiled_frame_intervals: Vec<f64>,
-    /// Buffers the guest currently has mapped, keyed by target and buffer
-    /// object name: `(guest mirror, driver mapping, size)`.
-    ///
-    /// The driver mapping is only set for `glMapBufferRange`, whose mapping is
-    /// still open; `glMapBufferOES` keeps the data in the guest mirror alone
-    /// and uploads it on unmap, so it never holds a driver pointer across a
-    /// guest call (see `gles_guest::glMapBufferOES`).
-    pub mapped_buffers:
-        HashMap<(GLenum, GLuint), (MutPtr<GLvoid>, Option<*mut GLvoid>, usize)>,
+    /// Buffer mappings are object state, shared by every context in the group.
+    pub(super) buffers: Rc<RefCell<super::buffer_mapping::BufferObjects>>,
 }
 impl HostObject for EAGLContextHostObject {}
 
@@ -448,6 +449,7 @@ struct EAGLSharegroupHostObject {
     retired_context: Option<Box<dyn GLESContext>>,
     resource_group_token: usize,
     renderbuffer_drawable_bindings: Rc<RefCell<HashMap<GLuint, id>>>,
+    buffers: Rc<RefCell<super::buffer_mapping::BufferObjects>>,
 }
 impl HostObject for EAGLSharegroupHostObject {}
 
@@ -462,6 +464,7 @@ fn attach_sharegroup(objc: &mut ObjC, mem: &mut crate::mem::Mem, context: id, gr
             retired_context: None,
             resource_group_token: host.present_token,
             renderbuffer_drawable_bindings: host.renderbuffer_drawable_bindings.clone(),
+            buffers: host.buffers.clone(),
         };
         let class = objc.get_known_class("EAGLSharegroup", mem);
         objc.alloc_object(class, Box::new(object), mem)
@@ -469,12 +472,13 @@ fn attach_sharegroup(objc: &mut ObjC, mem: &mut crate::mem::Mem, context: id, gr
         objc.increment_refcount(group);
         group
     };
-    let (token, bindings) = {
+    let (token, bindings, buffers) = {
         let host = objc.borrow_mut::<EAGLSharegroupHostObject>(group);
         host.contexts.push(context);
         (
             host.resource_group_token,
             host.renderbuffer_drawable_bindings.clone(),
+            host.buffers.clone(),
         )
     };
     let host = objc.borrow_mut::<EAGLContextHostObject>(context);
@@ -482,6 +486,7 @@ fn attach_sharegroup(objc: &mut ObjC, mem: &mut crate::mem::Mem, context: id, gr
     host.resource_group_token = token;
     host.shadow.resource_group_token = token;
     host.renderbuffer_drawable_bindings = bindings;
+    host.buffers = buffers;
     group
 }
 
@@ -627,7 +632,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         next_frame_due: None,
         last_profiled_frame: None,
         profiled_frame_intervals: Vec::new(),
-        mapped_buffers: HashMap::new(),
+        buffers: Rc::default(),
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -799,13 +804,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dealloc {
     let group = detach_sharegroup(&mut env.objc, this);
-    let (resource_group_token, drawables, mapped_guest_buffers) = {
+    let (resource_group_token, drawables) = {
         let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(this);
-        let mapped_guest_buffers = host_obj
-            .mapped_buffers
-            .values()
-            .map(|&(guest_buf, _, _)| guest_buf)
-            .collect::<Vec<_>>();
         let resource_group_token = host_obj.resource_group_token;
         host_obj.resource_group_token = 0;
         host_obj.shadow.resource_group_token = 0;
@@ -815,11 +815,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         } else {
             Vec::new()
         };
-        (resource_group_token, drawables, mapped_guest_buffers)
+        (resource_group_token, drawables)
     };
-    for guest_buffer in mapped_guest_buffers {
-        env.mem.free(guest_buffer);
-    }
     for drawable in drawables {
         release(env, drawable);
     }
@@ -1639,6 +1636,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())dealloc {
     let drawables = {
         let host = env.objc.borrow_mut::<EAGLSharegroupHostObject>(this);
+        host.buffers.borrow_mut().free_all(&mut env.mem);
         std::mem::take(&mut *host.renderbuffer_drawable_bindings.borrow_mut())
             .into_values().collect::<Vec<_>>()
     };

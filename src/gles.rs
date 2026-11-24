@@ -197,6 +197,9 @@ impl GLESContext for LoggingGLESContext {
 }
 
 impl<'a> GLES for LoggingGLES<'a> {
+    fn supports_map_buffer_range(&self) -> bool {
+        self.inner.supports_map_buffer_range()
+    }
     fn is_native_es1(&self) -> bool {
         self.inner.is_native_es1()
     }

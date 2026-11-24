@@ -1374,6 +1374,9 @@ impl GLES for GLES3Native<'_> {
     }
 
     // -- Buffer object operations --
+    fn supports_map_buffer_range(&self) -> bool {
+        true
+    }
     unsafe fn MapBufferRange(
         &mut self,
         target: GLenum,
