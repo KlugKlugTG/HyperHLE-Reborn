@@ -13,6 +13,52 @@ use super::gles11_raw as gles11;
 use super::gles11_raw::types::*;
 use super::gles2_glsl::patch_shadow_samplers_extension;
 use super::gles2_raw as gles2;
+use super::gles30_raw as gles30;
+use std::cell::Cell;
+use std::rc::Rc;
+
+#[derive(Clone, Copy, Debug, Default)]
+enum MultisampleApi {
+    Core,
+    Apple,
+    Angle,
+    #[default]
+    Unsupported,
+}
+
+unsafe fn detect_multisample_api(native_es3: bool) -> MultisampleApi {
+    if native_es3
+        && gles30::RenderbufferStorageMultisample::is_loaded()
+        && gles30::BlitFramebuffer::is_loaded()
+    {
+        return MultisampleApi::Core;
+    }
+    let extensions = gles2::GetString(gles11::EXTENSIONS);
+    if extensions.is_null() {
+        return MultisampleApi::Unsupported;
+    }
+    let extensions = CStr::from_ptr(extensions.cast()).to_string_lossy();
+    let has = |name| {
+        extensions
+            .split_whitespace()
+            .any(|extension| extension == name)
+    };
+    if has("GL_APPLE_framebuffer_multisample")
+        && gles2::RenderbufferStorageMultisampleAPPLE::is_loaded()
+        && gles2::ResolveMultisampleFramebufferAPPLE::is_loaded()
+    {
+        MultisampleApi::Apple
+    } else if has("GL_ANGLE_framebuffer_multisample")
+        && has("GL_ANGLE_framebuffer_blit")
+        && gles2::RenderbufferStorageMultisampleANGLE::is_loaded()
+        && gles2::BlitFramebufferANGLE::is_loaded()
+    {
+        MultisampleApi::Angle
+    } else {
+        MultisampleApi::Unsupported
+    }
+}
+
 use super::gles_generic::{GLchar, GLES};
 use super::util::{try_decode_pvrtc, PalettedTextureFormat};
 use super::GLESContext;
@@ -44,6 +90,8 @@ pub struct GLES2NativeContext {
     texture_3d_ext_supported: bool,
     map_buffer_range_supported: bool,
     native_es3: bool,
+    multisample_api: MultisampleApi,
+    multisample_error: Rc<Cell<GLenum>>,
 }
 
 impl GLESContext for GLES2NativeContext {
@@ -62,6 +110,8 @@ impl GLESContext for GLES2NativeContext {
             texture_3d_ext_supported: false,
             map_buffer_range_supported: false,
             native_es3: false,
+            multisample_api: MultisampleApi::Unsupported,
+            multisample_error: Rc::default(),
         })
     }
 
@@ -78,6 +128,8 @@ impl GLESContext for GLES2NativeContext {
                 texture_3d_ext_supported: self.texture_3d_ext_supported,
                 map_buffer_range_supported: self.map_buffer_range_supported,
                 native_es3: self.native_es3,
+                multisample_api: self.multisample_api,
+                multisample_error: self.multisample_error.clone(),
                 map_buffer_stagings: Vec::new(),
             });
         }
@@ -85,6 +137,8 @@ impl GLESContext for GLES2NativeContext {
             window.make_gl_context_current(&self.gl_ctx);
         }
         gles2::load_with(|s| window.gl_get_proc_address(s));
+        gles30::RenderbufferStorageMultisample::load_with(|s| window.gl_get_proc_address(s));
+        gles30::BlitFramebuffer::load_with(|s| window.gl_get_proc_address(s));
         // Some symbols (e.g. glGetString) are technically also part of ES 1.1
         // and are referenced via gles11:: in the surrounding code; load those
         // too so the existing helpers continue to work.
@@ -97,6 +151,7 @@ impl GLESContext for GLES2NativeContext {
             self.texture_3d_ext_supported = unsafe { detect_texture_3d_ext_support() };
             self.map_buffer_range_supported = unsafe { detect_map_buffer_range_support() };
             self.native_es3 = unsafe { detect_native_es3() };
+            self.multisample_api = unsafe { detect_multisample_api(self.native_es3) };
             self.pvrtc_native_checked = true;
         }
         crate::gles::CurrentGLES::NativeES2(GLES2Native {
@@ -107,6 +162,8 @@ impl GLESContext for GLES2NativeContext {
             texture_3d_ext_supported: self.texture_3d_ext_supported,
             map_buffer_range_supported: self.map_buffer_range_supported,
             native_es3: self.native_es3,
+            multisample_api: self.multisample_api,
+            multisample_error: self.multisample_error.clone(),
             map_buffer_stagings: Vec::new(),
         })
     }
@@ -125,11 +182,15 @@ impl GLESContext for GLES2NativeContext {
                 texture_3d_ext_supported: self.texture_3d_ext_supported,
                 map_buffer_range_supported: self.map_buffer_range_supported,
                 native_es3: self.native_es3,
+                multisample_api: self.multisample_api,
+                multisample_error: self.multisample_error.clone(),
                 map_buffer_stagings: Vec::new(),
             });
         }
         make_current_fn(&self.gl_ctx);
         gles2::load_with(&mut *loader_fn);
+        gles30::RenderbufferStorageMultisample::load_with(&mut *loader_fn);
+        gles30::BlitFramebuffer::load_with(&mut *loader_fn);
         gles11::load_with(&mut *loader_fn);
         self.is_loaded = true;
         if !self.pvrtc_native_checked {
@@ -139,6 +200,7 @@ impl GLESContext for GLES2NativeContext {
             self.texture_3d_ext_supported = detect_texture_3d_ext_support();
             self.map_buffer_range_supported = detect_map_buffer_range_support();
             self.native_es3 = detect_native_es3();
+            self.multisample_api = detect_multisample_api(self.native_es3);
             self.pvrtc_native_checked = true;
         }
         crate::gles::CurrentGLES::NativeES2(GLES2Native {
@@ -149,6 +211,8 @@ impl GLESContext for GLES2NativeContext {
             texture_3d_ext_supported: self.texture_3d_ext_supported,
             map_buffer_range_supported: self.map_buffer_range_supported,
             native_es3: self.native_es3,
+            multisample_api: self.multisample_api,
+            multisample_error: self.multisample_error.clone(),
             map_buffer_stagings: Vec::new(),
         })
     }
@@ -552,6 +616,8 @@ pub struct GLES2Native<'gl_ctx> {
     texture_3d_ext_supported: bool,
     map_buffer_range_supported: bool,
     native_es3: bool,
+    multisample_api: MultisampleApi,
+    multisample_error: Rc<Cell<GLenum>>,
     /// CPU staging buffers for the `glMapBufferOES` fallback (see below).
     ///
     /// Games can legitimately have more than one buffer mapped at a time
@@ -632,7 +698,12 @@ impl GLES for GLES2Native<'_> {
 
     // Generic state manipulation
     unsafe fn GetError(&mut self) -> GLenum {
-        gles2::GetError()
+        let error = self.multisample_error.replace(0);
+        if error != 0 {
+            error
+        } else {
+            gles2::GetError()
+        }
     }
     unsafe fn Enable(&mut self, cap: GLenum) {
         if is_es1_only_capability(cap) {
@@ -1129,18 +1200,9 @@ impl GLES for GLES2Native<'_> {
     ) {
         gles2::RenderbufferStorage(target, internalformat, width, height)
     }
-    // GL_APPLE_framebuffer_multisample
-    //
-    // The canonical iOS EAGLView MSAA pattern allocates a multisample
-    // "sample" renderbuffer, renders into it, then resolves it into the
-    // single-sample "resolve" renderbuffer whose color storage is the
-    // CAEAGLLayer drawable, and finally calls `-presentRenderbuffer:`.
-    // Real iPhone OS ES 2.0 drivers expose this extension natively, and so
-    // do many Android GPUs (e.g. Adreno advertises
-    // GL_APPLE_framebuffer_multisample). When the host driver exports the
-    // native entry points we forward to them directly; otherwise we degrade
-    // gracefully so the app keeps running (see the generic-backend fallback
-    // in `gles_generic`).
+    // Apple MSAA maps directly to ES 3 core or the equivalent ANGLE
+    // extensions. A no-op resolve loses every frame in the resolve buffer.
+    // https://registry.khronos.org/OpenGL/extensions/APPLE/APPLE_framebuffer_multisample.txt
     unsafe fn RenderbufferStorageMultisampleAPPLE(
         &mut self,
         target: GLenum,
@@ -1149,34 +1211,103 @@ impl GLES for GLES2Native<'_> {
         width: GLsizei,
         height: GLsizei,
     ) {
-        if gles2::RenderbufferStorageMultisampleAPPLE::is_loaded() {
-            gles2::RenderbufferStorageMultisampleAPPLE(
+        match self.multisample_api {
+            MultisampleApi::Core => gles30::RenderbufferStorageMultisample(
                 target,
                 samples,
                 internalformat,
                 width,
                 height,
-            )
-        } else {
-            log_once!(
-                "RenderbufferStorageMultisampleAPPLE: host ES 2.0 driver lacks \
-                 GL_APPLE_framebuffer_multisample; using single-sample storage"
-            );
-            gles2::RenderbufferStorage(target, internalformat, width, height)
+            ),
+            MultisampleApi::Apple => gles2::RenderbufferStorageMultisampleAPPLE(
+                target,
+                samples,
+                internalformat,
+                width,
+                height,
+            ),
+            MultisampleApi::Angle => gles2::RenderbufferStorageMultisampleANGLE(
+                target,
+                samples,
+                internalformat,
+                width,
+                height,
+            ),
+            MultisampleApi::Unsupported if samples == 0 => {
+                gles2::RenderbufferStorage(target, internalformat, width, height)
+            }
+            MultisampleApi::Unsupported => {
+                // The host supports zero multisamples. Report the specified
+                // samples > MAX_SAMPLES error instead of inventing storage.
+                if self.multisample_error.get() == 0 {
+                    self.multisample_error.set(gles11::INVALID_VALUE);
+                }
+            }
         }
     }
     unsafe fn ResolveMultisampleFramebufferAPPLE(&mut self) {
-        if gles2::ResolveMultisampleFramebufferAPPLE::is_loaded() {
-            // The app has already bound the sample framebuffer to
-            // GL_READ_FRAMEBUFFER_APPLE and the resolve framebuffer to
-            // GL_DRAW_FRAMEBUFFER_APPLE; the driver does the resolve.
-            gles2::ResolveMultisampleFramebufferAPPLE()
-        } else {
-            log_once!(
-                "ResolveMultisampleFramebufferAPPLE: host ES 2.0 driver lacks \
-                 GL_APPLE_framebuffer_multisample; relying on the single-sample \
-                 fallback from RenderbufferStorageMultisampleAPPLE"
-            );
+        match self.multisample_api {
+            MultisampleApi::Apple => {
+                gles2::ResolveMultisampleFramebufferAPPLE();
+                return;
+            }
+            MultisampleApi::Unsupported => {
+                if self.multisample_error.get() == 0 {
+                    self.multisample_error.set(gles11::INVALID_OPERATION);
+                }
+                return;
+            }
+            _ => {}
+        }
+        let mut color = 0;
+        let mut previous = 0;
+        let mut width = 0;
+        let mut height = 0;
+        gles2::GetFramebufferAttachmentParameteriv(
+            0x8ca8,
+            gles2::COLOR_ATTACHMENT0,
+            gles2::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+            &mut color,
+        );
+        gles2::GetIntegerv(gles2::RENDERBUFFER_BINDING, &mut previous);
+        gles2::BindRenderbuffer(gles2::RENDERBUFFER, color as GLuint);
+        gles2::GetRenderbufferParameteriv(
+            gles2::RENDERBUFFER,
+            gles2::RENDERBUFFER_WIDTH,
+            &mut width,
+        );
+        gles2::GetRenderbufferParameteriv(
+            gles2::RENDERBUFFER,
+            gles2::RENDERBUFFER_HEIGHT,
+            &mut height,
+        );
+        gles2::BindRenderbuffer(gles2::RENDERBUFFER, previous as GLuint);
+        match self.multisample_api {
+            MultisampleApi::Core => gles30::BlitFramebuffer(
+                0,
+                0,
+                width,
+                height,
+                0,
+                0,
+                width,
+                height,
+                gles2::COLOR_BUFFER_BIT,
+                gles2::NEAREST,
+            ),
+            MultisampleApi::Angle => gles2::BlitFramebufferANGLE(
+                0,
+                0,
+                width,
+                height,
+                0,
+                0,
+                width,
+                height,
+                gles2::COLOR_BUFFER_BIT,
+                gles2::NEAREST,
+            ),
+            _ => unreachable!(),
         }
     }
     unsafe fn FramebufferRenderbuffer(

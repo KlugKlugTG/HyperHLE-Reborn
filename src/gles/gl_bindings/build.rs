@@ -102,6 +102,8 @@ fn main() {
             // multisample calls straight through to the host driver instead
             // of degrading to a no-op resolve (which leaves the drawable
             // empty → black screen).
+            "GL_ANGLE_framebuffer_multisample",
+            "GL_ANGLE_framebuffer_blit",
             "GL_APPLE_framebuffer_multisample",
         ],
     )
