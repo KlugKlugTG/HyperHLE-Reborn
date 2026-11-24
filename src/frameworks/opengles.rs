@@ -9,6 +9,7 @@
 //! surface. See [crate::gles] for other uses and a discussion of the broader
 //! topic.
 
+mod buffer_mapping;
 mod eagl;
 mod gles_guest;
 mod software_vao;

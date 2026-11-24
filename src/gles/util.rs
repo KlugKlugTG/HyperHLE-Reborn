@@ -9,6 +9,18 @@ use super::gles11_raw as gles11; // constants only
 use super::gles11_raw::types::{GLenum, GLfixed, GLfloat, GLint, GLsizei};
 use super::GLES;
 
+/// ES 2.0's OES half-float token differs from the ES 3.0/desktop token.
+/// Preserve the OES value on ES 2.0 drivers and translate it only where
+/// the host API uses the core enum.
+/// <https://registry.khronos.org/OpenGL/extensions/OES/OES_vertex_half_float.txt>
+pub(crate) fn core_vertex_attrib_type(type_: GLenum) -> GLenum {
+    if type_ == 0x8d61 {
+        0x140b
+    } else {
+        type_
+    }
+}
+
 #[cfg(test)]
 mod pvrtc_payload_size_tests {
     use super::pvrtc_payload_size;

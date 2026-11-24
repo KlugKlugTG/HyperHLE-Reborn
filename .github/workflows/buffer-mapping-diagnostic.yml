@@ -1,0 +1,173 @@
+name: Buffer mapping graphics diagnostics
+
+on:
+  push:
+    branches: ["fix/brawlstars-3d-rendering"]
+    paths: [.github/workflows/buffer-mapping-diagnostic.yml]
+  workflow_dispatch:
+    inputs:
+      emulator_run_id:
+        description: Successful emulator diagnostics build
+        type: string
+        default: "45238379242"
+      tap_sequence:
+        description: Screenshot-guided WAIT:X,Y steps
+        type: string
+        default: "30:- 1:0.246875,0.9625 12:-"
+      final_wait:
+        description: Seconds to observe the final screen
+        type: string
+        default: "15"
+      backend:
+        description: Host graphics implementation
+        type: choice
+        options: [angle, mesa, mesa-es2]
+        default: angle
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  graphics:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      contents: write # Read the unpublished draft fixture; never publish it.
+      actions: read
+    env:
+      DISPLAY: ":99"
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      LP_NUM_THREADS: "2"
+      ALSOFT_DRIVERS: "null"
+      TOUCHHLE_TRACE_TOUCHES: "1"
+      TOUCHHLE_TRACE_BUFFER_UPLOADS: "1"
+      DIAGNOSTIC_BUILD: ${{ inputs.emulator_run_id || '45238379242' }}
+      DIAGNOSTIC_TAPS: ${{ inputs.tap_sequence || '30:- 1:0.246875,0.9625 12:-' }}
+      DIAGNOSTIC_WAIT: ${{ inputs.final_wait || '15' }}
+      DIAGNOSTIC_BACKEND: ${{ inputs.backend || 'angle' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install graphics runtime and debugger
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gdb ripgrep xvfb xdotool x11-utils imagemagick python3 libsndio7.0 libgl1 libegl1 libgles2 libvulkan1 mesa-vulkan-drivers mesa-utils
+      - name: Require successful emulator build and full tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run watch "$DIAGNOSTIC_BUILD" --repo "$GITHUB_REPOSITORY" --exit-status --interval 15
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ env.DIAGNOSTIC_BUILD }}
+          name: HyperHLE_Linux_ARM64_diagnostic
+          path: emulator
+      - uses: actions/download-artifact@v4
+        if: env.DIAGNOSTIC_BACKEND == 'angle'
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45154298497
+          name: ANGLE_Linux_ARM64_GLES1
+          path: native-angle
+      - name: Select the Android ANGLE revision or native Mesa
+        run: |
+          if [ "$DIAGNOSTIC_BACKEND" = angle ]; then
+            echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/native-angle" >> "$GITHUB_ENV"
+            echo "SDL_VIDEO_EGL_DRIVER=$GITHUB_WORKSPACE/native-angle/libEGL.so" >> "$GITHUB_ENV"
+            echo "SDL_VIDEO_GL_DRIVER=$GITHUB_WORKSPACE/native-angle/libGLESv1_CM.so" >> "$GITHUB_ENV"
+            echo "SDL_VIDEO_X11_FORCE_EGL=1" >> "$GITHUB_ENV"
+            echo "ANGLE_DEFAULT_PLATFORM=vulkan" >> "$GITHUB_ENV"
+            echo "MESA_VK_WSI_DEBUG=sw,noshm" >> "$GITHUB_ENV"
+            icd=$(rg --files /usr/share/vulkan/icd.d | rg '/lvp.*\.json$' | head -n 1)
+            test -n "$icd"
+            echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+          elif [ "$DIAGNOSTIC_BACKEND" = mesa-es2 ]; then
+            echo "MESA_GLES_VERSION_OVERRIDE=2.0" >> "$GITHUB_ENV"
+          fi
+      - name: Read the private game fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(gh release view ci-private-native-games-20261123 --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          gh release download ci-private-native-games-20261123 --repo "$GITHUB_REPOSITORY" --pattern bs7.ipa --dir private-inputs
+      - name: Start display and prepare debugger
+        run: |
+          mkdir -p results
+          Xvfb :99 -screen 0 1280x960x24 -ac > results/xvfb.log 2>&1 &
+          sleep 2
+          glxinfo -B > results/renderer.txt
+          chmod +x emulator/touchHLE
+          cat > results/crash.gdb <<'GDB'
+          set pagination off
+          set confirm off
+          set breakpoint pending on
+          set logging file gdb.log
+          set logging overwrite on
+          set logging enabled on
+          handle SIGSEGV nostop noprint pass
+          handle SIGBUS nostop noprint pass
+          handle SIGABRT stop print pass
+          break touchHLE::crash_handler::imp::handler
+          run
+          echo \n--- Stopped native process ---\n
+          print $_siginfo
+          python
+          try:
+              frame_name = gdb.selected_frame().name() or ""
+          except gdb.error:
+              frame_name = ""
+          if "crash_handler::imp::handler" in frame_name:
+              print("FATAL_HANDLER_SIGNAL=" + str(gdb.parse_and_eval("$x0")))
+              print("FATAL_HANDLER_SIGINFO:")
+              gdb.execute("x/4wx $x1")
+              gdb.execute("x/gx $x1+16")
+          end
+          if $_thread
+              info registers
+              thread apply all bt
+          end
+          quit
+          GDB
+          cat > results/debug-emulator <<'SH'
+          #!/bin/bash
+          gdb -q -nx -batch -return-child-result -x "$GITHUB_WORKSPACE/results/crash.gdb" --args "$GITHUB_WORKSPACE/emulator/touchHLE" "$@" &
+          debugger=$!
+          echo "$debugger" > "$GITHUB_WORKSPACE/results/gdb.pid"
+          wrapper=$$
+          # The tap script kills its executable after a successful run.
+          # Interrupt GDB when that wrapper exits, so it records a live stack
+          # and closes the output pipe instead of leaving the reader blocked.
+          (
+            while kill -0 "$wrapper" 2>/dev/null; do sleep 0.25; done
+            kill -INT "$debugger" 2>/dev/null || true
+          ) </dev/null >/dev/null 2>&1 &
+          wait "$debugger"
+          SH
+          chmod +x results/debug-emulator
+      - name: Screenshot-guided character rendering reproduction
+        run: |
+          read -r -a taps <<< "$DIAGNOSTIC_TAPS"
+          tap_args=()
+          for tap in "${taps[@]}"; do tap_args+=(--step "$tap"); done
+          graphics_args=()
+          # Android sets the initial SDL window's ES profile before creating
+          # it. The native GLES1 option selects that same path on Linux.
+          if [ "$DIAGNOSTIC_BACKEND" = angle ]; then graphics_args+=(--gles1=gles1_native); fi
+          set +e
+          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/bs7.ipa" --exe "$GITHUB_WORKSPACE/results/debug-emulator" --window-title HyperHLE --cwd "$GITHUB_WORKSPACE/emulator" --out results/repro "${tap_args[@]}" --final-wait "$DIAGNOSTIC_WAIT" --require-touch-delivery --require-nonblack-frame --require-frame-change -- "${graphics_args[@]}" --overlay=off --trace-gl-errors --no-error-popup
+          status=$?
+          if [ -f results/gdb.pid ]; then
+            kill -INT "$(cat results/gdb.pid)" 2>/dev/null || true
+            sleep 2
+          fi
+          exit "$status"
+      - name: Preserve native stack and GL log
+        if: always()
+        run: |
+          cp emulator/gdb.log results/ 2>/dev/null || true
+          cp emulator/HyperHLE_log.txt results/graphics.log 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Buffer_mapping_graphics_diagnostics
+          path: results/

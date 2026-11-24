@@ -2141,6 +2141,11 @@ pub trait GLES {
     }
 
     // -- Buffer object operations (3.0) --
+    /// Whether range mappings can use a real driver data store. Older ES
+    /// drivers use the guest buffer mirror instead.
+    fn supports_map_buffer_range(&self) -> bool {
+        false
+    }
     unsafe fn MapBufferRange(
         &mut self,
         _target: GLenum,
