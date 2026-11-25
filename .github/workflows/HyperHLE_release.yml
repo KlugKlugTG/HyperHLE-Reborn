@@ -52,6 +52,8 @@ jobs:
           
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@master
+        with:
+          cache-on-failure: true
 
       - name: Try to get cached copy of Boost  
         id: cache-boost  
@@ -106,7 +108,7 @@ jobs:
         run: cargo build --target ${{ matrix.target }} --release
 
       - name: Verify macOS executable architecture
-        run: lipo -verify_arch ${{ matrix.arch }} target/${{ matrix.target }}/release/touchHLE
+        run: lipo target/${{ matrix.target }}/release/touchHLE -verify_arch ${{ matrix.arch }}
 
       - name: Create .app bundle and DMG
         # `hdiutil create` periodically fails on the `macos-15-arm64` GitHub
