@@ -78,7 +78,9 @@ pub use properties::{
 };
 pub use selectors::{selector, SEL};
 
-use crate::objc::classes::imp_implementationWithBlock;
+use crate::objc::classes::{
+    imp_getBlock, imp_implementationWithBlock, imp_removeBlock, object_setClass,
+};
 use crate::objc::classes::{objc_msgForward, objc_msgForward_stret};
 use crate::Environment;
 use classes::{ClassHostObject, FakeClass, UnimplementedClass};
@@ -224,6 +226,7 @@ pub struct ObjC {
     /// `method_getImplementation(m) == method_getImplementation(m)` holds,
     /// matching Apple's behaviour.
     pub(super) host_imp_tokens: FxHashMap<usize, crate::mem::MutVoidPtr>,
+    pub(super) block_imps: FxHashMap<u32, crate::mem::ConstVoidPtr>,
     exceptions: exceptions::State,
 }
 
@@ -243,6 +246,7 @@ impl ObjC {
             method_handles: FxHashMap::default(),
             imp_tokens: FxHashMap::default(),
             host_imp_tokens: FxHashMap::default(),
+            block_imps: FxHashMap::default(),
             exceptions: Default::default(),
         }
     }
@@ -451,6 +455,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_getMetaClass(_)),
     export_c_func!(object_getClassName(_)),
     export_c_func!(object_getClass(_)),
+    export_c_func!(object_setClass(_, _)),
     export_c_func!(objc_retainAutoreleasedReturnValue(_)),
     export_c_func!(objc_unsafeClaimAutoreleasedReturnValue(_)),
     export_c_func!(objc_autoreleaseReturnValue(_)),
@@ -465,6 +470,8 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_autorelease(_)),
     export_c_func!(objc_retainBlock(_)),
     export_c_func!(imp_implementationWithBlock(_)),
+    export_c_func!(imp_getBlock(_)),
+    export_c_func!(imp_removeBlock(_)),
     export_c_func!(objc_release(_)),
     export_c_func!(objc_setProperty_nonatomic(_, _, _, _)),
     export_c_func!(objc_exception_throw(_)),

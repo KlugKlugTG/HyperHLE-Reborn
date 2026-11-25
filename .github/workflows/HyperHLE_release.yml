@@ -32,9 +32,13 @@ jobs:
         include:
           - target: x86_64-apple-darwin
             runner: macos-15-intel
+            arch: x86_64
             artifact: HyperHLE_macOS_x86_64
           - target: aarch64-apple-darwin
-            runner: macos-15
+            # The hosted ARM pool can fail to acquire a runner. Apple's Intel
+            # SDK can cross-compile the same ARM executable with cargo's target.
+            runner: macos-15-intel
+            arch: arm64
             artifact: HyperHLE_macOS_AArch64
     runs-on: ${{ matrix.runner }}
 
@@ -48,6 +52,8 @@ jobs:
           
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@master
+        with:
+          cache-on-failure: true
 
       - name: Try to get cached copy of Boost  
         id: cache-boost  
@@ -100,6 +106,9 @@ jobs:
         
       - name: Build  
         run: cargo build --target ${{ matrix.target }} --release
+
+      - name: Verify macOS executable architecture
+        run: lipo target/${{ matrix.target }}/release/touchHLE -verify_arch ${{ matrix.arch }}
 
       - name: Create .app bundle and DMG
         # `hdiutil create` periodically fails on the `macos-15-arm64` GitHub

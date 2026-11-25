@@ -1261,8 +1261,6 @@ impl Dyld {
                 || name == "__dispatch_data_destructor_default"
                 || name == "__dispatch_data_destructor_free"
                 || name == "__dispatch_data_destructor_munmap"
-                || name == "__dispatch_main_q"
-                || name == "__dispatch_queue_main"
             {
                 // Dispatch source types carry small internal tags; other
                 // libdispatch constants remain opaque non-NULL markers.
@@ -1519,8 +1517,6 @@ impl Dyld {
                 || symbol == "__dispatch_data_destructor_default"
                 || symbol == "__dispatch_data_destructor_free"
                 || symbol == "__dispatch_data_destructor_munmap"
-                || symbol == "__dispatch_main_q"
-                || symbol == "__dispatch_queue_main"
             {
                 // See the matching branch in the external-relocation loop.
                 let p: MutPtr<u32> = mem.alloc(4).cast();
@@ -1689,6 +1685,13 @@ impl Dyld {
     /// Return a host function that can be called to handle an SVC instruction
     /// encountered during CPU emulation. If `None` is returned, the execution
     /// needs to resume at `svc_pc`.
+    pub(crate) fn svc_symbol(&self, svc: u32) -> &'static str {
+        let svc = svc & !Self::SVC_LAZY_LINK_RET_FLAG;
+        if svc < Self::SVC_LINKED_FUNCTIONS_BASE { return "lazy-link"; }
+        self.linked_host_functions.get((svc - Self::SVC_LINKED_FUNCTIONS_BASE) as usize)
+            .map_or("unknown-hle", |&(symbol, _)| symbol)
+    }
+
     pub fn get_svc_handler(
         &mut self,
         bins: &[MachO],

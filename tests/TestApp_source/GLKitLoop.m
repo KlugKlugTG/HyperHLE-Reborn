@@ -9,7 +9,7 @@
 
 // The common-3.0 SDK predates GLKit. These declarations follow Apple's SDK:
 // https://github.com/xybp888/iOS-SDKs/blob/master/iPhoneOS9.3.sdk/System/Library/Frameworks/GLKit.framework/Headers/GLKViewController.h
-@interface UIView : NSObject
+@interface UIView (GLKitLoopMethods)
 - (instancetype)initWithFrame:(CGRect)frame;
 @end
 @interface GLKView : UIView
@@ -178,7 +178,7 @@ int test_GLKViewController_render_loop(void) {
 - (instancetype)initWithAPI:(NSUInteger)api;
 + (BOOL)setCurrentContext:(EAGLContext *)context;
 @end
-@interface UIImage : NSObject
+@interface UIImage (GLKitSnapshotMethods)
 @property(nonatomic, readonly) CGImageRef CGImage;
 @end
 extern void glClearColor(float, float, float, float);
@@ -192,6 +192,98 @@ extern void glPixelStorei(unsigned, int);
 extern void glBindFramebuffer(unsigned, unsigned);
 extern void glGetFramebufferAttachmentParameteriv(unsigned, unsigned, unsigned,
                                                   int *);
+extern void glVertexAttrib1fv(unsigned, const float *);
+extern void glVertexAttrib2fv(unsigned, const float *);
+extern void glVertexAttrib3fv(unsigned, const float *);
+extern void glVertexAttrib4fv(unsigned, const float *);
+extern void glGetVertexAttribfv(unsigned, unsigned, float *);
+extern unsigned glCreateShader(unsigned);
+extern void glShaderSource(unsigned, int, const char **, const int *);
+extern void glCompileShader(unsigned);
+extern void glGetShaderiv(unsigned, unsigned, int *);
+extern unsigned glCreateProgram(void);
+extern void glAttachShader(unsigned, unsigned);
+extern void glLinkProgram(unsigned);
+extern void glGetProgramiv(unsigned, unsigned, int *);
+extern void glGetActiveUniform(unsigned, unsigned, int, int *, int *,
+                               unsigned *, char *);
+extern void glGetActiveAttrib(unsigned, unsigned, int, int *, int *, unsigned *,
+                              char *);
+extern void glDeleteProgram(unsigned);
+extern void glDeleteShader(unsigned);
+
+// Each vector entry point reads the stated number of guest components; the
+// missing components are (0, 0, 1). A scalar host temporary cannot back it.
+// https://registry.khronos.org/OpenGL-Refpages/es3.0/html/glVertexAttrib.xhtml
+static int test_vertex_attribute_vectors(void) {
+  const float input[4] = {0.25f, -0.5f, 0.75f, 0.125f};
+  void (*setters[])(unsigned,
+                    const float *) = {glVertexAttrib1fv, glVertexAttrib2fv,
+                                      glVertexAttrib3fv, glVertexAttrib4fv};
+  for (unsigned n = 1; n <= 4; n++) {
+    setters[n - 1](7, input);
+    float actual[4] = {9, 9, 9, 9};
+    glGetVertexAttribfv(7, 0x8626, actual);
+    for (unsigned component = 0; component < 4; component++) {
+      float expected = component < n ? input[component] : component == 3;
+      if (actual[component] != expected)
+        return -1;
+    }
+  }
+  return glGetError() ? -2 : 0;
+}
+
+// bufSize limits the returned name, not the size/type metadata. Zero is valid.
+// https://registry.khronos.org/OpenGL-Refpages/es3.0/html/glGetActiveUniform.xhtml
+static int test_shader_reflection_without_names(void) {
+  const char *sources[] = {
+      "attribute vec4 position; uniform mat4 transform;"
+      "void main() { gl_Position = transform * position; }",
+      "precision mediump float; uniform vec4 tint;"
+      "void main() { gl_FragColor = tint; }"};
+  unsigned shaders[] = {glCreateShader(0x8b31), glCreateShader(0x8b30)};
+  unsigned program = glCreateProgram();
+  int result = 0;
+  for (unsigned i = 0; i < 2; i++) {
+    glShaderSource(shaders[i], 1, &sources[i], NULL);
+    glCompileShader(shaders[i]);
+    int compiled = 0;
+    glGetShaderiv(shaders[i], 0x8b81, &compiled);
+    if (!compiled)
+      result = -1;
+    glAttachShader(program, shaders[i]);
+  }
+  glLinkProgram(program);
+  int linked = 0, count = 0;
+  glGetProgramiv(program, 0x8b82, &linked);
+  glGetProgramiv(program, 0x8b86, &count);
+  if (!linked || count != 2)
+    result = -2;
+  for (unsigned i = 0; i < (unsigned)count; i++) {
+    int length = -1, size = -1;
+    unsigned type = 0;
+    glGetActiveUniform(program, i, 0, &length, &size, &type, NULL);
+    if (length || size != 1 || (type != 0x8b5c && type != 0x8b52))
+      result = -3;
+    char name = 'X';
+    glGetActiveUniform(program, i, 1, &length, &size, &type, &name);
+    if (name || length || size != 1)
+      result = -4;
+  }
+  int length = -1, size = -1;
+  unsigned type = 0;
+  glGetActiveAttrib(program, 0, 0, &length, &size, &type, NULL);
+  if (length || size != 1 || type != 0x8b52)
+    result = -5;
+  length = size = -7;
+  glGetActiveAttrib(program, 0, -1, &length, &size, &type, NULL);
+  if (glGetError() != 0x501 || length != -7 || size != -7)
+    result = -6;
+  glDeleteProgram(program);
+  for (unsigned i = 0; i < 2; i++)
+    glDeleteShader(shaders[i]);
+  return result;
+}
 
 static int glk_graphics_error;
 @interface GLKDrawableProbe : NSObject
@@ -219,7 +311,10 @@ int test_GLKView_drawable_graphics(void) {
   view.context = context;
   view.contentScaleFactor = 1;
   view.delegate = delegate;
-  int result = 0;
+  [view bindDrawable];
+  int result = test_vertex_attribute_vectors() ? -9 : 0;
+  if (test_shader_reflection_without_names())
+    result = -10;
   const int configurations[][4] = {
       {0, 0, 0, 0}, {0, 1, 0, 0}, {0, 2, 1, 0},
       {0, 2, 1, 1}, {1, 0, 0, 1}, {2, 0, 0, 1},

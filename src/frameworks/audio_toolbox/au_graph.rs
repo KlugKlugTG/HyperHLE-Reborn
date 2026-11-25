@@ -189,13 +189,21 @@ fn AUGraphRemoveNode(env: &mut Environment, graph: AUGraph, node: AUNode) -> OSS
 }
 
 fn AUGraphCountNodes(env: &mut Environment, graph: AUGraph, out_count: MutPtr<u32>) -> OSStatus {
-    let count = State::get(&mut env.framework_state)
-        .graphs
-        .get(&graph)
-        .map(|s| s.nodes.len() as u32)
-        .unwrap_or(0);
+    if out_count.is_null() {
+        return paramErr;
+    }
+    let Some(state) = State::get(&mut env.framework_state).graphs.get(&graph) else {
+        return paramErr;
+    };
+    let count = state.nodes.len() as u32;
     env.mem.write(out_count, count);
     0
+}
+
+// The modern spelling of AUGraphCountNodes.
+// https://developer.apple.com/documentation/audiotoolbox/augraphgetnodecount(_:_:)
+fn AUGraphGetNodeCount(env: &mut Environment, graph: AUGraph, out_count: MutPtr<u32>) -> OSStatus {
+    AUGraphCountNodes(env, graph, out_count)
 }
 
 fn AUGraphGetIndNode(
@@ -360,7 +368,11 @@ pub fn start_graph_for_output(env: &mut Environment, output_unit: AudioUnit) -> 
                 }
                 Some((
                     *graph,
-                    state.nodes.values().filter_map(|node| node.audio_unit).collect(),
+                    state
+                        .nodes
+                        .values()
+                        .filter_map(|node| node.audio_unit)
+                        .collect(),
                     !contains_output,
                 ))
             })
@@ -633,6 +645,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(AUGraphAddNode(_, _, _)),
     export_c_func!(AUGraphRemoveNode(_, _)),
     export_c_func!(AUGraphCountNodes(_, _)),
+    export_c_func!(AUGraphGetNodeCount(_, _)),
     export_c_func!(AUGraphGetIndNode(_, _, _)),
     export_c_func!(AUGraphNodeInfo(_, _, _, _)),
     export_c_func!(AUGraphOpen(_)),

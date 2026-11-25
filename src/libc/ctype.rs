@@ -72,6 +72,17 @@ fn isupper(_env: &mut Environment, c: i32) -> i32 {
 fn isxdigit(_env: &mut Environment, c: i32) -> i32 {
     ctype_mask(c, 0x10000)
 }
+// Darwin digittoint returns zero for a character outside 0-9/A-F/a-f.
+// https://github.com/apple-oss-distributions/Libc/blob/main/include/_ctype.h
+fn digittoint(_env: &mut Environment, c: i32) -> i32 {
+    match c {
+        48..=57 => c - 48,
+        65..=70 => c - 65 + 10,
+        97..=102 => c - 97 + 10,
+        _ => 0,
+    }
+}
+
 fn isblank(_env: &mut Environment, c: i32) -> i32 {
     ctype_mask(c, 0x20000)
 }
@@ -240,6 +251,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(isalpha(_)),
     export_c_func!(iscntrl(_)),
     export_c_func!(isdigit(_)),
+    export_c_func!(digittoint(_)),
     export_c_func!(isgraph(_)),
     export_c_func!(islower(_)),
     export_c_func!(ispunct(_)),

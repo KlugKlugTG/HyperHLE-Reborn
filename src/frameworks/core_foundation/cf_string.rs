@@ -256,6 +256,28 @@ fn CFStringConvertEncodingToIANACharSetName(
     ns_string::get_static_str(env, name)
 }
 
+// IANA charset names are ASCII case-insensitive. Unsupported names return
+// kCFStringEncodingInvalidId, rather than silently becoming UTF-8.
+// https://developer.apple.com/documentation/corefoundation/cfstringconvertianacharsetnametoencoding(_:)
+fn CFStringConvertIANACharSetNameToEncoding(env: &mut Environment, name: CFStringRef) -> CFStringEncoding {
+    let name = ns_string::to_rust_string(env, name).to_ascii_lowercase();
+    match name.as_str() {
+        "macintosh" | "mac" | "macroman" | "x-mac-roman" => kCFStringEncodingMacRoman,
+        "us-ascii" | "ascii" | "ansi_x3.4-1968" | "iso-ir-6" => kCFStringEncodingASCII,
+        "utf-8" | "utf8" => kCFStringEncodingUTF8,
+        "utf-16" | "utf16" => kCFStringEncodingUTF16,
+        "utf-16be" => kCFStringEncodingUTF16BE,
+        "utf-16le" => kCFStringEncodingUTF16LE,
+        "utf-32" => kCFStringEncodingUTF32,
+        "utf-32be" => kCFStringEncodingUTF32BE,
+        "utf-32le" => kCFStringEncodingUTF32LE,
+        "iso-8859-1" | "iso_8859-1" | "latin1" | "iso-ir-100" | "l1" => kCFStringEncodingISOLatin1,
+        "windows-1252" | "cp1252" => kCFStringEncodingWindowsLatin1,
+        "x-nextstep" => kCFStringEncodingNextStepLatin,
+        _ => u32::MAX,
+    }
+}
+
 fn CFStringGetMostCompatibleMacStringEncoding(
     _env: &mut Environment,
     encoding: CFStringEncoding,
@@ -2369,6 +2391,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFStringGetSystemEncoding()),
     export_c_func!(CFStringGetFastestEncoding(_)),
     export_c_func!(CFStringConvertEncodingToIANACharSetName(_)),
+    export_c_func!(CFStringConvertIANACharSetNameToEncoding(_)),
     export_c_func!(CFStringGetSmallestEncoding(_)),
     export_c_func!(CFStringGetMostCompatibleMacStringEncoding(_)),
     // Immutable constructors

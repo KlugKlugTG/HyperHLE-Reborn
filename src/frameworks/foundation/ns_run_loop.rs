@@ -72,6 +72,10 @@ pub(crate) struct NSRunLoopHostObject {
     ports: Vec<id>,
     /// Set by CFRunLoopStop; cleared at the start of the next run.
     pub(crate) stopped: bool,
+    pub(crate) owner_thread: ThreadId,
+    pub(crate) current_mode: Option<String>,
+    pub(crate) common_modes: std::collections::HashSet<String>,
+    pub(crate) blocks: Vec<(Vec<String>, crate::mem::MutVoidPtr)>,
 }
 impl HostObject for NSRunLoopHostObject {}
 
@@ -95,7 +99,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (()) release {}
 - (id) autorelease { this }
 
-- (bool)runMode:(id)_mode beforeDate:(id)limit_date {
+- (bool)runMode:(id)mode beforeDate:(id)limit_date {
     // Run the run loop for one iteration, honouring the caller's time limit.
     // Apps frequently call this in a synchronous spin like:
     //
@@ -123,7 +127,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         limit_date,
         time_limit
     );
+    let mode = ns_string::to_rust_string(env, mode).into_owned();
+    let previous = env.objc.borrow_mut::<NSRunLoopHostObject>(this).current_mode.replace(mode);
     run_run_loop(env, this, /* single_iteration: */ true, time_limit);
+    env.objc.borrow_mut::<NSRunLoopHostObject>(this).current_mode = previous;
     true
 }
 
@@ -362,6 +369,32 @@ pub(crate) fn remove_timer(env: &mut Environment, run_loop: id, timer: id) {
 
 /// Run the run loop for just a single iteration. Used by the app picker and
 /// by `-[NSRunLoop runMode:beforeDate:]`.
+pub(crate) fn drain_blocks(env: &mut Environment, run_loop: id) {
+    let state = env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop);
+    let mode = state
+        .current_mode
+        .as_deref()
+        .unwrap_or(kCFRunLoopDefaultMode);
+    let common = mode == kCFRunLoopDefaultMode || state.common_modes.contains(mode);
+    let mut pending = Vec::new();
+    let mut ready = Vec::new();
+    for (modes, block) in std::mem::take(&mut state.blocks) {
+        if modes
+            .iter()
+            .any(|candidate| candidate == mode || (common && candidate == kCFRunLoopCommonModes))
+        {
+            ready.push(block);
+        } else {
+            pending.push((modes, block));
+        }
+    }
+    state.blocks = pending;
+    for block in ready {
+        crate::libc::dispatch::call_void_block(env, block);
+        crate::libc::blocks::_Block_release(env, block.cast_const());
+    }
+}
+
 pub fn run_run_loop_single_iteration(env: &mut Environment, run_loop: id) {
     run_run_loop(env, run_loop, /* single_iteration: */ true, None)
 }
@@ -372,6 +405,16 @@ pub fn run_run_loop(
     single_iteration: bool,
     unix_time_limit: Option<f64>,
 ) {
+    let inserted_default_mode = env
+        .objc
+        .borrow::<NSRunLoopHostObject>(run_loop)
+        .current_mode
+        .is_none();
+    if inserted_default_mode {
+        env.objc
+            .borrow_mut::<NSRunLoopHostObject>(run_loop)
+            .current_mode = Some(kCFRunLoopDefaultMode.to_owned());
+    }
     // Temporary vectors used to track things without needing a reference to the
     // environment or to lock the object. Re-used each iteration for efficiency.
     let mut timers_tmp = Vec::new();
@@ -420,6 +463,7 @@ pub fn run_run_loop(
         ca_transaction::State::commit_implicit_transaction(env);
 
         // We want to process those only on the main run loop
+        drain_blocks(env, run_loop);
         if is_main_run_loop {
             crate::libc::dispatch::drain_main_queue(env);
 
@@ -548,6 +592,11 @@ pub fn run_run_loop(
             }
         }
     }
+    if inserted_default_mode {
+        env.objc
+            .borrow_mut::<NSRunLoopHostObject>(run_loop)
+            .current_mode = None;
+    }
 }
 
 /// Helper method for `mainRunLoop` and `currentRunLoop` NSThread class methods
@@ -567,6 +616,10 @@ pub(crate) fn run_loop_for_thread(env: &mut Environment, this: Class, thread_id:
             observers: Vec::new(),
             ports: Vec::new(),
             stopped: false,
+            owner_thread: thread_id,
+            current_mode: None,
+            common_modes: Default::default(),
+            blocks: Vec::new(),
         });
         // TODO: is it OK to allocate static object for all threads,
         // not only main one?

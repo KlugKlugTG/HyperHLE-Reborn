@@ -2,7 +2,7 @@ name: Emulator diagnostics
 
 on:
   push:
-    branches: ["fix/minecraft-story-mode-startup", "fix/infinity-blade-display", "fix/general-launch-compatibility", "fix/general-startup-stability", "fix/gameloft-video-menu", "fix/backstab-gameplay", "fix/bowmasters-startup", "fix/brawlstars-3d-rendering", "fix/brawlstars-text-and-symbols", "fix/glkit-render-loop"]
+    branches: ["fix/minecraft-story-mode-startup", "fix/infinity-blade-display", "fix/general-launch-compatibility", "fix/general-startup-stability", "fix/gameloft-video-menu", "fix/backstab-gameplay", "fix/bowmasters-startup", "fix/brawlstars-3d-rendering", "fix/brawlstars-text-and-symbols", "fix/glkit-render-loop", "fix/driving-zone-runtime"]
   workflow_dispatch:
 
 permissions:
@@ -28,6 +28,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential pkg-config libasound2-dev libpulse-dev libsndio-dev libdbus-1-dev libudev-dev libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxss-dev libxxf86vm-dev libxkbcommon-dev libwayland-dev wayland-protocols libgl1-mesa-dev libegl1-mesa-dev
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - uses: actions/cache@v4
         id: boost
         with:
@@ -69,6 +71,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential pkg-config libasound2-dev libpulse-dev libsndio-dev libdbus-1-dev libudev-dev libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxss-dev libxxf86vm-dev libxkbcommon-dev libwayland-dev wayland-protocols libgl1-mesa-dev libegl1-mesa-dev
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - uses: actions/cache@v4
         id: boost
         with:

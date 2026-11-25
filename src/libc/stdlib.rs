@@ -415,6 +415,12 @@ where
     Ok(count - offset)
 }
 
+// atoll has strtoll's decimal conversion semantics.
+// https://github.com/apple-oss-distributions/Libc/blob/main/stdlib/FreeBSD/atoll.c
+fn atoll(env: &mut Environment, string: ConstPtr<u8>) -> i64 {
+    strtoll(env, string, Ptr::null(), 10)
+}
+
 fn atoi(env: &mut Environment, s: ConstPtr<u8>) -> i32 {
     set_errno(env, 0);
     let (res, _) = strtol_inner(env, s, 10).unwrap_or((0, 0));
@@ -1170,15 +1176,25 @@ fn strtoll(env: &mut Environment, str: ConstPtr<u8>, endptr: MutPtr<MutPtr<u8>>,
         0, // starting offset
         base.try_into().unwrap(),
         u32::MAX, // max_length
-        |s, base| i64::from_str_radix(s, base).unwrap_or(i64::MAX),
-        |num| num.checked_mul(-1).unwrap_or(i64::MIN),
+        |s, base| i128::from_str_radix(s, base).unwrap_or(i128::MAX),
+        |num| -num,
     );
     match parse_res {
         Ok((res, len)) => {
             if !endptr.is_null() {
                 env.mem.write(endptr, (str + len).cast_mut());
             }
-            res
+            match i64::try_from(res) {
+                Ok(value) => value,
+                Err(_) => {
+                    set_errno(env, super::errno::ERANGE);
+                    if res < 0 {
+                        i64::MIN
+                    } else {
+                        i64::MAX
+                    }
+                }
+            }
         }
         Err(_) => {
             if !endptr.is_null() {
@@ -1996,6 +2012,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(valloc(_)),
     export_c_func!(atexit(_)),
     export_c_func!(atoi(_)),
+    export_c_func!(atoll(_)),
     export_c_func!(atol(_)),
     export_c_func!(atof(_)),
     export_c_func!(getloadavg(_, _)),

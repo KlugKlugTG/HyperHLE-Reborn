@@ -13,8 +13,9 @@ use crate::objc::{id, msg, msg_class, nil, release, retain, Class};
 use crate::Environment;
 
 use super::dispatch::{
-    call_void_block, dispatch_after_delay_secs, dispatch_block_t, dispatch_queue_t,
-    dispatch_source_t, get_state, with_current_queue, State, DISPATCH_TIME_FOREVER, MAIN_QUEUE_PTR,
+    alloc_dispatch_object, call_void_block, dispatch_after_delay_secs, dispatch_block_t,
+    dispatch_queue_t, dispatch_source_t, get_state, main_queue, with_current_queue, State,
+    DISPATCH_TIME_FOREVER,
 };
 
 const SOURCE_TYPE_READ: u32 = 0x4453_0001;
@@ -340,27 +341,21 @@ pub(super) fn dispatch_source_create(
         );
         return MutVoidPtr::null();
     }
+    let queue = if queue.is_null() {
+        MutVoidPtr::from_bits(main_queue(env))
+    } else {
+        queue
+    };
     let source = {
+        let source_handle = alloc_dispatch_object(env, "OS_dispatch_source").to_bits();
         let state = get_state(env);
-        let mut source_handle = state.next_source_handle.max(0x0400_0001);
-        while state.sources.contains_key(&source_handle) {
-            source_handle = source_handle.wrapping_add(4);
-            if source_handle < 0x0400_0001 {
-                source_handle = 0x0400_0001;
-            }
-        }
-        state.next_source_handle = source_handle.wrapping_add(4);
         state.sources.insert(
             source_handle,
             DispatchSource {
                 source_type: type_tag,
                 handle,
                 mask,
-                queue: if queue.is_null() {
-                    MutVoidPtr::from_bits(MAIN_QUEUE_PTR)
-                } else {
-                    queue
-                },
+                queue,
                 context: MutVoidPtr::null(),
                 event_handler: None,
                 cancel_handler: None,
@@ -604,6 +599,7 @@ pub(super) fn release_source(env: &mut Environment, object: MutVoidPtr) -> bool 
     invalidate_and_release_timer(env, removed.event_timer);
     release_handler(env, removed.event_handler);
     release_handler(env, removed.cancel_handler);
+    env.objc.dealloc_object(object.cast(), &mut env.mem);
     true
 }
 

@@ -69,8 +69,11 @@ impl CMTime {
     }
 
     pub fn from_seconds_with_timescale(value: f64, preferred_timescale: i32) -> Self {
-        if !value.is_finite() || preferred_timescale <= 0 {
+        if value.is_nan() || preferred_timescale <= 0 {
             return Self::default();
+        }
+        if value.is_infinite() {
+            return Self::from_parts(0, 0, if value < 0.0 { 9 } else { 5 }, 0);
         }
         let mut timescale = preferred_timescale;
         loop {
@@ -82,12 +85,16 @@ impl CMTime {
                 return Self {
                     value: scaled as i64,
                     timescale,
-                    flags: 1,
+                    flags: if (scaled / f64::from(timescale)) == value {
+                        1
+                    } else {
+                        3
+                    },
                     epoch: 0,
                 };
             }
             if timescale == 1 {
-                return Self::default();
+                return Self::from_parts(0, 0, if value < 0.0 { 9 } else { 5 }, 0);
             }
             timescale = (timescale / 2).max(1);
         }

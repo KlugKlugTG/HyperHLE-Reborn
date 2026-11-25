@@ -38,7 +38,8 @@ pub struct State {
     /// string (Bad Piggies / Unity 3.5 checks the version string to decide
     /// which renderer code path to use — mismatching the API leaves Unity in
     /// a half-initialised ES 2.0 path that emits torn / overlapping frames).
-    strings_cache: std::collections::HashMap<(bool, GLenum), ConstPtr<u8>>,
+    strings_cache: std::collections::HashMap<(u32, GLenum), ConstPtr<u8>>,
+    indexed_strings_cache: std::collections::HashMap<(u32, GLuint), ConstPtr<u8>>,
     /// Guest `GLsync` handles (`glFenceSync` / `glFenceSyncAPPLE`). Host
     /// `GLsync` values are pointers and don't fit in a 32-bit guest value,
     /// so the guest gets an opaque handle into this table instead.
@@ -150,6 +151,7 @@ fn sync_context<'objc, 'win: 'objc>(
     current_thread: crate::ThreadId,
 ) -> Option<crate::gles::CurrentGLES<'objc>> {
     let gles_ctx = get_thread_context(state, objc, current_thread)?;
+    let _profile = crate::runtime_profile::scope(current_thread, "gles.context-current");
     Some(gles_ctx.make_current(window))
 }
 

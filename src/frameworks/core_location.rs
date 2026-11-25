@@ -15,9 +15,9 @@
 //! you know, **GAMES**.
 
 use crate::abi::GuestArg;
-use crate::dyld::{ConstantExports, HostConstant, HostDylib};
+use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant, HostDylib};
 use crate::frameworks::foundation::ns_string;
-use crate::mem::SafeRead;
+use crate::mem::{MutPtr, SafeRead};
 use crate::objc::{
     id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
 };
@@ -27,7 +27,7 @@ pub const DYLIB: HostDylib = HostDylib {
     aliases: &[],
     class_exports: &[CLASSES],
     constant_exports: &[CONSTANTS],
-    function_exports: &[],
+    function_exports: &[FUNCTIONS],
 };
 
 // MARK: - Type aliases
@@ -66,6 +66,39 @@ impl GuestArg for CLLocationCoordinate2D {
         self.longitude.to_regs(&mut regs[2..4]);
     }
 }
+
+// https://developer.apple.com/documentation/corelocation/cllocationcoordinate2disvalid(_:)
+fn CLLocationCoordinate2DIsValid(
+    _env: &mut crate::Environment,
+    coordinate: CLLocationCoordinate2D,
+) -> bool {
+    let latitude = coordinate.latitude;
+    let longitude = coordinate.longitude;
+    latitude.is_finite() && longitude.is_finite()
+        && (-90.0..=90.0).contains(&latitude)
+        && (-180.0..=180.0).contains(&longitude)
+}
+
+fn CLLocationCoordinate2DMake(
+    env: &mut crate::Environment,
+    out: MutPtr<CLLocationCoordinate2D>,
+    latitude: f64,
+    longitude: f64,
+) -> MutPtr<CLLocationCoordinate2D> {
+    env.mem.write(
+        out,
+        CLLocationCoordinate2D {
+            latitude,
+            longitude,
+        },
+    );
+    out
+}
+
+pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(CLLocationCoordinate2DMake(_, _, _)),
+    export_c_func!(CLLocationCoordinate2DIsValid(_)),
+];
 
 // MARK: - CLAuthorizationStatus constants
 const CL_AUTHORIZATION_STATUS_NOT_DETERMINED: CLAuthorizationStatus = 0;

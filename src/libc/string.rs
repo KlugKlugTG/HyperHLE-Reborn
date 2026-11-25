@@ -312,6 +312,40 @@ fn __strncat_chk(
 ) -> MutPtr<u8> {
     GenericChar::<u8>::strncat(env, dest, src, n)
 }
+// The length bounds reads of the haystack, including when there is no NUL.
+// https://github.com/apple-oss-distributions/Libc/blob/main/string/FreeBSD/strnstr.c
+fn strnstr(
+    env: &mut Environment,
+    string: ConstPtr<u8>,
+    substring: ConstPtr<u8>,
+    length: GuestUSize,
+) -> ConstPtr<u8> {
+    let needle = env.mem.cstr_at(substring).to_vec();
+    if needle.is_empty() {
+        return string;
+    }
+    if needle.len() > length as usize {
+        return Ptr::null();
+    }
+    for offset in 0..=length - needle.len() as u32 {
+        if env.mem.read(string + offset) == 0 {
+            break;
+        }
+        let mut matches = true;
+        for (index, &expected) in needle.iter().enumerate() {
+            let byte = env.mem.read(string + offset + index as u32);
+            if byte != expected {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            return string + offset;
+        }
+    }
+    Ptr::null()
+}
+
 fn strstr(env: &mut Environment, string: ConstPtr<u8>, substring: ConstPtr<u8>) -> ConstPtr<u8> {
     GenericChar::<u8>::strstr(env, string, substring)
 }
@@ -772,6 +806,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(strncat(_, _, _)),
     export_c_func!(__strncat_chk(_, _, _, _)),
     export_c_func!(strstr(_, _)),
+    export_c_func!(strnstr(_, _, _)),
     export_c_func!(strchr(_, _)),
     export_c_func!(index(_, _)),
     export_c_func!(strrchr(_, _)),

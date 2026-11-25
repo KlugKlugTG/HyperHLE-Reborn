@@ -1,0 +1,186 @@
+name: Driving Zone rendering and CPU diagnostics
+
+on:
+  push:
+    branches: ["fix/driving-zone-runtime"]
+    paths: [.github/workflows/driving-zone-diagnostic.yml]
+  workflow_dispatch:
+    inputs:
+      emulator_run_id:
+        description: CI build containing the emulator artifact
+        type: string
+        default: ""
+      graphics_trace:
+        description: Capture racing shader sources and draw state separately from performance runs
+        type: boolean
+        default: false
+      trace_after_seconds:
+        description: Delay draw-state sampling until racing has loaded
+        type: string
+        default: "40"
+      tap_sequence:
+        description: Screenshot and tap steps
+        type: string
+        default: "1:- 15:0.5,0.2 3:0.89,0.92 3:0.89,0.92 3:0.63,0.56 25:- 10:-"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [mesa, mesa-native, angle]
+    permissions:
+      contents: write # Read the unpublished draft input; never publish it.
+      actions: read
+    env:
+      DISPLAY: ":99"
+      ALSOFT_DRIVERS: "null"
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      LP_NUM_THREADS: "2"
+      TOUCHHLE_FRAME_TIMES: "1"
+      TOUCHHLE_PROFILE_RUNTIME: "1"
+      GRAPHICS_TRACE: ${{ inputs.graphics_trace && '1' || '0' }}
+      TOUCHHLE_TRACE_DRAW_AFTER_SECONDS: ${{ inputs.trace_after_seconds || '40' }}
+      BUILD_RUN: ${{ inputs.emulator_run_id }}
+      TAPS: ${{ inputs.tap_sequence || '1:- 15:0.5,0.2 3:0.89,0.92 3:0.89,0.92 3:0.63,0.56 25:- 10:-' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install runtime and profiling tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ripgrep xvfb xdotool x11-utils imagemagick python3 libsndio7.0 libgl1 libegl1 libgles1 libgles2 libvulkan1 mesa-vulkan-drivers mesa-utils sysstat linux-tools-generic
+      - name: Require a successful emulator compilation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$BUILD_RUN" ]; then
+            for attempt in $(seq 1 60); do
+              BUILD_RUN=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow minecraft-diagnostic.yml --commit "$GITHUB_SHA" --json databaseId --jq '.[0].databaseId // empty')
+              if [ -n "$BUILD_RUN" ]; then break; fi
+              sleep 2
+            done
+          fi
+          test -n "$BUILD_RUN"
+          echo "BUILD_RUN=$BUILD_RUN" >> "$GITHUB_ENV"
+          gh run watch "$BUILD_RUN" --repo "$GITHUB_REPOSITORY" --interval 15
+          test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN/jobs" --jq '.jobs[] | select(.name == "linux-arm64") | .conclusion')" = success
+          # TestApp's independent result remains visible in the build workflow.
+          gh run view "$BUILD_RUN" --repo "$GITHUB_REPOSITORY" --json headSha,jobs > build-validation.json
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ env.BUILD_RUN }}
+          name: HyperHLE_Linux_ARM64_diagnostic
+          path: emulator
+      - uses: actions/download-artifact@v4
+        if: matrix.backend == 'angle'
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45154298497
+          name: ANGLE_Linux_ARM64_GLES1
+          path: angle
+      - name: Select graphics implementation
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          if [ "$BACKEND" = angle ]; then
+            echo "LD_LIBRARY_PATH=$GITHUB_WORKSPACE/angle" >> "$GITHUB_ENV"
+            echo "SDL_VIDEO_EGL_DRIVER=$GITHUB_WORKSPACE/angle/libEGL.so" >> "$GITHUB_ENV"
+            echo "SDL_VIDEO_GL_DRIVER=$GITHUB_WORKSPACE/angle/libGLESv1_CM.so" >> "$GITHUB_ENV"
+            echo "ANGLE_DEFAULT_PLATFORM=vulkan" >> "$GITHUB_ENV"
+            echo "MESA_VK_WSI_DEBUG=sw,noshm" >> "$GITHUB_ENV"
+            icd=$(rg --files /usr/share/vulkan/icd.d | rg '/lvp.*\.json$' | head -n 1)
+            test -n "$icd"
+            echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+          fi
+          if [ "$BACKEND" != mesa ]; then
+            echo "SDL_VIDEO_X11_FORCE_EGL=1" >> "$GITHUB_ENV"
+          fi
+      - name: Read the unpublished game fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(gh release view ci-private-driving-zone-20261125 --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          gh release download ci-private-driving-zone-20261125 --repo "$GITHUB_REPOSITORY" --pattern '*.ipa' --dir private-inputs
+          input=$(rg --files --no-ignore private-inputs | head -n 1)
+          mv "$input" private-inputs/driving-zone.ipa
+      - name: Start display and record host hardware
+        run: |
+          mkdir -p results
+          cp build-validation.json results/
+          lscpu > results/cpu.txt
+          free -h > results/memory.txt
+          ls -l /dev/dri > results/gpu-devices.txt 2>&1 || true
+          Xvfb :99 -screen 0 1280x960x24 -ac > results/xvfb.log 2>&1 &
+          sleep 2
+          glxinfo -B > results/renderer.txt
+          chmod +x emulator/touchHLE
+      - name: Capture gameplay, frame timing and sampled CPU stacks
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          read -r -a taps <<< "$TAPS"
+          tap_args=()
+          for tap in "${taps[@]}"; do tap_args+=(--step "$tap"); done
+          graphics_args=()
+          if [ "$BACKEND" = angle ]; then graphics_args+=(--gles1=gles1_native); fi
+          # Mesa's EGL driver supports ES2/3, but not the bootstrap ES1 context.
+          if [ "$BACKEND" = mesa-native ]; then graphics_args+=(--gles1=gles1_on_gles2); fi
+          # These emulator flags test presence, so a value of 0 enables them.
+          if [ "$GRAPHICS_TRACE" = 1 ]; then
+            export TOUCHHLE_TRACE_DRAW=1 TOUCHHLE_DEBUG_ES2_DRAW=1
+            export TOUCHHLE_DUMP_SHADER_SOURCE=1 TOUCHHLE_TRACE_UNIFORMS=1
+          fi
+          pidstat -h -r -u -w -t -C touchHLE 1 > results/pidstat.txt &
+          python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/driving-zone.ipa" --exe "$GITHUB_WORKSPACE/emulator/touchHLE" --cwd "$GITHUB_WORKSPACE/emulator" --out results/gameplay "${tap_args[@]}" --final-wait 20 --require-nonblack-frame --require-eagl-frames -- "${graphics_args[@]}" --overlay=off --device-family=iphone-4s --no-error-popup &
+          game_test=$!
+          (
+            for attempt in $(seq 1 60); do
+              game_pid=$(pgrep -x touchHLE | head -n 1 || true)
+              if [ -n "$game_pid" ]; then break; fi
+              sleep 0.5
+            done
+            test -n "$game_pid"
+            perf_exe=$(rg --files -L /usr/lib/linux-tools* | rg '/perf$' | head -n 1)
+            test -n "$perf_exe"
+            sleep 15
+            if ! sudo "$perf_exe" record -F 99 -e cpu-clock:u -g --call-graph dwarf,16384 -o "$GITHUB_WORKSPACE/results/startup-perf.data" -p "$game_pid" -- sleep 20; then
+              echo 'Sampling PMU unavailable; require coroutine-aware runtime profile below.'
+              exit 0
+            fi
+            sudo "$perf_exe" report --stdio --no-children -i "$GITHUB_WORKSPACE/results/startup-perf.data" > results/startup-perf.txt
+            sleep 10
+            sudo "$perf_exe" record -F 99 -e cpu-clock:u -g --call-graph dwarf,16384 -o "$GITHUB_WORKSPACE/results/gameplay-perf.data" -p "$game_pid" -- sleep 20
+            sudo "$perf_exe" report --stdio --no-children -i "$GITHUB_WORKSPACE/results/gameplay-perf.data" > results/gameplay-perf.txt
+          ) > results/perf.log 2>&1 &
+          profile=$!
+          set +e
+          wait "$game_test"
+          game_status=$?
+          wait "$profile"
+          profile_status=$?
+          cat results/perf.log
+          rg 'RUNTIME-PROFILE category=guest.cpu' emulator/HyperHLE_log.txt > results/guest-cpu-profile.txt
+          rg 'RUNTIME-PROFILE' emulator/HyperHLE_log.txt > results/runtime-profile.txt
+          test "$game_status" = 0 && test "$profile_status" = 0
+      - name: Preserve diagnostics without the private input
+        if: always()
+        run: |
+          mkdir -p results
+          sudo chown -R "$(id -u):$(id -g)" results
+          cp emulator/HyperHLE_log.txt results/runtime.log 2>/dev/null || true
+          mkdir -p results/shaders
+          for shader in emulator/shader_dump_*.glsl; do
+            if [ -f "$shader" ]; then cp "$shader" results/shaders/; fi
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Driving_Zone_${{ matrix.backend }}_diagnostics
+          path: results/

@@ -1645,6 +1645,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     if let Some(frame_due) = frame_due {
+        let _profile = crate::runtime_profile::scope(env.current_thread, "eagl.frame-sync");
         pace_frame(env, frame_due);
         }
 
@@ -1817,6 +1818,7 @@ const FRAME_PACING_SPIN_BUDGET: Duration = Duration::from_millis(2);
 ///   milliseconds lands the wake-up within tens of microseconds of the
 ///   deadline — the frame pacing equivalent of a vsync phase-lock.
 fn pace_frame(env: &mut Environment, frame_due: Instant) {
+    let _profile = crate::runtime_profile::scope(env.current_thread, "eagl.frame-sync");
     let now = Instant::now();
     if frame_due <= now {
         return;
@@ -3029,6 +3031,9 @@ unsafe fn present_renderbuffer(
     options: EaglPresentOptions,
     context_token: usize,
 ) {
+    let _profile = crate::runtime_profile::scope(env.current_thread, "eagl.presentation");
+    crate::runtime_profile::report();
+
     // Capture this up front because the env borrow is moved into the GL
     // context machinery below.
     let trace_gl_errors = options.trace_gl_errors;
@@ -3240,7 +3245,10 @@ unsafe fn present_renderbuffer(
             context_token,
         );
         std::mem::drop(gles_boxed);
-        env.window.as_mut().unwrap().swap_window();
+        {
+            let _profile = crate::runtime_profile::scope(env.current_thread, "eagl.swap");
+            env.window.as_mut().unwrap().swap_window();
+        }
         return;
     }
     if gles.is_translator() {
