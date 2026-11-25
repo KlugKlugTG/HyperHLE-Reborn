@@ -562,6 +562,11 @@ Other options:
         Gameloft titles) then take the older path instead of the 3.0 one,
         which is often what fixes black, garbled or missing frames.
 
+        The confirmed case is Unity: on its ES 3.0 path many titles render
+        their textures broken here (scrambled, stretched, or showing another
+        image entirely), and with this option they switch to ES 2.0 and draw
+        correctly. If a game looks fine on 3.0, leave the switch alone.
+
         Apps that are ES 3.0-only keep failing to create a context, exactly
         as they would on the real hardware this option emulates.
 
