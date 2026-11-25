@@ -49,9 +49,11 @@ fn trace_draw_delay_elapsed() -> bool {
     static DELAY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let delay = *DELAY.get_or_init(|| {
-        std::env::var("TOUCHHLE_TRACE_DRAW_AFTER_SECONDS").ok()
+        std::env::var("TOUCHHLE_TRACE_DRAW_AFTER_SECONDS")
+            .ok()
             .and_then(|seconds| seconds.parse::<u64>().ok())
-            .map(std::time::Duration::from_secs).unwrap_or_default()
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_default()
     });
     START.get_or_init(std::time::Instant::now).elapsed() >= delay
 }
@@ -1265,7 +1267,7 @@ fn glBufferData(
         }
         let guest_data = data;
         debug_log_buffer_upload(gles, mem, "BufferData", target, 0, size, data);
-        if trace_draw_enabled()
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW")
             && target == ARRAY_BUFFER
             && !data.is_null()
         {
@@ -1354,7 +1356,7 @@ fn glBufferSubData(
         let range = objects.validate_sub_data(gles, target, buffer, offset, size)?;
         let guest_data = data;
         debug_log_buffer_upload(gles, mem, "BufferSubData", target, offset, size, data);
-        if trace_draw_enabled()
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW")
             && target == ARRAY_BUFFER
             && !data.is_null()
         {
@@ -2509,21 +2511,23 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
     })
 }
 
-/// One-shot state dump at the first larger indexed draw, gated by
-/// `TOUCHHLE_DEBUG_ES2_DRAW`. Helps diagnose "render loop alive but
-/// renderbuffer stays black" situations.
+/// Bounded state dump for each program, gated by `TOUCHHLE_DEBUG_ES2_DRAW`.
+/// Sampling more than the first program includes lit meshes as well as UI.
 unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, mem: &Mem) {
-    if !trace_debug_draw_enabled() {
+    if !trace_debug_draw_enabled() || !gles.is_es2() {
         return;
     }
-    static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    let mut fbo: GLint = 0;
-    gles.GetIntegerv(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &mut fbo);
     let mut program: GLint = 0;
     gles.GetIntegerv(0x8B8D /* GL_CURRENT_PROGRAM */, &mut program);
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(usize, GLint)>>> =
+        std::sync::OnceLock::new();
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+    if program == 0 || seen.len() >= 64 || !seen.insert((shadow.resource_group_token, program)) {
+        return;
+    }
+    drop(seen);
+    let mut fbo: GLint = 0;
+    gles.GetIntegerv(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &mut fbo);
     let mut tex: GLint = 0;
     gles.GetIntegerv(0x8069 /* GL_TEXTURE_BINDING_2D */, &mut tex);
     let mut arr_buf: GLint = 0;
@@ -2535,6 +2539,8 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
     );
     let mut viewport = [0 as GLint; 4];
     gles.GetIntegerv(0x0BA2 /* GL_VIEWPORT */, viewport.as_mut_ptr());
+    let mut scissor = [0 as GLint; 4];
+    gles.GetIntegerv(0x0C10 /* GL_SCISSOR_BOX */, scissor.as_mut_ptr());
     let mut rb: GLint = 0;
     gles.GetIntegerv(0x8CA7 /* GL_RENDERBUFFER_BINDING */, &mut rb);
     let status = gles.CheckFramebufferStatus(0x8D40 /* GL_FRAMEBUFFER */);
@@ -2614,10 +2620,18 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
             name.as_mut_ptr().cast(),
         );
         let used = length.clamp(0, name.len() as GLsizei) as usize;
+        let c_name = std::ffi::CString::new(&name[..used]).unwrap();
+        let location = gles.GetAttribLocation(program as GLuint, c_name.as_ptr());
+        let mut current = [0.0_f32; 4];
+        if location >= 0 {
+            gles.GetVertexAttribfv(location as GLuint, 0x8626, current.as_mut_ptr());
+        }
         active_attribs.push((
             String::from_utf8_lossy(&name[..used]).into_owned(),
             size,
             type_,
+            location,
+            current,
         ));
     }
     let mut enabled_attribs = Vec::new();
@@ -2635,6 +2649,7 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
         }
         let mut size = 0;
         let mut type_ = 0;
+        let mut normalized = 0;
         let mut stride = 0;
         let mut buffer = 0;
         let mut ptr: *mut GLvoid = std::ptr::null_mut();
@@ -2646,6 +2661,7 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
             index, 0x8625, /* GL_VERTEX_ATTRIB_ARRAY_TYPE */
             &mut type_,
         );
+        gles.GetVertexAttribiv(index, 0x886A, &mut normalized);
         gles.GetVertexAttribiv(
             index,
             0x8624, /* GL_VERTEX_ATTRIB_ARRAY_STRIDE */
@@ -2669,7 +2685,27 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
         } else {
             None
         };
-        enabled_attribs.push((index, size, type_, stride, buffer, ptr as usize, first));
+        let buffer_sample = if buffer > 0 {
+            let cache = diag_buffer_cache().lock().unwrap();
+            cache.get(&(buffer as GLuint)).and_then(|bytes| {
+                bytes
+                    .get(ptr as usize..(ptr as usize).saturating_add(16))
+                    .map(|bytes| format!("{:02x?}", bytes))
+            })
+        } else {
+            None
+        };
+        enabled_attribs.push((
+            index,
+            size,
+            type_,
+            normalized,
+            stride,
+            buffer,
+            ptr as usize,
+            first,
+            buffer_sample,
+        ));
     }
     let mut active_uniform_count: GLint = 0;
     gles.GetProgramiv(
@@ -2678,7 +2714,8 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
         &mut active_uniform_count,
     );
     let mut active_uniforms = Vec::new();
-    for index in 0..active_uniform_count.clamp(0, 32) as GLuint {
+    let mut samplers = Vec::new();
+    for index in 0..active_uniform_count.clamp(0, 128) as GLuint {
         let mut name = [0_u8; 128];
         let mut length: GLsizei = 0;
         let mut size: GLint = 0;
@@ -2712,11 +2749,40 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
                 _ => 1,
             };
             format!("{:?}", &value[..components])
+        } else if matches!(type_, 0x8B5E | 0x8B60) {
+            let mut unit = 0;
+            gles.GetUniformiv(program as GLuint, location, &mut unit);
+            samplers.push((uniform_name.clone(), unit, type_));
+            format!("unit={}", unit)
         } else {
             "non-float uniform".to_string()
         };
         active_uniforms.push((uniform_name, size, type_, location, value));
     }
+    let mut active_texture = 0;
+    gles.GetIntegerv(0x84E0 /* GL_ACTIVE_TEXTURE */, &mut active_texture);
+    let mut textures = Vec::new();
+    for (name, unit, type_) in samplers {
+        if !(0..32).contains(&unit) {
+            continue;
+        }
+        gles.ActiveTexture(gles11::TEXTURE0 + unit as GLenum);
+        let target = if type_ == 0x8B60 {
+            TEXTURE_CUBE_MAP
+        } else {
+            gles11::TEXTURE_2D
+        };
+        let binding = current_bound_texture(gles, target).unwrap_or(0);
+        let mut parameters = [0; 4];
+        for (pname, value) in [0x2801, 0x2800, 0x2802, 0x2803]
+            .into_iter()
+            .zip(&mut parameters)
+        {
+            gles.GetTexParameteriv(target, pname, value);
+        }
+        textures.push((name, unit, target, binding, parameters));
+    }
+    gles.ActiveTexture(active_texture as GLenum);
     let mut err = gles.GetError();
     while err != 0 && errs.len() < 16 {
         errs.push(err);
@@ -2724,8 +2790,8 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
     }
     log!(
         "ES2 draw state: fbo={} status={:#x} program={} texture={} \
-         array_buf={} elem_buf={} renderbuffer={} viewport={:?} color_mask={:?} states={:?} attribs={:?} \
-         active_count={} active_attribs={:?} enabled_attribs={:?} active_uniform_count={} active_uniforms={:?} generic_attribs_used={} err={:?}",
+         array_buf={} elem_buf={} renderbuffer={} viewport={:?} scissor={:?} color_mask={:?} states={:?} attribs={:?} \
+         active_count={} active_attribs={:?} enabled_attribs={:?} active_uniform_count={} active_uniforms={:?} textures={:?} generic_attribs_used={} err={:?}",
         fbo,
         status,
         program,
@@ -2734,6 +2800,7 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
         elem_buf,
         rb,
         viewport,
+        scissor,
         color_mask,
         states,
         attribs,
@@ -2742,6 +2809,7 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
         enabled_attribs,
         active_uniform_count,
         active_uniforms,
+        textures,
         shadow.generic_attribs_used,
         errs,
     );
@@ -2831,13 +2899,6 @@ fn glDrawElements(
             return;
         }
         if count > 3 && trace_debug_draw_enabled() {
-            log!(
-                "ES2 first larger indexed draw: mode=0x{:x} count={} type=0x{:x} indices=0x{:x}",
-                mode,
-                count,
-                type_,
-                indices.to_bits()
-            );
             log_es2_draw_state_once(gles, shadow, mem);
         }
         let Some(native_arrays) = guard_native_client_arrays(gles, shadow) else {
@@ -4614,10 +4675,10 @@ fn glGetUniformLocation(env: &mut Environment, program: GLuint, name: ConstPtr<G
     with_ctx_and_mem_no_skip(env, |gles, mem| unsafe {
         let cstr = read_guest_cstring(mem, name);
         let loc = gles.GetUniformLocation(program, cstr.as_ptr());
-        if trace_debug_draw_enabled() {
+        if trace_debug_draw_enabled() || crate::env_flag_cached!("TOUCHHLE_TRACE_UNIFORMS") {
             static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 64 {
+            if n < 4096 {
                 log!(
                     "[ES2DIAG] glGetUniformLocation(program={}, \"{}\") = {}",
                     program,
@@ -4751,6 +4812,9 @@ fn glAttachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.AttachShader(program, shader);
         record_shader_attach(program, shader);
+        if crate::env_flag_cached!("TOUCHHLE_DUMP_SHADER_SOURCE") {
+            log!("SHADER-DIAG attach program={} shader={}", program, shader);
+        }
     });
 }
 fn glDetachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
@@ -5107,11 +5171,9 @@ fn glGetActiveUniform(
     type_: MutPtr<GLenum>,
     name: MutPtr<GLubyte>,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        if bufSize <= 0 {
-            if !length.is_null() {
-                mem.write(length, 0);
-            }
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        if bufSize < 0 {
+            shadow.record_error(gles11::INVALID_VALUE);
             return;
         }
         let mut host_length: GLsizei = 0;
@@ -5125,8 +5187,26 @@ fn glGetActiveUniform(
             &mut host_length,
             &mut host_size,
             &mut host_type,
-            buf.as_mut_ptr().cast(),
+            if bufSize == 0 {
+                std::ptr::null_mut()
+            } else {
+                buf.as_mut_ptr().cast()
+            },
         );
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_UNIFORMS") {
+            static QUERIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if QUERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4096 {
+                log!(
+                    "ACTIVE-UNIFORM program={} index={} buf_size={} size={} type={:#x} name={:?}",
+                    program,
+                    index,
+                    bufSize,
+                    host_size,
+                    host_type,
+                    String::from_utf8_lossy(&buf[..host_length.clamp(0, bufSize) as usize])
+                );
+            }
+        }
         if !length.is_null() {
             mem.write(length, host_length);
         }
@@ -5154,11 +5234,9 @@ fn glGetActiveAttrib(
     type_: MutPtr<GLenum>,
     name: MutPtr<GLubyte>,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        if bufSize <= 0 {
-            if !length.is_null() {
-                mem.write(length, 0);
-            }
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        if bufSize < 0 {
+            shadow.record_error(gles11::INVALID_VALUE);
             return;
         }
         let mut host_length: GLsizei = 0;
@@ -5172,8 +5250,26 @@ fn glGetActiveAttrib(
             &mut host_length,
             &mut host_size,
             &mut host_type,
-            buf.as_mut_ptr().cast(),
+            if bufSize == 0 {
+                std::ptr::null_mut()
+            } else {
+                buf.as_mut_ptr().cast()
+            },
         );
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_UNIFORMS") {
+            static QUERIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if QUERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 1024 {
+                log!(
+                    "ACTIVE-ATTRIB program={} index={} buf_size={} size={} type={:#x} name={:?}",
+                    program,
+                    index,
+                    bufSize,
+                    host_size,
+                    host_type,
+                    String::from_utf8_lossy(&buf[..host_length.clamp(0, bufSize) as usize])
+                );
+            }
+        }
         if !length.is_null() {
             mem.write(length, host_length);
         }
@@ -6980,9 +7076,8 @@ fn glVertexAttrib1f(env: &mut Environment, index: GLuint, x: GLfloat) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.VertexAttrib1f(index, x) });
 }
 fn glVertexAttrib1fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
-    let value = env.mem.read(values);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.VertexAttrib1fv(index, &value)
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        gles.VertexAttrib1fv(index, mem.ptr_at(values, 1))
     });
 }
 fn glVertexAttrib2f(env: &mut Environment, index: GLuint, x: GLfloat, y: GLfloat) {
@@ -7008,21 +7103,18 @@ fn glVertexAttrib4f(
     });
 }
 fn glVertexAttrib2fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
-    let value = env.mem.read(values);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.VertexAttrib2fv(index, &value)
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        gles.VertexAttrib2fv(index, mem.ptr_at(values, 2))
     });
 }
 fn glVertexAttrib3fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
-    let value = env.mem.read(values);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.VertexAttrib3fv(index, &value)
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        gles.VertexAttrib3fv(index, mem.ptr_at(values, 3))
     });
 }
 fn glVertexAttrib4fv(env: &mut Environment, index: GLuint, values: ConstPtr<GLfloat>) {
-    let value = env.mem.read(values);
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.VertexAttrib4fv(index, &value)
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        gles.VertexAttrib4fv(index, mem.ptr_at(values, 4))
     });
 }
 fn glUniform1i(env: &mut Environment, location: GLint, v0: GLint) {
@@ -7069,7 +7161,7 @@ fn glUniform4f(
             use std::sync::atomic::{AtomicU32, Ordering};
             static UN: AtomicU32 = AtomicU32::new(0);
             let un = UN.fetch_add(1, Ordering::Relaxed);
-            if un < 40 {
+            if un < 256 {
                 log!(
                     "UNIFORM4F loc={} vals=[{},{},{},{}]",
                     location,
@@ -7143,7 +7235,15 @@ fn glUniform4fv(env: &mut Environment, location: GLint, count: GLsizei, value: C
             if un < 40 {
                 let mut v = vec![0.0f32; n.min(16)];
                 std::ptr::copy_nonoverlapping(ptr, v.as_mut_ptr(), v.len());
-                log!("UNIFORM4FV loc={} count={} vals={:?}", location, count, v);
+                let mut program = 0;
+                gles.GetIntegerv(0x8B8D, &mut program);
+                log!(
+                    "UNIFORM4FV program={} loc={} count={} vals={:?}",
+                    program,
+                    location,
+                    count,
+                    v
+                );
             }
         }
         // EXPERIMENT (TOUCHHLE_FORCE_IDENTITY_TC): rewrite a shear-looking
