@@ -24,6 +24,10 @@ pub(super) struct WorkerQueue {
 }
 
 impl WorkerQueue {
+    pub(super) fn make_immortal(&mut self) {
+        self.references = usize::MAX;
+    }
+
     pub(super) fn new(concurrent: bool) -> Self {
         Self {
             concurrent,
@@ -48,7 +52,7 @@ pub(super) fn requires_sync_worker(env: &mut Environment, queue: dispatch_queue_
 
 pub(super) fn enqueue(env: &mut Environment, queue: dispatch_queue_t, task: MainQueueTask) {
     let handle = queue.to_bits();
-    if handle == MAIN_QUEUE_PTR {
+    if handle == main_queue(env) {
         get_state(env).main_queue.push_back(task);
         return;
     }
@@ -177,7 +181,7 @@ fn dispatch_worker(env: &mut Environment, queue: dispatch_queue_t) -> MutVoidPtr
             let ready = !q.barrier_active
                 && q.pending.front().is_some_and(|task| {
                     !task.barrier
-                        || handle == GLOBAL_QUEUE_PTR
+                        || q.references == usize::MAX
                         || !q.workers.iter().any(|(_, busy)| *busy)
                 });
             if ready || (q.references == 0 && q.pending.is_empty()) {
@@ -197,7 +201,7 @@ fn dispatch_worker(env: &mut Environment, queue: dispatch_queue_t) -> MutVoidPtr
             break;
         }
         let task = q.pending.pop_front().unwrap();
-        q.barrier_active = task.barrier && handle != GLOBAL_QUEUE_PTR;
+        q.barrier_active = task.barrier && q.references != usize::MAX;
         q.workers.iter_mut().find(|(id, _)| *id == tid).unwrap().1 = true;
         if q.pending.is_empty() {
             state.pending_worker_queues.remove(&handle);
@@ -243,6 +247,7 @@ fn dispatch_worker(env: &mut Environment, queue: dispatch_queue_t) -> MutVoidPtr
     let q = get_state(env).worker_queues.get_mut(&handle).unwrap();
     q.workers.retain(|(worker, _)| *worker != tid);
     if q.workers.is_empty() {
+        env.objc.dealloc_object(queue.cast(), &mut env.mem);
         get_state(env).worker_queues.remove(&handle);
         host_destroy_semaphore(env, wake);
         if let Some(label) = get_state(env).queue_labels.remove(&handle) {
@@ -288,6 +293,8 @@ pub(super) fn release(env: &mut Environment, handle: u32) -> bool {
     let wake = q.wake;
     let workers = q.workers.len();
     if workers == 0 {
+        env.objc
+            .dealloc_object(Ptr::from_bits(handle), &mut env.mem);
         get_state(env).worker_queues.remove(&handle);
         if let Some(label) = get_state(env).queue_labels.remove(&handle) {
             env.mem.free(label.cast_mut().cast());

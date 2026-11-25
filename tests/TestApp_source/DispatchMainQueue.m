@@ -590,3 +590,57 @@ int test_CADisplayLink_refresh_clock(void) {
   [pool drain];
   return result;
 }
+
+// Dispatch objects use Objective-C ownership on iOS >= 6, and C retention
+// must be interchangeable with -retain/-release. Returning nil from a
+// property setter's retain used to erase the group and crash on enter.
+// https://github.com/apple-oss-distributions/libdispatch/blob/main/os/object.h
+extern void dispatch_retain(void *);
+extern dispatch_queue_t dispatch_get_main_queue(void);
+extern void *dispatch_semaphore_create(long);
+extern long dispatch_semaphore_wait(void *, uint64_t);
+extern long dispatch_semaphore_signal(void *);
+
+int test_dispatch_objc_ownership(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  int result = 0;
+  dispatch_group_t group = dispatch_group_create();
+  id object = [(id)group retain];
+  if (object != (id)group || ![object isKindOfClass:[NSObject class]])
+    result = -1;
+  dispatch_release(group);
+  dispatch_group_enter(group);
+  dispatch_group_leave(group);
+  if (dispatch_group_wait(group, 0) != 0)
+    result = -2;
+  [object autorelease];
+
+  dispatch_queue_t main = dispatch_get_main_queue();
+  if (main != &_dispatch_main_q || [(id)main retain] != (id)main)
+    result = -3;
+  [(id)main release];
+  dispatch_queue_t global = dispatch_get_global_queue(0, 0);
+  if ([(id)global retain] != (id)global)
+    result = -4;
+  [(id)global release];
+  dispatch_queue_t queue = dispatch_queue_create("objc ownership", NULL);
+  id queue_object = [(id)queue retain];
+  dispatch_release(queue);
+  if (queue_object != (id)queue)
+    result = -5;
+  [queue_object release];
+
+  void *sem = dispatch_semaphore_create(0);
+  id sem_object = [(id)sem retain];
+  dispatch_release(sem);
+  if (sem_object != (id)sem || dispatch_semaphore_wait(sem, 0) == 0)
+    result = -6;
+  dispatch_semaphore_signal(sem);
+  if (dispatch_semaphore_wait(sem, 0) != 0)
+    result = -7;
+  [sem_object autorelease];
+  if (dispatch_semaphore_create(-1) != NULL)
+    result = -8;
+  [pool drain];
+  return result;
+}

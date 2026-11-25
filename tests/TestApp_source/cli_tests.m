@@ -694,6 +694,7 @@ int test_AutoreleasePool(void);    // AutoReleasePoolTest.m
 int test_CGAffineTransform(void);  // CGAffineTransform.c
 int test_RespondsToSelector(void); // RespondsToSelector.m
 int test_Initialize(void);         // Initialize.m
+int test_dispatch_objc_ownership(void);
 int test_dispatch_main_queue_async(void);     // DispatchMainQueue.m
 int test_dispatch_main_queue_serial(void);    // DispatchMainQueue.m
 int test_dispatch_main_queue_sync(void);      // DispatchMainQueue.m
@@ -7559,6 +7560,7 @@ struct {
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_removeObserver),
     FUNC_DEF(test_performSelectorOnMainThread_mainThreadDeferred),
     FUNC_DEF(test_dispatch_main_queue_async),
+    FUNC_DEF(test_dispatch_objc_ownership),
     FUNC_DEF(test_dispatch_main_queue_serial),
     FUNC_DEF(test_dispatch_main_queue_sync),
     FUNC_DEF(test_dispatch_queue_thread_identity),

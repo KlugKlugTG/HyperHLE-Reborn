@@ -1261,8 +1261,6 @@ impl Dyld {
                 || name == "__dispatch_data_destructor_default"
                 || name == "__dispatch_data_destructor_free"
                 || name == "__dispatch_data_destructor_munmap"
-                || name == "__dispatch_main_q"
-                || name == "__dispatch_queue_main"
             {
                 // Dispatch source types carry small internal tags; other
                 // libdispatch constants remain opaque non-NULL markers.
@@ -1519,8 +1517,6 @@ impl Dyld {
                 || symbol == "__dispatch_data_destructor_default"
                 || symbol == "__dispatch_data_destructor_free"
                 || symbol == "__dispatch_data_destructor_munmap"
-                || symbol == "__dispatch_main_q"
-                || symbol == "__dispatch_queue_main"
             {
                 // See the matching branch in the external-relocation loop.
                 let p: MutPtr<u32> = mem.alloc(4).cast();
