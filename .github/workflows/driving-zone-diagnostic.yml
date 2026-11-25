@@ -14,6 +14,10 @@ on:
         description: Capture racing shader sources and draw state separately from performance runs
         type: boolean
         default: false
+      trace_after_seconds:
+        description: Delay draw-state sampling until racing has loaded
+        type: string
+        default: "40"
       tap_sequence:
         description: Screenshot and tap steps
         type: string
@@ -41,10 +45,8 @@ jobs:
       LP_NUM_THREADS: "2"
       TOUCHHLE_FRAME_TIMES: "1"
       TOUCHHLE_PROFILE_RUNTIME: "1"
-      TOUCHHLE_TRACE_DRAW: ${{ inputs.graphics_trace && '1' || '0' }}
-      TOUCHHLE_DEBUG_ES2_DRAW: ${{ inputs.graphics_trace && '1' || '0' }}
-      TOUCHHLE_DUMP_SHADER_SOURCE: ${{ inputs.graphics_trace && '1' || '0' }}
-      TOUCHHLE_TRACE_DRAW_AFTER_SECONDS: "20"
+      GRAPHICS_TRACE: ${{ inputs.graphics_trace && '1' || '0' }}
+      TOUCHHLE_TRACE_DRAW_AFTER_SECONDS: ${{ inputs.trace_after_seconds || '40' }}
       BUILD_RUN: ${{ inputs.emulator_run_id }}
       TAPS: ${{ inputs.tap_sequence || '1:- 15:0.5,0.2 3:0.89,0.92 3:0.89,0.92 3:0.63,0.56 25:- 10:-' }}
     steps:
@@ -127,7 +129,14 @@ jobs:
           tap_args=()
           for tap in "${taps[@]}"; do tap_args+=(--step "$tap"); done
           graphics_args=()
-          if [ "$BACKEND" != mesa ]; then graphics_args+=(--gles1=gles1_native); fi
+          if [ "$BACKEND" = angle ]; then graphics_args+=(--gles1=gles1_native); fi
+          # Mesa's EGL driver supports ES2/3, but not the bootstrap ES1 context.
+          if [ "$BACKEND" = mesa-native ]; then graphics_args+=(--gles1=gles1_on_gles2); fi
+          # These emulator flags test presence, so a value of 0 enables them.
+          if [ "$GRAPHICS_TRACE" = 1 ]; then
+            export TOUCHHLE_TRACE_DRAW=1 TOUCHHLE_DEBUG_ES2_DRAW=1
+            export TOUCHHLE_DUMP_SHADER_SOURCE=1 TOUCHHLE_TRACE_UNIFORMS=1
+          fi
           pidstat -h -r -u -w -t -C touchHLE 1 > results/pidstat.txt &
           python3 dev-scripts/ai-tap-sequence.py "$GITHUB_WORKSPACE/private-inputs/driving-zone.ipa" --exe "$GITHUB_WORKSPACE/emulator/touchHLE" --cwd "$GITHUB_WORKSPACE/emulator" --out results/gameplay "${tap_args[@]}" --final-wait 20 --require-nonblack-frame --require-eagl-frames -- "${graphics_args[@]}" --overlay=off --device-family=iphone-4s --no-error-popup &
           game_test=$!
