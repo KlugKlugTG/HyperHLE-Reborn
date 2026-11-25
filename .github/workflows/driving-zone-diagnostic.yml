@@ -10,6 +10,10 @@ on:
         description: CI build containing the emulator artifact
         type: string
         default: ""
+      graphics_trace:
+        description: Capture racing shader sources and draw state separately from performance runs
+        type: boolean
+        default: false
       tap_sequence:
         description: Screenshot and tap steps
         type: string
@@ -37,6 +41,10 @@ jobs:
       LP_NUM_THREADS: "2"
       TOUCHHLE_FRAME_TIMES: "1"
       TOUCHHLE_PROFILE_RUNTIME: "1"
+      TOUCHHLE_TRACE_DRAW: ${{ inputs.graphics_trace && '1' || '0' }}
+      TOUCHHLE_DEBUG_ES2_DRAW: ${{ inputs.graphics_trace && '1' || '0' }}
+      TOUCHHLE_DUMP_SHADER_SOURCE: ${{ inputs.graphics_trace && '1' || '0' }}
+      TOUCHHLE_TRACE_DRAW_AFTER_SECONDS: "20"
       BUILD_RUN: ${{ inputs.emulator_run_id }}
       TAPS: ${{ inputs.tap_sequence || '1:- 15:0.5,0.2 3:0.89,0.92 3:0.89,0.92 3:0.63,0.56 25:- 10:-' }}
     steps:
@@ -158,6 +166,10 @@ jobs:
           mkdir -p results
           sudo chown -R "$(id -u):$(id -g)" results
           cp emulator/HyperHLE_log.txt results/runtime.log 2>/dev/null || true
+          mkdir -p results/shaders
+          for shader in emulator/shader_dump_*.glsl; do
+            if [ -f "$shader" ]; then cp "$shader" results/shaders/; fi
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:

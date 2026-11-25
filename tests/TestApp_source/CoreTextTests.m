@@ -276,9 +276,13 @@ int test_CTFont_draw_glyphs_bitmap(void) {
         continue;
       if (pixel[0] == 0 || pixel[1] || pixel[2])
         result = -2;
-      if (x >= 9 && x < 25 && y >= 9 && y < 40)
+      // Quartz glyph positions are in a Y-up user space. Bitmap storage
+      // scans from the top row, so compare the original user-space bounds.
+      // https://developer.apple.com/library/archive/documentation/GraphicsImaging/Conceptual/drawingwithquartz2d/dq_overview/dq_overview.html
+      unsigned user_y = 63 - y;
+      if (x >= 9 && x < 25 && user_y >= 9 && user_y < 40)
         left++;
-      else if (x >= 59 && x < 75 && y >= 29 && y < 60)
+      else if (x >= 59 && x < 75 && user_y >= 29 && user_y < 60)
         right++;
       else
         outside++;

@@ -45,6 +45,25 @@ const SUPPORTED_COMPRESSED_TEXTURE_FORMATS: &[GLenum] = &[
     gles11::PALETTE8_RGBA8_OES,
 ];
 
+fn trace_draw_delay_elapsed() -> bool {
+    static DELAY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let delay = *DELAY.get_or_init(|| {
+        std::env::var("TOUCHHLE_TRACE_DRAW_AFTER_SECONDS").ok()
+            .and_then(|seconds| seconds.parse::<u64>().ok())
+            .map(std::time::Duration::from_secs).unwrap_or_default()
+    });
+    START.get_or_init(std::time::Instant::now).elapsed() >= delay
+}
+
+fn trace_draw_enabled() -> bool {
+    crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && trace_draw_delay_elapsed()
+}
+
+fn trace_debug_draw_enabled() -> bool {
+    crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") && trace_draw_delay_elapsed()
+}
+
 fn trace_potatogold_render() -> bool {
     crate::env_flag_cached!("TOUCHHLE_TRACE_POTATOGOLD_RENDER")
 }
@@ -1188,7 +1207,7 @@ unsafe fn debug_log_buffer_upload(
     size: GuestGLsizeiptr,
     data: ConstPtr<GLvoid>,
 ) {
-    if !crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+    if !trace_debug_draw_enabled() {
         return;
     }
     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1246,7 +1265,7 @@ fn glBufferData(
         }
         let guest_data = data;
         debug_log_buffer_upload(gles, mem, "BufferData", target, 0, size, data);
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW")
+        if trace_draw_enabled()
             && target == ARRAY_BUFFER
             && !data.is_null()
         {
@@ -1260,7 +1279,7 @@ fn glBufferData(
                     .insert(bound as GLuint, bytes);
             }
         }
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW")
+        if trace_draw_enabled()
             && target == ARRAY_BUFFER
             && !data.is_null()
             && (1..=256).contains(&size)
@@ -1335,7 +1354,7 @@ fn glBufferSubData(
         let range = objects.validate_sub_data(gles, target, buffer, offset, size)?;
         let guest_data = data;
         debug_log_buffer_upload(gles, mem, "BufferSubData", target, offset, size, data);
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW")
+        if trace_draw_enabled()
             && target == ARRAY_BUFFER
             && !data.is_null()
         {
@@ -2355,7 +2374,7 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
         // DIAG (TOUCHHLE_TRACE_DRAW=1): dump the vertex-attribute + texture
         // state for the first several draws, to see whether the texcoord
         // attribute (A1 / loc 1) is actually fed and a texture is bound.
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") {
+        if trace_draw_enabled() {
             use std::sync::atomic::{AtomicU32, Ordering};
             static DN: AtomicU32 = AtomicU32::new(0);
             let dn = DN.fetch_add(1, Ordering::Relaxed);
@@ -2494,7 +2513,7 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
 /// `TOUCHHLE_DEBUG_ES2_DRAW`. Helps diagnose "render loop alive but
 /// renderbuffer stays black" situations.
 unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, mem: &Mem) {
-    if !crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+    if !trace_debug_draw_enabled() {
         return;
     }
     static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2811,7 +2830,7 @@ fn glDrawElements(
             );
             return;
         }
-        if count > 3 && crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+        if count > 3 && trace_debug_draw_enabled() {
             log!(
                 "ES2 first larger indexed draw: mode=0x{:x} count={} type=0x{:x} indices=0x{:x}",
                 mode,
@@ -2846,7 +2865,7 @@ fn glDrawElements(
         trace_native_draw_state(gles, shadow);
         crate::gles::perf_overlay::record_draw();
         gles.DrawElements(mode, count, type_, indices);
-        if count > 3 && crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+        if count > 3 && trace_debug_draw_enabled() {
             static FB_DUMPED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !FB_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -3627,7 +3646,7 @@ fn glTexImage2D(
                 storage_size,
             );
         }
-        if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+        if trace_debug_draw_enabled() {
             static TEX_DUMP_COUNT: std::sync::atomic::AtomicU32 =
                 std::sync::atomic::AtomicU32::new(0);
             let n = TEX_DUMP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4516,7 +4535,7 @@ fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutP
 fn unmap_buffer(env: &mut Environment, target: GLenum, _oes: bool) -> GLboolean {
     with_ctx_mem_and_buffers(env, |gles, mem, _shadow, objects| {
         let buffer = buffer_mapping::binding(gles, target)?;
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && target == ARRAY_BUFFER {
+        if trace_draw_enabled() && target == ARRAY_BUFFER {
             if let Some(mapping) = objects.mapping(buffer) {
                 if mapping.offset + mapping.length <= 4_194_304 {
                     let mut cache = diag_buffer_cache().lock().unwrap();
@@ -4595,7 +4614,7 @@ fn glGetUniformLocation(env: &mut Environment, program: GLuint, name: ConstPtr<G
     with_ctx_and_mem_no_skip(env, |gles, mem| unsafe {
         let cstr = read_guest_cstring(mem, name);
         let loc = gles.GetUniformLocation(program, cstr.as_ptr());
-        if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+        if trace_debug_draw_enabled() {
             static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 64 {
@@ -4646,7 +4665,7 @@ fn glUniformMatrix4fv(
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let n = (count as usize) * 16;
         let ptr = mem.ptr_at(value, n.try_into().unwrap_or(0));
-        if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") && location >= 0 {
+        if trace_debug_draw_enabled() && location >= 0 {
             static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let seen = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if seen < 8 {
@@ -7046,7 +7065,7 @@ fn glUniform4f(
     v3: GLfloat,
 ) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && location >= 0 {
+        if trace_draw_enabled() && location >= 0 {
             use std::sync::atomic::{AtomicU32, Ordering};
             static UN: AtomicU32 = AtomicU32::new(0);
             let un = UN.fetch_add(1, Ordering::Relaxed);
@@ -7117,7 +7136,7 @@ fn glUniform4fv(env: &mut Environment, location: GLint, count: GLsizei, value: C
     with_ctx_and_mem(env, |gles, mem| unsafe {
         let n = (count as usize) * 4;
         let ptr = mem.ptr_at(value, n.try_into().unwrap_or(0));
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && location >= 0 {
+        if trace_draw_enabled() && location >= 0 {
             use std::sync::atomic::{AtomicU32, Ordering};
             static UN: AtomicU32 = AtomicU32::new(0);
             let un = UN.fetch_add(1, Ordering::Relaxed);
