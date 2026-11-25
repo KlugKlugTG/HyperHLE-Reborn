@@ -2,7 +2,7 @@ name: Emulator diagnostics
 
 on:
   push:
-    branches: ["fix/minecraft-story-mode-startup", "fix/infinity-blade-display", "fix/general-launch-compatibility", "fix/general-startup-stability", "fix/gameloft-video-menu", "fix/backstab-gameplay", "fix/bowmasters-startup", "fix/brawlstars-3d-rendering", "fix/brawlstars-text-and-symbols", "fix/glkit-render-loop"]
+    branches: ["fix/minecraft-story-mode-startup", "fix/infinity-blade-display", "fix/general-launch-compatibility", "fix/general-startup-stability", "fix/gameloft-video-menu", "fix/backstab-gameplay", "fix/bowmasters-startup", "fix/brawlstars-3d-rendering", "fix/brawlstars-text-and-symbols", "fix/glkit-render-loop", "fix/driving-zone-runtime"]
   workflow_dispatch:
 
 permissions:
