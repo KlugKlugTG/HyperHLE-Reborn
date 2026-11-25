@@ -88,7 +88,7 @@ jobs:
         run: |
           test "$(gh release view ci-private-driving-zone-20261125 --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
           gh release download ci-private-driving-zone-20261125 --repo "$GITHUB_REPOSITORY" --pattern '*.ipa' --dir private-inputs
-          input=$(rg --files private-inputs | head -n 1)
+          input=$(rg --files --no-ignore private-inputs | head -n 1)
           mv "$input" private-inputs/driving-zone.ipa
       - name: Start display and record host hardware
         run: |
