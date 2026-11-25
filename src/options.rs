@@ -317,6 +317,21 @@ pub struct Options {
     /// (per-app via the options file) or `TOUCHHLE_FORCE_GLES1_CONTEXT=1`.
     /// Apps that are ES 2.0-only will fail to create a context with this set.
     pub force_gles1_context: bool,
+    /// Pretend the GPU has no OpenGL ES 3.0 support, so apps that feature-test
+    /// for it fall back to their older GLES renderer.
+    ///
+    /// Apple only exposes ES 3.0 on A7-class GPUs and later (iPhone 5s,
+    /// iPad Air); on every earlier device
+    /// `-[EAGLContext initWithAPI:kEAGLRenderingAPIOpenGLES3]` returns `nil`
+    /// and `glGetString(GL_VERSION)` reports `"OpenGL ES 2.0 …"`.
+    /// With this option EAGL reproduces exactly that: an ES 3.0 context
+    /// request fails, and the ES 2.0 context reports a 2.0 version string.
+    /// Engines that ship both a 3.0 and an older renderer then take the older
+    /// path instead of the 3.0 one.
+    ///
+    /// Enable with `--no-gles3` (the "No GLES 3" switch in the app picker's
+    /// Settings > Graphics screen) or per-app via the options files.
+    pub no_gles3: bool,
     pub network_access: bool,
     /// Report a local Game Center player as signed in, without providing
     /// online Game Center services. Some games require this at startup.
@@ -465,6 +480,7 @@ impl Default for Options {
                     value != "0" && !value.is_empty()
                 })
                 .unwrap_or(false),
+            no_gles3: false,
             network_access: false,
             game_center_authenticated: false,
             popup_errors: true,
@@ -817,6 +833,10 @@ impl Options {
             // GLES-native backend selection and EAGL both read this env var
             // (the GLES backend layer has no `Options` access).
             std::env::set_var("TOUCHHLE_FORCE_GLES1_CONTEXT", "1");
+        } else if arg == "--no-gles3" {
+            self.no_gles3 = true;
+        } else if arg == "--gles3" {
+            self.no_gles3 = false;
         } else if arg == "--allow-network-access" {
             self.network_access = true;
         } else if arg == "--no-network-access" {
@@ -1043,6 +1063,18 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--no-rotation-fix").unwrap());
         assert!(!options.rotation_fix);
+    }
+
+    #[test]
+    fn no_gles3_is_opt_in_and_can_be_disabled() {
+        let mut options = Options::default();
+        assert!(!options.no_gles3);
+
+        assert!(options.parse_argument("--no-gles3").unwrap());
+        assert!(options.no_gles3);
+
+        assert!(options.parse_argument("--gles3").unwrap());
+        assert!(!options.no_gles3);
     }
 
     #[test]

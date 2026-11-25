@@ -546,6 +546,25 @@ Other options:
         should NOT enable this flag, because real ES 2.0 has no fixed-function
         pipeline.
 
+    --no-gles3 / --gles3
+        Pretend the GPU has no OpenGL ES 3.0 support, so apps that
+        feature-test for it fall back to their older GLES renderer. ON means
+        "no ES 3.0"; --gles3 restores the default (real driver support).
+        Also available as the "No GLES 3" switch in Settings > Graphics.
+
+        Apple only exposes ES 3.0 on A7-class GPUs and later (iPhone 5s,
+        iPad Air), so on every earlier device the call
+        [EAGLContext initWithAPI:kEAGLRenderingAPIOpenGLES3] returns nil and
+        glGetString(GL_VERSION) reports "OpenGL ES 2.0 …". With this option
+        HyperHLE answers the same way: an ES 3.0 context request fails, and
+        an ES 2.0 context keeps reporting a 2.0 version string. Engines that
+        ship both a 3.0 and an older renderer (Unity 4.x, many cocos2d-x and
+        Gameloft titles) then take the older path instead of the 3.0 one,
+        which is often what fixes black, garbled or missing frames.
+
+        Apps that are ES 3.0-only keep failing to create a context, exactly
+        as they would on the real hardware this option emulates.
+
     --allow-network-access
     --no-network-access
         Allow apps running in HyperHLE to access the Internet and the local network,
