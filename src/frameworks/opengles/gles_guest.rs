@@ -6,6 +6,7 @@
 
 //! Wrapper functions exposing OpenGL ES to the guest.
 
+use super::buffer_mapping::{self, BufferObjects};
 use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
 use crate::frameworks::opengles::eagl::{EAGLContextHostObject, GLShadowState};
 use crate::frameworks::opengles::software_vao::{self, ArrayPointer, FixedArray};
@@ -14,7 +15,6 @@ use crate::mem::{ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, Mem, MutPtr, Mu
 use crate::objc::nil;
 use crate::window::DeviceFamily;
 use crate::Environment;
-use super::buffer_mapping::{self, BufferObjects};
 use std::collections::HashMap;
 use std::slice::from_raw_parts;
 use touchHLE_gl_bindings::gles11::{
@@ -519,6 +519,27 @@ fn glGetIntegerv(env: &mut Environment, pname: GLenum, params: MutPtr<GLint>) {
     if params.is_null() {
         return;
     }
+    if pname == 0x821D {
+        // GL_NUM_EXTENSIONS
+        let Some(context) = *env
+            .framework_state
+            .opengles
+            .current_ctx_for_thread(env.current_thread)
+        else {
+            return;
+        };
+        if env.objc.borrow::<EAGLContextHostObject>(context).api >= 3 {
+            let extensions = glGetString(env, gles11::EXTENSIONS);
+            let count = env
+                .mem
+                .cstr_at_utf8(extensions)
+                .unwrap()
+                .split_whitespace()
+                .count() as GLint;
+            env.mem.write(params, count);
+            return;
+        }
+    }
     match pname {
         gles11::NUM_COMPRESSED_TEXTURE_FORMATS => {
             env.mem
@@ -640,14 +661,17 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
     // We therefore branch on the *currently-bound context's* API instead of
     // hard-coding the ES 1.1 strings. The cache is keyed by `(is_es2, name)`
     // because the two profiles share the same `name` enum values.
-    let is_es2 = with_ctx_and_mem(env, |gles, _mem| gles.is_es2());
-
-    if let Some(&str) = env
+    let Some(context) = *env
         .framework_state
         .opengles
-        .strings_cache
-        .get(&(is_es2, name))
-    {
+        .current_ctx_for_thread(env.current_thread)
+    else {
+        return Ptr::null();
+    };
+    let api = env.objc.borrow::<EAGLContextHostObject>(context).api;
+    let is_es2 = api >= 2;
+
+    if let Some(&str) = env.framework_state.opengles.strings_cache.get(&(api, name)) {
         return str;
     }
 
@@ -687,10 +711,12 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
         match name {
             gles11::VENDOR => b"Imagination Technologies",
             gles11::RENDERER => b"PowerVR SGX 535",
+            gles11::VERSION if api >= 3 => b"OpenGL ES 3.0 HyperHLE",
             gles11::VERSION => b"OpenGL ES 2.0 IMGSGX535-63.27",
             // `GL_SHADING_LANGUAGE_VERSION` is 0x8B8C in both ES 2.0 and
             // desktop GL; reference it by numeric literal so we don't have
             // to pull in the ES 2.0 enum table here.
+            0x8B8C if api >= 3 => b"OpenGL ES GLSL ES 3.00",
             0x8B8C => b"OpenGL ES GLSL ES 1.00",
             // GAMELOFT BYPASS: the Asphalt 8 engine feature-tests
             // GL_OES_element_index_uint before selecting its renderer; without
@@ -710,6 +736,12 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
     } else {
         b""
     };
+    if s == b"Unknown" {
+        with_ctx_mem_and_shadow(env, |_gles, _mem, shadow| {
+            shadow.record_error(gles11::INVALID_ENUM)
+        });
+        return Ptr::null();
+    }
     let new_str = env
         .mem
         .alloc_and_write_cstr(&[npot_prefix, s].concat())
@@ -717,7 +749,7 @@ fn glGetString(env: &mut Environment, name: GLenum) -> ConstPtr<GLubyte> {
     env.framework_state
         .opengles
         .strings_cache
-        .insert((is_es2, name), new_str);
+        .insert((api, name), new_str);
     new_str
 }
 
@@ -821,7 +853,13 @@ fn glScissor(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height: 
         gles.Scissor(x, y, width, height)
     })
 }
-pub(crate) fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height: GLsizei) {
+pub(crate) fn glViewport(
+    env: &mut Environment,
+    x: GLint,
+    y: GLint,
+    width: GLsizei,
+    height: GLsizei,
+) {
     // ULTRAHLE_MINIONJUMP_VIEWPORT_BEGIN
     let (x, y, width, height) = if matches!(
         env.bundle.bundle_identifier(),
@@ -1176,7 +1214,11 @@ unsafe fn debug_log_buffer_upload(
             mem.ptr_at(data.cast::<u8>(), sample_len),
             sample_len as usize,
         );
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ")
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     };
     log!(
         "[GLES BUFFER TRACE] {} target={:#x} binding={} offset={} size={} data={:#x} first_bytes={}",
@@ -1204,13 +1246,18 @@ fn glBufferData(
         }
         let guest_data = data;
         debug_log_buffer_upload(gles, mem, "BufferData", target, 0, size, data);
-        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && target == ARRAY_BUFFER && !data.is_null()
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW")
+            && target == ARRAY_BUFFER
+            && !data.is_null()
         {
             let mut bound: GLint = 0;
             gles.GetIntegerv(0x8894 /*ARRAY_BUFFER_BINDING*/, &mut bound);
             if bound > 0 && (1..=1_048_576).contains(&size) {
                 let bytes = mem.bytes_at(data.cast::<u8>(), size as GuestUSize).to_vec();
-                diag_buffer_cache().lock().unwrap().insert(bound as GLuint, bytes);
+                diag_buffer_cache()
+                    .lock()
+                    .unwrap()
+                    .insert(bound as GLuint, bytes);
             }
         }
         if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW")
@@ -1227,7 +1274,12 @@ fn glBufferData(
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
-                log!("BUFDATA-DIAG #{} ARRAY_BUFFER size={} floats={:?}", bn, size, floats);
+                log!(
+                    "BUFDATA-DIAG #{} ARRAY_BUFFER size={} floats={:?}",
+                    bn,
+                    size,
+                    floats
+                );
             }
         }
         let binding = match target {
@@ -1634,16 +1686,10 @@ fn glCompressedTexSubImage2D(
             }
         };
         let bound_texture = current_bound_texture(gles, target);
-        let texture_level = bound_texture
-            .and_then(|texture| shadow.pvrtc_texture_level(target, texture, level));
-        if pvrtc_subimage_matches_level(
-            texture_level,
-            xoffset,
-            yoffset,
-            width,
-            height,
-            format,
-        ) && !data.is_null()
+        let texture_level =
+            bound_texture.and_then(|texture| shadow.pvrtc_texture_level(target, texture, level));
+        if pvrtc_subimage_matches_level(texture_level, xoffset, yoffset, width, height, format)
+            && !data.is_null()
             && crate::gles::util::pvrtc_payload_size(format, width, height)
                 == Some(image_size_usize)
         {
@@ -1672,7 +1718,10 @@ fn glCompressedTexSubImage2D(
                             let b = (px as u32).to_le_bytes();
                             ppm.extend_from_slice(&[b[0], b[1], b[2]]);
                         }
-                        let _ = std::fs::write(format!("tex_{}_{}x{}_fmt{:#x}.ppm", k, w, h, format), &ppm);
+                        let _ = std::fs::write(
+                            format!("tex_{}_{}x{}_fmt{:#x}.ppm", k, w, h, format),
+                            &ppm,
+                        );
                         log!("DUMP-TEX wrote tex_{}_{}x{}_fmt{:#x}.ppm", k, w, h, format);
                     }
                 }
@@ -1961,7 +2010,10 @@ fn glDeleteVertexArraysOES(env: &mut Environment, n: GLsizei, arrays: ConstPtr<G
         let count = n as GuestUSize;
         if gles.supports_vao_oes() {
             let slice = mem.bytes_at(arrays.cast(), count * 4);
-            for array in slice.chunks_exact(4).map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap())) {
+            for array in slice
+                .chunks_exact(4)
+                .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()))
+            {
                 if array == shadow.current_vertex_array {
                     shadow.current_vertex_array = 0;
                     shadow.invalidate_vao_state();
@@ -2282,9 +2334,8 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
             static COUNT: AtomicU32 = AtomicU32::new(0);
             static LARGE_COUNT: AtomicU32 = AtomicU32::new(0);
             let n = COUNT.fetch_add(1, Ordering::Relaxed);
-            let log_large = n >= 120
-                && count > 12
-                && LARGE_COUNT.fetch_add(1, Ordering::Relaxed) < 256;
+            let log_large =
+                n >= 120 && count > 12 && LARGE_COUNT.fetch_add(1, Ordering::Relaxed) < 256;
             if n < 120 || log_large {
                 log!(
                     "[POTATO RENDER TRACE] glDrawArrays #{} mode=0x{:x} first={} count={}",
@@ -2384,7 +2435,10 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
                                 if base + 8 <= bytes.len() {
                                     let rd = |o: usize| {
                                         f32::from_le_bytes([
-                                            bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3],
+                                            bytes[o],
+                                            bytes[o + 1],
+                                            bytes[o + 2],
+                                            bytes[o + 3],
                                         ])
                                     };
                                     tc.push_str(&format!(" ({:.4},{:.4})", rd(base), rd(base + 4)));
@@ -2392,7 +2446,13 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
                                     tc.push_str(" (oob)");
                                 }
                             }
-                            log!("  DRAW-TC vbo={} off={} stride={} tc:{}", vbo, off, stride, tc);
+                            log!(
+                                "  DRAW-TC vbo={} off={} stride={} tc:{}",
+                                vbo,
+                                off,
+                                stride,
+                                tc
+                            );
                         } else {
                             log!("  DRAW-TC vbo={} not in cache", vbo);
                         }
@@ -2450,7 +2510,10 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
     let mut arr_buf: GLint = 0;
     gles.GetIntegerv(0x8894 /* GL_ARRAY_BUFFER_BINDING */, &mut arr_buf);
     let mut elem_buf: GLint = 0;
-    gles.GetIntegerv(0x8895 /* GL_ELEMENT_ARRAY_BUFFER_BINDING */, &mut elem_buf);
+    gles.GetIntegerv(
+        0x8895, /* GL_ELEMENT_ARRAY_BUFFER_BINDING */
+        &mut elem_buf,
+    );
     let mut viewport = [0 as GLint; 4];
     gles.GetIntegerv(0x0BA2 /* GL_VIEWPORT */, viewport.as_mut_ptr());
     let mut rb: GLint = 0;
@@ -2464,14 +2527,18 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
         err = gles.GetError();
     }
     let mut color_mask = [0u8; 4];
-    gles.GetBooleanv(0x0C23 /* GL_COLOR_WRITEMASK */, color_mask.as_mut_ptr());
-    let states = [0x0BE2, 0x0B71, 0x0B44, 0x0C11, 0x0B90]
-        .map(|cap| gles.IsEnabled(cap) != 0);
+    gles.GetBooleanv(
+        0x0C23, /* GL_COLOR_WRITEMASK */
+        color_mask.as_mut_ptr(),
+    );
+    let states = [0x0BE2, 0x0B71, 0x0B44, 0x0C11, 0x0B90].map(|cap| gles.IsEnabled(cap) != 0);
     let mut attribs = Vec::new();
     for name in ["a_position", "a_texCoord", "a_color"] {
         let name_c = std::ffi::CString::new(name).unwrap();
         let loc = gles.GetAttribLocation(program as GLuint, name_c.as_ptr());
-        if loc < 0 { continue; }
+        if loc < 0 {
+            continue;
+        }
         let i = loc as GLuint;
         let mut enabled = 0;
         let mut size = 0;
@@ -2485,13 +2552,33 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
         gles.GetVertexAttribiv(i, 0x8624, &mut stride);
         gles.GetVertexAttribiv(i, 0x889F, &mut buffer);
         gles.GetVertexAttribPointerv(i, 0x8645, &mut ptr);
-        let first = if buffer == 0 && type_ as u32 == 0x1406 && !ptr.is_null() && mem.is_host_ptr_in_guest_mem(ptr) {
+        let first = if buffer == 0
+            && type_ as u32 == 0x1406
+            && !ptr.is_null()
+            && mem.is_host_ptr_in_guest_mem(ptr)
+        {
             Some(std::slice::from_raw_parts(ptr.cast::<f32>(), (size as usize).min(4)).to_vec())
-        } else { None };
-        attribs.push((name, loc, enabled, size, type_, stride, buffer, ptr as usize, first));
+        } else {
+            None
+        };
+        attribs.push((
+            name,
+            loc,
+            enabled,
+            size,
+            type_,
+            stride,
+            buffer,
+            ptr as usize,
+            first,
+        ));
     }
     let mut active_count = 0;
-    gles.GetProgramiv(program as GLuint, 0x8B89 /* GL_ACTIVE_ATTRIBUTES */, &mut active_count);
+    gles.GetProgramiv(
+        program as GLuint,
+        0x8B89, /* GL_ACTIVE_ATTRIBUTES */
+        &mut active_count,
+    );
     let mut active_attribs = Vec::new();
     for index in 0..active_count.clamp(0, 32) as GLuint {
         let mut name = [0_u8; 128];
@@ -2508,32 +2595,69 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
             name.as_mut_ptr().cast(),
         );
         let used = length.clamp(0, name.len() as GLsizei) as usize;
-        active_attribs.push((String::from_utf8_lossy(&name[..used]).into_owned(), size, type_));
+        active_attribs.push((
+            String::from_utf8_lossy(&name[..used]).into_owned(),
+            size,
+            type_,
+        ));
     }
     let mut enabled_attribs = Vec::new();
     let mut max_attribs: GLint = 0;
     gles.GetIntegerv(0x8869 /* GL_MAX_VERTEX_ATTRIBS */, &mut max_attribs);
     for index in 0..max_attribs.clamp(0, 32) as GLuint {
         let mut enabled = 0;
-        gles.GetVertexAttribiv(index, 0x8622 /* GL_VERTEX_ATTRIB_ARRAY_ENABLED */, &mut enabled);
-        if enabled == 0 { continue; }
+        gles.GetVertexAttribiv(
+            index,
+            0x8622, /* GL_VERTEX_ATTRIB_ARRAY_ENABLED */
+            &mut enabled,
+        );
+        if enabled == 0 {
+            continue;
+        }
         let mut size = 0;
         let mut type_ = 0;
         let mut stride = 0;
         let mut buffer = 0;
         let mut ptr: *mut GLvoid = std::ptr::null_mut();
-        gles.GetVertexAttribiv(index, 0x8623 /* GL_VERTEX_ATTRIB_ARRAY_SIZE */, &mut size);
-        gles.GetVertexAttribiv(index, 0x8625 /* GL_VERTEX_ATTRIB_ARRAY_TYPE */, &mut type_);
-        gles.GetVertexAttribiv(index, 0x8624 /* GL_VERTEX_ATTRIB_ARRAY_STRIDE */, &mut stride);
-        gles.GetVertexAttribiv(index, 0x889F /* GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING */, &mut buffer);
-        gles.GetVertexAttribPointerv(index, 0x8645 /* GL_VERTEX_ATTRIB_ARRAY_POINTER */, &mut ptr);
-        let first = if buffer == 0 && type_ as u32 == 0x1406 && !ptr.is_null() && mem.is_host_ptr_in_guest_mem(ptr) {
+        gles.GetVertexAttribiv(
+            index, 0x8623, /* GL_VERTEX_ATTRIB_ARRAY_SIZE */
+            &mut size,
+        );
+        gles.GetVertexAttribiv(
+            index, 0x8625, /* GL_VERTEX_ATTRIB_ARRAY_TYPE */
+            &mut type_,
+        );
+        gles.GetVertexAttribiv(
+            index,
+            0x8624, /* GL_VERTEX_ATTRIB_ARRAY_STRIDE */
+            &mut stride,
+        );
+        gles.GetVertexAttribiv(
+            index,
+            0x889F, /* GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING */
+            &mut buffer,
+        );
+        gles.GetVertexAttribPointerv(
+            index, 0x8645, /* GL_VERTEX_ATTRIB_ARRAY_POINTER */
+            &mut ptr,
+        );
+        let first = if buffer == 0
+            && type_ as u32 == 0x1406
+            && !ptr.is_null()
+            && mem.is_host_ptr_in_guest_mem(ptr)
+        {
             Some(std::slice::from_raw_parts(ptr.cast::<f32>(), (size as usize).min(4)).to_vec())
-        } else { None };
+        } else {
+            None
+        };
         enabled_attribs.push((index, size, type_, stride, buffer, ptr as usize, first));
     }
     let mut active_uniform_count: GLint = 0;
-    gles.GetProgramiv(program as GLuint, 0x8B86 /* GL_ACTIVE_UNIFORMS */, &mut active_uniform_count);
+    gles.GetProgramiv(
+        program as GLuint,
+        0x8B86, /* GL_ACTIVE_UNIFORMS */
+        &mut active_uniform_count,
+    );
     let mut active_uniforms = Vec::new();
     for index in 0..active_uniform_count.clamp(0, 32) as GLuint {
         let mut name = [0_u8; 128];
@@ -2624,10 +2748,19 @@ unsafe fn trace_native_draw_state(gles: &mut dyn GLES, shadow: &GLShadowState) {
     gles.GetFloatv(gles11::CURRENT_COLOR, colour.as_mut_ptr());
     gles.GetIntegerv(gles11::VIEWPORT, viewport.as_mut_ptr());
     gles.GetBooleanv(gles11::COLOR_WRITEMASK, colour_mask.as_mut_ptr());
-    let states = [gles11::VERTEX_ARRAY, gles11::COLOR_ARRAY, gles11::TEXTURE_COORD_ARRAY,
-        gles11::TEXTURE_2D, gles11::LIGHTING, gles11::ALPHA_TEST, gles11::DEPTH_TEST,
-        gles11::CULL_FACE, gles11::SCISSOR_TEST, gles11::BLEND]
-        .map(|cap| (cap, gles.IsEnabled(cap)));
+    let states = [
+        gles11::VERTEX_ARRAY,
+        gles11::COLOR_ARRAY,
+        gles11::TEXTURE_COORD_ARRAY,
+        gles11::TEXTURE_2D,
+        gles11::LIGHTING,
+        gles11::ALPHA_TEST,
+        gles11::DEPTH_TEST,
+        gles11::CULL_FACE,
+        gles11::SCISSOR_TEST,
+        gles11::BLEND,
+    ]
+    .map(|cap| (cap, gles.IsEnabled(cap)));
     log!("Native draw #{}: viewport={:?} colour={:?} mask={:?} states={:?} arrays={:?} modelview={:?} projection={:?}",
         draw, viewport, colour, colour_mask, states, shadow.vertex_array_state, modelview, projection);
 }
@@ -2653,9 +2786,8 @@ fn glDrawElements(
             static COUNT: AtomicU32 = AtomicU32::new(0);
             static LARGE_COUNT: AtomicU32 = AtomicU32::new(0);
             let n = COUNT.fetch_add(1, Ordering::Relaxed);
-            let log_large = n >= 160
-                && count > 3
-                && LARGE_COUNT.fetch_add(1, Ordering::Relaxed) < 256;
+            let log_large =
+                n >= 160 && count > 3 && LARGE_COUNT.fetch_add(1, Ordering::Relaxed) < 256;
             if n < 160 || log_large {
                 log!(
                     "[POTATO RENDER TRACE] glDrawElements #{} mode=0x{:x} count={} type=0x{:x} indices=0x{:x}",
@@ -2715,7 +2847,8 @@ fn glDrawElements(
         crate::gles::perf_overlay::record_draw();
         gles.DrawElements(mode, count, type_, indices);
         if count > 3 && crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
-            static FB_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            static FB_DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
             if !FB_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 let mut vp = [0 as GLint; 4];
                 gles.GetIntegerv(0x0BA2 /* GL_VIEWPORT */, vp.as_mut_ptr());
@@ -2732,7 +2865,14 @@ fn glDrawElements(
                         0x1401, /* GL_UNSIGNED_BYTE */
                         pix.as_mut_ptr() as *mut _,
                     );
-                    dump_rgb_ppm(&pix, w as u32, h as u32, 0x1908, 0x1401, "/tmp/a8run/fb_after_larger_draw.ppm");
+                    dump_rgb_ppm(
+                        &pix,
+                        w as u32,
+                        h as u32,
+                        0x1908,
+                        0x1401,
+                        "/tmp/a8run/fb_after_larger_draw.ppm",
+                    );
                 }
                 let mut err = gles.GetError();
                 let mut errs = Vec::new();
@@ -3024,10 +3164,7 @@ fn glDeleteTextures(env: &mut Environment, n: GLsizei, textures: ConstPtr<GLuint
         unsafe { gles.DeleteTextures(n, deleted.as_ptr()) };
         for texture in &deleted {
             shadow.forget_pvrtc_texture(*texture);
-            crate::gles::perf_overlay::delete_gl_texture(
-                shadow.resource_group_token,
-                *texture,
-            );
+            crate::gles::perf_overlay::delete_gl_texture(shadow.resource_group_token, *texture);
         }
     })
 }
@@ -3491,7 +3628,8 @@ fn glTexImage2D(
             );
         }
         if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
-            static TEX_DUMP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            static TEX_DUMP_COUNT: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
             let n = TEX_DUMP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 8 && !pixels.is_null() && level == 0 {
                 let tex_id = {
@@ -3511,9 +3649,7 @@ fn glTexImage2D(
                     let buf: Vec<u8> = mem
                         .bytes_at(guest_pixels.cast::<u8>(), byte_size as u32)
                         .to_vec();
-                    let path = format!(
-                        "/tmp/a8run/tex{}_id{}_{}x{}.ppm", n, tex_id, width, height
-                    );
+                    let path = format!("/tmp/a8run/tex{}_id{}_{}x{}.ppm", n, tex_id, width, height);
                     dump_rgb_ppm(&buf, width as u32, height as u32, format, type_, &path);
                 }
             }
@@ -3767,12 +3903,7 @@ fn glCompressedTexImage2D(
                     target,
                     texture,
                     level,
-                    compressed_texture_level_bytes(
-                        internalformat,
-                        width,
-                        height,
-                        image_size_usize,
-                    ),
+                    compressed_texture_level_bytes(internalformat, width, height, image_size_usize),
                 );
             }
         }
@@ -4047,7 +4178,11 @@ fn glBindRenderbufferOES(env: &mut Environment, target: GLenum, renderbuffer: GL
         use std::sync::atomic::{AtomicU32, Ordering};
         static BINDS: AtomicU32 = AtomicU32::new(0);
         if BINDS.fetch_add(1, Ordering::Relaxed) < 16 {
-            log!("Guest glBindRenderbufferOES(target={:#x}, rb={:#x})", target, renderbuffer);
+            log!(
+                "Guest glBindRenderbufferOES(target={:#x}, rb={:#x})",
+                target,
+                renderbuffer
+            );
         }
     }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
@@ -4213,10 +4348,14 @@ fn glDeleteFramebuffersOES(env: &mut Environment, n: GLsizei, framebuffers: Cons
 }
 fn glDeleteRenderbuffersOES(env: &mut Environment, n: GLsizei, renderbuffers: ConstPtr<GLuint>) {
     if n < 0 {
-        with_ctx_and_mem(env, |gles, _| unsafe { gles.DeleteRenderbuffersOES(n, std::ptr::null()) });
+        with_ctx_and_mem(env, |gles, _| unsafe {
+            gles.DeleteRenderbuffersOES(n, std::ptr::null())
+        });
         return;
     }
-    let deleted = (0..n as GuestUSize).map(|i| env.mem.read(renderbuffers + i)).collect::<Vec<_>>();
+    let deleted = (0..n as GuestUSize)
+        .map(|i| env.mem.read(renderbuffers + i))
+        .collect::<Vec<_>>();
     with_ctx_and_mem(env, |gles, mem| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let renderbuffers = mem.ptr_at(renderbuffers, n_usize);
@@ -4269,7 +4408,11 @@ pub fn dump_rgb_ppm(pix: &[u8], width: u32, height: u32, format: u32, type_: u32
             }
         }
         _ => {
-            log!("dump_rgb_ppm: unsupported format=0x{:x} type=0x{:x}", format, type_);
+            log!(
+                "dump_rgb_ppm: unsupported format=0x{:x} type=0x{:x}",
+                format,
+                type_
+            );
             return;
         }
     }
@@ -4458,7 +4601,9 @@ fn glGetUniformLocation(env: &mut Environment, program: GLuint, name: ConstPtr<G
             if n < 64 {
                 log!(
                     "[ES2DIAG] glGetUniformLocation(program={}, \"{}\") = {}",
-                    program,  String::from_utf8_lossy(cstr.as_bytes()).to_string(), loc
+                    program,
+                    String::from_utf8_lossy(cstr.as_bytes()).to_string(),
+                    loc
                 );
             }
         }
@@ -4509,7 +4654,10 @@ fn glUniformMatrix4fv(
                 std::ptr::copy_nonoverlapping(ptr, m.as_mut_ptr(), 16);
                 log!(
                     "[ES2DIAG] glUniformMatrix4fv(loc={}, count={}, transpose={}, m0={:?})",
-                    location, count, transpose, m
+                    location,
+                    count,
+                    transpose,
+                    m
                 );
             }
         }
@@ -4696,13 +4844,17 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
                     1,
                     &["normal", "a_normal", "aNormal", "inNormal", "rm_Normal"][..],
                 ),
-                (
-                    1,
-                    &["a_color"][..],
-                ),
+                (1, &["a_color"][..]),
                 (
                     2,
-                    &["color", "aColor", "inColor", "inVtxColor", "rm_Color", "a_texCoord"][..],
+                    &[
+                        "color",
+                        "aColor",
+                        "inColor",
+                        "inVtxColor",
+                        "rm_Color",
+                        "a_texCoord",
+                    ][..],
                 ),
                 (
                     3,
@@ -5305,9 +5457,9 @@ fn split_top_level<'a>(text: &'a str, sep: char) -> Vec<&'a str> {
 
 /// GLSL ES type names that can act as constant-expression constructors.
 const GLSL_TYPE_CONSTRUCTORS: &[&str] = &[
-    "float", "int", "bool", "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4", "bvec2",
-    "bvec3", "bvec4", "mat2", "mat3", "mat4", "mat2x2", "mat2x3", "mat2x4", "mat3x2",
-    "mat3x3", "mat3x4", "mat4x2", "mat4x3", "mat4x4",
+    "float", "int", "bool", "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4", "bvec2", "bvec3",
+    "bvec4", "mat2", "mat3", "mat4", "mat2x2", "mat2x3", "mat2x4", "mat3x2", "mat3x3", "mat3x4",
+    "mat4x2", "mat4x3", "mat4x4",
 ];
 
 /// Conservative constant-expression check for a GLSL initializer: an
@@ -5454,8 +5606,19 @@ fn rewrite_global_declaration(
     end: usize,
 ) -> Option<(String, Vec<String>)> {
     const SKIP_QUALIFIERS: &[&str] = &[
-        "uniform", "attribute", "varying", "const", "in", "out", "centroid", "flat",
-        "invariant", "layout", "struct", "void", "precision",
+        "uniform",
+        "attribute",
+        "varying",
+        "const",
+        "in",
+        "out",
+        "centroid",
+        "flat",
+        "invariant",
+        "layout",
+        "struct",
+        "void",
+        "precision",
     ];
     const PRECISION_QUALIFIERS: &[&str] = &["lowp", "mediump", "highp"];
 
@@ -6000,10 +6163,7 @@ fn collect_int_defines(source: &str) -> std::collections::HashMap<String, u32> {
             continue;
         }
         let Some(name) = tokens.next() else { continue };
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             continue;
         }
         let Some(value) = tokens.next() else { continue };
@@ -6061,7 +6221,10 @@ fn parse_uniform_array_declarations(
             None
         } else if let Ok(n) = trimmed.parse::<u32>() {
             Some(n)
-        } else if trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        } else if trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
             defines.get(trimmed).copied()
         } else {
             None
@@ -6118,7 +6281,7 @@ fn rewrite_uniform_array_sizes(
                 .map(|(_, size)| (d.digits_span, *size))
         })
         .collect();
-    spans.sort_by(|a, b| b.0.0.cmp(&a.0.0));
+    spans.sort_by(|a, b| b.0 .0.cmp(&a.0 .0));
     let mut out = source.to_string();
     for ((s, e), size) in spans {
         out.replace_range(s..e, &size.to_string());
@@ -6193,8 +6356,7 @@ unsafe fn reconcile_uniform_array_sizes(gles: &mut dyn GLES, program: GLuint) {
     let vertex_defines = collect_int_defines(&vertex_stripped);
     let fragment_defines = collect_int_defines(&fragment_stripped);
     let vertex_uniforms = parse_uniform_array_declarations(&vertex_stripped, &vertex_defines);
-    let fragment_uniforms =
-        parse_uniform_array_declarations(&fragment_stripped, &fragment_defines);
+    let fragment_uniforms = parse_uniform_array_declarations(&fragment_stripped, &fragment_defines);
     if vertex_uniforms.is_empty() || fragment_uniforms.is_empty() {
         return;
     }
@@ -6333,8 +6495,8 @@ fn parse_struct_definitions(source: &str) -> Vec<StructDefinition> {
         let prev_ok =
             idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
         let next = idx + "struct".len();
-        let next_ok = next >= bytes.len()
-            || !(bytes[next].is_ascii_alphanumeric() || bytes[next] == b'_');
+        let next_ok =
+            next >= bytes.len() || !(bytes[next].is_ascii_alphanumeric() || bytes[next] == b'_');
         if !prev_ok || !next_ok {
             continue;
         }
@@ -6726,11 +6888,11 @@ fn glShaderSource(
     // 3. Hoist `#extension` directives to the top — strict compilers (ANGLE
     //    etc.) reject them after non-preprocessor tokens; see
     //    `hoist_shader_extension_directives`.
-    let src = hoist_shader_extension_directives(&src);    // 4. Move non-constant global variable initializers into `main()` —
-    //    strict GLES compilers (ANGLE) reject them with "global variable
-    //    initializers must be constant expressions" (e.g. Modern Combat 4's
-    //    shaders), which the lenient PowerVR drivers on real iPhone-era
-    //    hardware accepted; see `rewrite_nonconstant_global_initializers`.
+    let src = hoist_shader_extension_directives(&src); // 4. Move non-constant global variable initializers into `main()` —
+                                                       //    strict GLES compilers (ANGLE) reject them with "global variable
+                                                       //    initializers must be constant expressions" (e.g. Modern Combat 4's
+                                                       //    shaders), which the lenient PowerVR drivers on real iPhone-era
+                                                       //    hardware accepted; see `rewrite_nonconstant_global_initializers`.
     let src = rewrite_nonconstant_global_initializers(&src);
     let bytes_vec = strip_captain_tomato_shader_precision(&src).into_bytes();
 
@@ -6740,10 +6902,7 @@ fn glShaderSource(
     // the vertex shader at link time without depending on optional backend
     // entry points (GetShaderSource / GetAttachedShaders are unimplemented
     // on some backends, e.g. GLES2Native's GetAttachedShaders panics).
-    record_shader_source(
-        shader,
-        String::from_utf8_lossy(cs.as_bytes()).into_owned(),
-    );
+    record_shader_source(shader, String::from_utf8_lossy(cs.as_bytes()).into_owned());
     if crate::env_flag_cached!("TOUCHHLE_DUMP_SHADER_SOURCE") {
         let _ = std::fs::write(format!("shader_dump_{}.glsl", shader), cs.as_bytes());
     }
@@ -6892,7 +7051,14 @@ fn glUniform4f(
             static UN: AtomicU32 = AtomicU32::new(0);
             let un = UN.fetch_add(1, Ordering::Relaxed);
             if un < 40 {
-                log!("UNIFORM4F loc={} vals=[{},{},{},{}]", location, v0, v1, v2, v3);
+                log!(
+                    "UNIFORM4F loc={} vals=[{},{},{},{}]",
+                    location,
+                    v0,
+                    v1,
+                    v2,
+                    v3
+                );
             }
         }
         gles.Uniform4f(location, v0, v1, v2, v3)
@@ -8661,7 +8827,11 @@ fn has_current_ctx(env: &mut Environment) -> bool {
 }
 
 fn lookup_sync(env: &Environment, sync: GuestGLsync) -> Option<GuestSyncObject> {
-    env.framework_state.opengles.sync_objects.get(&sync).copied()
+    env.framework_state
+        .opengles
+        .sync_objects
+        .get(&sync)
+        .copied()
 }
 
 /// Observe an emulated (`host == None`) fence, returning whether it is now
@@ -8957,10 +9127,7 @@ fn glGetInteger64vAPPLE(env: &mut Environment, pname: GLenum, params: MutPtr<i64
         return;
     }
     let count = get_integer_value_count(pname);
-    let tmp: MutPtr<GLint> = env
-        .mem
-        .alloc((count.max(16) * 4) as GuestUSize)
-        .cast();
+    let tmp: MutPtr<GLint> = env.mem.alloc((count.max(16) * 4) as GuestUSize).cast();
     glGetIntegerv(env, pname, tmp);
     for i in 0..count {
         let value: GLint = env.mem.read(tmp + i as GuestUSize);
@@ -8993,20 +9160,55 @@ fn get_integer_value_count(pname: GLenum) -> u32 {
 }
 
 // -- Misc --
+// ES3 extension enumeration must describe the same HLE capabilities as
+// glGetString, rather than expose unrelated host-only extensions.
+// https://registry.khronos.org/OpenGL-Refpages/es3.0/html/glGetString.xhtml
 fn glGetStringi(env: &mut Environment, name: GLenum, index: GLuint) -> ConstPtr<u8> {
-    let host_ptr: *const GLubyte =
-        with_ctx_and_mem(env, |gles, _mem| unsafe { gles.GetStringi(name, index) });
-    if host_ptr.is_null() {
+    let Some(context) = *env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread)
+    else {
+        return Ptr::null();
+    };
+    let api = env.objc.borrow::<EAGLContextHostObject>(context).api;
+    if api < 3 || name != gles11::EXTENSIONS {
+        with_ctx_mem_and_shadow(env, |_gles, _mem, shadow| {
+            shadow.record_error(gles11::INVALID_ENUM)
+        });
         return Ptr::null();
     }
-    // Copy the C string into guest memory once and intern the pointer in
-    // EAGL's per-context string cache.
-    let bytes = unsafe { std::ffi::CStr::from_ptr(host_ptr as *const _) }.to_bytes_with_nul();
-    let guest_buf: MutPtr<u8> = env.mem.alloc(bytes.len() as GuestUSize).cast();
-    env.mem
-        .bytes_at_mut(guest_buf, bytes.len() as GuestUSize)
-        .copy_from_slice(bytes);
-    guest_buf.cast_const()
+    if let Some(&pointer) = env
+        .framework_state
+        .opengles
+        .indexed_strings_cache
+        .get(&(api, index))
+    {
+        return pointer;
+    }
+    let extensions = glGetString(env, name);
+    let extension = env
+        .mem
+        .cstr_at_utf8(extensions)
+        .unwrap()
+        .split_whitespace()
+        .nth(index as usize)
+        .map(str::to_owned);
+    let Some(extension) = extension else {
+        with_ctx_mem_and_shadow(env, |_gles, _mem, shadow| {
+            shadow.record_error(gles11::INVALID_VALUE)
+        });
+        return Ptr::null();
+    };
+    let pointer = env
+        .mem
+        .alloc_and_write_cstr(extension.as_bytes())
+        .cast_const();
+    env.framework_state
+        .opengles
+        .indexed_strings_cache
+        .insert((api, index), pointer);
+    pointer
 }
 
 fn glGetFragDataLocation(env: &mut Environment, program: GLuint, name: ConstPtr<u8>) -> GLint {
@@ -9589,7 +9791,8 @@ mod shader_preprocessor_normalization_tests {
 
     #[test]
     fn handles_multiline_constructor_initializer() {
-        let src = "uniform float u_s;\nvec4 col =\n    vec4(u_s);\nvoid main() { gl_FragColor = col; }";
+        let src =
+            "uniform float u_s;\nvec4 col =\n    vec4(u_s);\nvoid main() { gl_FragColor = col; }";
         let out = rewrite_nonconstant_global_initializers(src);
         assert!(out.contains("vec4 col;"));
         assert!(out.contains("col = vec4(u_s);"));
@@ -9735,7 +9938,8 @@ mod shader_extension_hoisting_tests {
 
     #[test]
     fn keeps_version_first_and_normalizes_whitespace() {
-        let src = "#version 100\nvoid main() {}\n#  extension GL_OES_standard_derivatives : enable\n";
+        let src =
+            "#version 100\nvoid main() {}\n#  extension GL_OES_standard_derivatives : enable\n";
         let out = hoist_shader_extension_directives(src);
         assert!(
             out.starts_with("#version 100\n#extension GL_OES_standard_derivatives : enable\n"),
@@ -9775,7 +9979,8 @@ mod varying_declaration_parsing_tests {
     fn fragment_only_varyings_detected_as_missing() {
         // The Gangstar case: fragment declares vAlpha, vertex does not.
         let vert = parse_varying_declarations("varying vec2 vUV;\nvoid main() {}\n");
-        let frag = parse_varying_declarations("varying vec4 vAlpha;\nvarying vec2 vUV;\nvoid main() {}\n");
+        let frag =
+            parse_varying_declarations("varying vec4 vAlpha;\nvarying vec2 vUV;\nvoid main() {}\n");
         let missing: Vec<_> = frag
             .into_iter()
             .filter(|(_, n)| !vert.iter().any(|(_, vn)| vn == n))
@@ -9815,8 +10020,7 @@ mod uniform_array_reconciliation_tests {
     #[test]
     fn parses_array_sizes_and_rewrites_both_stages_to_max() {
         let vertex = "uniform vec4 light[4];\nuniform float pad;\nvoid main() {}\n";
-        let fragment =
-            "precision mediump float;\nuniform highp vec4 light[2];\nvoid main() {}\n";
+        let fragment = "precision mediump float;\nuniform highp vec4 light[2];\nvoid main() {}\n";
         let defines = std::collections::HashMap::new();
         let vd = parse_uniform_array_declarations(vertex, &defines);
         let fd = parse_uniform_array_declarations(fragment, &defines);
@@ -9947,10 +10151,7 @@ mod performance_texture_size_tests {
             400
         );
         assert_eq!(texture_storage_level_bytes(16, 8, 0x8058), 512);
-        assert_eq!(
-            texture_storage_level_bytes(16, 8, gles11::RGB565_OES),
-            256
-        );
+        assert_eq!(texture_storage_level_bytes(16, 8, gles11::RGB565_OES), 256);
         assert_eq!(texture_storage_volume_bytes(8, 4, 2, 0x8058), 256);
         assert_eq!(texture_storage_level_bytes(0, 8, 0x8058), 0);
         assert_eq!(texture_storage_level_bytes(16, 8, 0x83F1), 0);

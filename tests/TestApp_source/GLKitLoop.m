@@ -9,7 +9,7 @@
 
 // The common-3.0 SDK predates GLKit. These declarations follow Apple's SDK:
 // https://github.com/xybp888/iOS-SDKs/blob/master/iPhoneOS9.3.sdk/System/Library/Frameworks/GLKit.framework/Headers/GLKViewController.h
-@interface UIView : NSObject
+@interface UIView (GLKitLoopMethods)
 - (instancetype)initWithFrame:(CGRect)frame;
 @end
 @interface GLKView : UIView
@@ -178,7 +178,7 @@ int test_GLKViewController_render_loop(void) {
 - (instancetype)initWithAPI:(NSUInteger)api;
 + (BOOL)setCurrentContext:(EAGLContext *)context;
 @end
-@interface UIImage : NSObject
+@interface UIImage (GLKitSnapshotMethods)
 @property(nonatomic, readonly) CGImageRef CGImage;
 @end
 extern void glClearColor(float, float, float, float);

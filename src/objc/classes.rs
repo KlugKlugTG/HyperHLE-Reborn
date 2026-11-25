@@ -1441,6 +1441,16 @@ pub fn object_getClassName(env: &mut crate::Environment, obj: id) -> Class {
     objc_obj.isa
 }
 
+/// https://developer.apple.com/documentation/objectivec/object_setclass(_:_:)
+pub fn object_setClass(env: &mut crate::Environment, object: id, class: Class) -> Class {
+    if object == nil {
+        return nil;
+    }
+    let previous = super::ObjC::read_isa(object, &env.mem);
+    env.mem.write(object.cast::<Class>(), class);
+    previous
+}
+
 pub fn object_getClass(env: &mut crate::Environment, obj: id) -> Class {
     if obj.is_null() {
         return nil;
@@ -2472,7 +2482,35 @@ pub fn imp_implementationWithBlock(
         env.mem.write(tramp + 2, 0xe590_f00c); // ldr pc, [r0, #12]
     }
     env.mem.write(tramp + 3, block.to_bits()); // literal: block literal
+    env.objc.block_imps.insert(tramp.to_bits(), block);
     tramp.cast().cast_const()
+}
+
+/// Return the block owned by an IMP, or nil for a non-block IMP.
+/// https://developer.apple.com/documentation/objectivec/imp_getblock(_:)
+pub fn imp_getBlock(env: &mut crate::Environment, implementation: crate::mem::ConstVoidPtr) -> id {
+    env.objc
+        .block_imps
+        .get(&implementation.to_bits())
+        .copied()
+        .unwrap_or(crate::mem::ConstVoidPtr::null())
+        .cast_mut()
+        .cast()
+}
+
+/// Removing a block IMP releases the runtime's copy and its executable thunk.
+/// https://developer.apple.com/documentation/objectivec/imp_removeblock(_:)
+pub fn imp_removeBlock(
+    env: &mut crate::Environment,
+    implementation: crate::mem::ConstVoidPtr,
+) -> bool {
+    let Some(block) = env.objc.block_imps.remove(&implementation.to_bits()) else {
+        return false;
+    };
+    crate::libc::blocks::_Block_release(env, block);
+    env.cpu.invalidate_cache_range(implementation.to_bits(), 16);
+    env.mem.free(implementation.cast_mut());
+    true
 }
 
 /// `id objc_unsafeClaimAutoreleasedReturnValue(id obj)` — ARC runtime

@@ -101,6 +101,7 @@ pub mod ns_url_response;
 pub mod ns_url_session;
 pub mod ns_uuid;
 pub mod ns_value;
+pub mod ns_value_transformer;
 pub mod ns_xml_parser;
 
 pub fn NSGetSizeAndAlignment(
@@ -475,6 +476,11 @@ fn av_capture_iso_current(env: &mut Environment) -> ConstVoidPtr {
 }
 
 pub const STUB_CONSTANTS: ConstantExports = &[
+    ("_NSNegateBooleanTransformerName", HostConstant::NSString("NSNegateBooleanTransformerName")),
+    ("_NSIsNilTransformerName", HostConstant::NSString("NSIsNilTransformerName")),
+    ("_NSIsNotNilTransformerName", HostConstant::NSString("NSIsNotNilTransformerName")),
+    ("_NSKeyedUnarchiveFromDataTransformerName", HostConstant::NSString("NSKeyedUnarchiveFromDataTransformerName")),
+
     // _NSLocalizedFailureReasonErrorKey and _NSURLErrorDomain are exported
     // from foundation::ns_error::CONSTANTS; not duplicated here.
     (
@@ -1582,6 +1588,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ns_user_defaults::CLASSES,
         ns_uuid::CLASSES,
         ns_value::CLASSES,
+        ns_value_transformer::CLASSES,
         ns_xml_parser::CLASSES,
     ],
     constant_exports: &[
@@ -1625,6 +1632,7 @@ pub struct State {
     ns_user_defaults: ns_user_defaults::State,
     ns_url_session: ns_url_session::State,
     ns_value: ns_value::State,
+    ns_value_transformer: ns_value_transformer::State,
     url_protocol: url_protocol::State,
     /// Singleton for [NSURLCache sharedURLCache].
     pub url_cache_singleton: crate::objc::id,

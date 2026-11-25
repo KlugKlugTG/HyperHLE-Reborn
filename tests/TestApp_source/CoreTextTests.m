@@ -8,6 +8,10 @@
 #include <math.h>
 #include <string.h>
 
+@interface NSNumber (CoreTextTestLiterals)
++ (NSNumber *)numberWithInt:(int)value;
+@end
+
 // The common-3.0 SDK predates Core Text. Keep Apple's actual signatures,
 // especially double widths and size_t glyph counts, to exercise the ARM ABI.
 // https://developer.apple.com/documentation/coretext/ctfontdrawglyphs(_:_:_:_:_:)

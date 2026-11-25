@@ -46,6 +46,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     path: "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
     aliases: &[],
     class_exports: &[
+        cf_binary_heap::CLASSES,
         cf_run_loop_timer::CLASSES, // Special internal classes.
         cf_file_descriptor::CLASSES,
         cf_run_loop::CLASSES,
