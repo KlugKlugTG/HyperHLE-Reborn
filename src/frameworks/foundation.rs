@@ -476,10 +476,10 @@ fn av_capture_iso_current(env: &mut Environment) -> ConstVoidPtr {
 }
 
 pub const STUB_CONSTANTS: ConstantExports = &[
-    ("_NSNegateBooleanTransformerName", HostConstant::NSString("NSNegateBooleanTransformerName")),
-    ("_NSIsNilTransformerName", HostConstant::NSString("NSIsNilTransformerName")),
-    ("_NSIsNotNilTransformerName", HostConstant::NSString("NSIsNotNilTransformerName")),
-    ("_NSKeyedUnarchiveFromDataTransformerName", HostConstant::NSString("NSKeyedUnarchiveFromDataTransformerName")),
+    ("_NSNegateBooleanTransformerName", HostConstant::NSString("NSNegateBoolean")),
+    ("_NSIsNilTransformerName", HostConstant::NSString("NSIsNil")),
+    ("_NSIsNotNilTransformerName", HostConstant::NSString("NSIsNotNil")),
+    ("_NSKeyedUnarchiveFromDataTransformerName", HostConstant::NSString("NSKeyedUnarchiveFromData")),
 
     // _NSLocalizedFailureReasonErrorKey and _NSURLErrorDomain are exported
     // from foundation::ns_error::CONSTANTS; not duplicated here.

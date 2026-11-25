@@ -84,8 +84,9 @@ fn CFBinaryHeapCreate(
     if callbacks.version != 0 || context.version != 0 {
         return Ptr::null();
     }
-    if context.retain != GuestFunction::null_ptr() {
-        context.info = context.retain.call_from_host(env, (context.info,));
+    let retain_context = context.retain;
+    if retain_context != GuestFunction::null_ptr() {
+        context.info = retain_context.call_from_host(env, (context.info,));
     }
     let class = env
         .objc
@@ -284,8 +285,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())dealloc {
     CFBinaryHeapRemoveAllValues(env, this);
     let context = env.objc.borrow::<Heap>(this).context;
-    if context.release != GuestFunction::null_ptr() {
-        let _: () = context.release.call_from_host(env, (context.info,));
+    let release_context = context.release;
+    if release_context != GuestFunction::null_ptr() {
+        let _: () = release_context.call_from_host(env, (context.info,));
     }
     env.objc.dealloc_object(this, &mut env.mem);
 }

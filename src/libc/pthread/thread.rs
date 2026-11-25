@@ -6,7 +6,7 @@
 //! Threads.
 
 use crate::abi::GuestFunction;
-use crate::dyld::{export_c_func, FunctionExports};
+use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
 use crate::libc::errno::{set_errno, EDEADLK, EINVAL, ESRCH};
 use crate::mem::{
     self, ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr, SafeRead, PAGE_SIZE,
@@ -965,6 +965,10 @@ pub const FUNCTIONS: FunctionExports = &[
     // Darwin extensions
     export_c_func!(pthread_mach_thread_np(_)),
     export_c_func!(_pthread_from_mach_thread_np(_)),
+    export_c_func_aliased!(
+        "pthread_from_mach_thread_np",
+        _pthread_from_mach_thread_np(_)
+    ),
     export_c_func!(pthread_get_stackaddr_np(_)),
     export_c_func!(pthread_get_stacksize_np(_)),
     export_c_func!(pthread_getschedparam(_, _, _)),

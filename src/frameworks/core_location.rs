@@ -72,10 +72,11 @@ fn CLLocationCoordinate2DIsValid(
     _env: &mut crate::Environment,
     coordinate: CLLocationCoordinate2D,
 ) -> bool {
-    coordinate.latitude.is_finite()
-        && coordinate.longitude.is_finite()
-        && (-90.0..=90.0).contains(&coordinate.latitude)
-        && (-180.0..=180.0).contains(&coordinate.longitude)
+    let latitude = coordinate.latitude;
+    let longitude = coordinate.longitude;
+    latitude.is_finite() && longitude.is_finite()
+        && (-90.0..=90.0).contains(&latitude)
+        && (-180.0..=180.0).contains(&longitude)
 }
 
 fn CLLocationCoordinate2DMake(

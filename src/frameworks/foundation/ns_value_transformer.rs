@@ -12,11 +12,45 @@ use super::ns_string::{get_static_str, to_rust_string};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, Class, ClassExports,
 };
+use crate::Environment;
 use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct State {
     transformers: HashMap<String, id>,
+    initialized: bool,
+}
+
+fn ensure_builtins(env: &mut Environment) {
+    if env
+        .framework_state
+        .foundation
+        .ns_value_transformer
+        .initialized
+    {
+        return;
+    }
+    env.framework_state
+        .foundation
+        .ns_value_transformer
+        .initialized = true;
+    for (name, class_name) in [
+        ("NSNegateBoolean", "NSNegateBooleanTransformer"),
+        ("NSIsNil", "NSIsNilTransformer"),
+        ("NSIsNotNil", "NSIsNotNilTransformer"),
+        (
+            "NSKeyedUnarchiveFromData",
+            "NSKeyedUnarchiveFromDataTransformer",
+        ),
+    ] {
+        let class = env.objc.get_known_class(class_name, &mut env.mem);
+        let transformer: id = msg![env; class new];
+        env.framework_state
+            .foundation
+            .ns_value_transformer
+            .transformers
+            .insert(name.to_owned(), transformer);
+    }
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -26,6 +60,57 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (bool)allowsReverseTransformation { true }
 + (Class)transformedValueClass { msg_class![env; NSObject class] }
++ (())setValueTransformer:(id)transformer forName:(id)name {
+    ensure_builtins(env);
+    if name == nil {
+        let exception_name = get_static_str(env, "NSInvalidArgumentException");
+        let reason = get_static_str(env, "A value transformer name cannot be nil");
+        let exception: id = msg_class![env; NSException exceptionWithName:exception_name reason:reason userInfo:nil];
+        crate::objc::objc_exception_throw(env, exception);
+        return;
+    }
+    let name = to_rust_string(env, name).into_owned();
+    retain(env, transformer);
+    let registry = &mut env.framework_state.foundation.ns_value_transformer.transformers;
+    let old = if transformer == nil {
+        registry.remove(&name)
+    } else {
+        registry.insert(name, transformer)
+    };
+    if let Some(old) = old { release(env, old); }
+}
+
++ (id)valueTransformerForName:(id)name {
+    ensure_builtins(env);
+    if name == nil { return nil; }
+    let key = to_rust_string(env, name).into_owned();
+    if let Some(&transformer) = env.framework_state.foundation.ns_value_transformer.transformers.get(&key) {
+        retain(env, transformer);
+        return autorelease(env, transformer);
+    }
+    let Some(class) = env.objc.try_get_known_class(&key, &mut env.mem) else { return nil; };
+    let base = env.objc.get_known_class("NSValueTransformer", &mut env.mem);
+    let is_transformer: bool = msg![env; class isSubclassOfClass:base];
+    if !is_transformer { return nil; }
+    let transformer: id = msg![env; class new];
+    if transformer != nil {
+        let _: () = msg_class![env; NSValueTransformer setValueTransformer:transformer forName:name];
+    }
+    autorelease(env, transformer)
+}
+
++ (id)valueTransformerNames {
+    ensure_builtins(env);
+    let names: Vec<_> = env.framework_state.foundation.ns_value_transformer.transformers.keys().cloned().collect();
+    let array: id = msg_class![env; NSMutableArray array];
+    for name in names {
+        let name = super::ns_string::from_rust_string(env, name);
+        let _: () = msg![env; array addObject:name];
+        release(env, name);
+    }
+    let result: id = msg![env; array copy];
+    autorelease(env, result)
+}
 - (id)transformedValue:(id)value { value }
 
 - (id)reverseTransformedValue:(id)value {
@@ -41,60 +126,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this transformedValue:value]
 }
 
-+ (())setValueTransformer:(id)transformer forName:(id)name {
-    let name = to_rust_string(env, name).into_owned();
-    retain(env, transformer);
-    let registry = &mut env.framework_state.foundation.ns_value_transformer.transformers;
-    let old = if transformer == nil {
-        registry.remove(&name)
-    } else {
-        registry.insert(name, transformer)
-    };
-    if let Some(old) = old { release(env, old); }
-}
-
-+ (id)valueTransformerForName:(id)name {
-    if name == nil { return nil; }
-    let key = to_rust_string(env, name).into_owned();
-    if let Some(&transformer) = env.framework_state.foundation.ns_value_transformer.transformers.get(&key) {
-        retain(env, transformer);
-        return autorelease(env, transformer);
-    }
-    let class_name = match key.as_str() {
-        "NSNegateBooleanTransformerName" => "NSNegateBooleanTransformer",
-        "NSIsNilTransformerName" => "NSIsNilTransformer",
-        "NSIsNotNilTransformerName" => "NSIsNotNilTransformer",
-        "NSKeyedUnarchiveFromDataTransformerName" => "NSKeyedUnarchiveFromDataTransformer",
-        _ => key.as_str(),
-    };
-    let Some(class) = env.objc.try_get_known_class(class_name, &mut env.mem) else { return nil; };
-    let base = env.objc.get_known_class("NSValueTransformer", &mut env.mem);
-    let is_transformer: bool = msg![env; class isSubclassOfClass:base];
-    if !is_transformer { return nil; }
-    let transformer: id = msg![env; class new];
-    if transformer != nil {
-        let _: () = msg_class![env; NSValueTransformer setValueTransformer:transformer forName:name];
-    }
-    autorelease(env, transformer)
-}
-
-+ (id)valueTransformerNames {
-    // Built-ins belong to the registry even before their first lookup.
-    for name in ["NSNegateBooleanTransformerName", "NSIsNilTransformerName",
-                 "NSIsNotNilTransformerName", "NSKeyedUnarchiveFromDataTransformerName"] {
-        let name = get_static_str(env, name);
-        let _: id = msg![env; this valueTransformerForName:name];
-    }
-    let names: Vec<_> = env.framework_state.foundation.ns_value_transformer.transformers.keys().cloned().collect();
-    let array: id = msg_class![env; NSMutableArray array];
-    for name in names {
-        let name = super::ns_string::from_rust_string(env, name);
-        let _: () = msg![env; array addObject:name];
-        release(env, name);
-    }
-    let result: id = msg![env; array copy];
-    autorelease(env, result)
-}
 @end
 
 @implementation NSNegateBooleanTransformer: NSValueTransformer
