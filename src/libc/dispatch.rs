@@ -1275,7 +1275,7 @@ pub(super) fn with_current_queue(
 /// Invoke a GCD block (`void (^)(void)`).
 /// On ARM32 the fourth word of a block is the invoke function pointer.
 /// Layout: [isa, flags, reserved, invoke, descriptor, captures...]
-pub(super) fn call_void_block(env: &mut Environment, block: dispatch_block_t) {
+pub(super) pub(crate) fn call_void_block(env: &mut Environment, block: dispatch_block_t) {
     let invoke_ptr = env.mem.read(block.cast::<u32>() + 3u32);
     if invoke_ptr == 0 {
         return;

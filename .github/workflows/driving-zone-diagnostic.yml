@@ -9,11 +9,11 @@ on:
       emulator_run_id:
         description: CI build containing the emulator artifact
         type: string
-        default: "45651929952"
+        default: ""
       tap_sequence:
         description: Screenshot and tap steps
         type: string
-        default: "1:- 30:0.5,0.2 5:0.89,0.92 5:0.89,0.92 20:-"
+        default: "1:- 15:0.5,0.2 3:0.89,0.92 3:0.89,0.92 3:0.63,0.56 25:- 10:-"
 
 permissions:
   contents: read
@@ -37,8 +37,8 @@ jobs:
       LP_NUM_THREADS: "2"
       TOUCHHLE_FRAME_TIMES: "1"
       TOUCHHLE_PROFILE_RUNTIME: "1"
-      BUILD_RUN: ${{ inputs.emulator_run_id || '45651929952' }}
-      TAPS: ${{ inputs.tap_sequence || '1:- 30:0.5,0.2 5:0.89,0.92 5:0.89,0.92 20:-' }}
+      BUILD_RUN: ${{ inputs.emulator_run_id }}
+      TAPS: ${{ inputs.tap_sequence || '1:- 15:0.5,0.2 3:0.89,0.92 3:0.89,0.92 3:0.63,0.56 25:- 10:-' }}
     steps:
       - uses: actions/checkout@v4
       - name: Install runtime and profiling tools
@@ -49,6 +49,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [ -z "$BUILD_RUN" ]; then
+            for attempt in $(seq 1 60); do
+              BUILD_RUN=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow minecraft-diagnostic.yml --commit "$GITHUB_SHA" --json databaseId --jq '.[0].databaseId // empty')
+              if [ -n "$BUILD_RUN" ]; then break; fi
+              sleep 2
+            done
+          fi
+          test -n "$BUILD_RUN"
+          echo "BUILD_RUN=$BUILD_RUN" >> "$GITHUB_ENV"
           gh run watch "$BUILD_RUN" --repo "$GITHUB_REPOSITORY" --interval 15
           test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN/jobs" --jq '.jobs[] | select(.name == "linux-arm64") | .conclusion')" = success
           # TestApp's independent result remains visible in the build workflow.

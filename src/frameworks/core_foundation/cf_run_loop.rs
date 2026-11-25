@@ -9,12 +9,12 @@
 //! but here it is the same type.
 
 use crate::abi::CallFromHost;
-use crate::frameworks::foundation::ns_run_loop;
 use crate::abi::GuestFunction;
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_foundation::cf_allocator::{kCFAllocatorDefault, CFAllocatorRef};
 use crate::frameworks::core_foundation::time::{CFAbsoluteTime, CFTimeInterval};
 use crate::frameworks::core_foundation::{CFIndex, CFRelease, CFRetain, CFTypeRef};
+use crate::frameworks::foundation::ns_run_loop;
 use crate::frameworks::foundation::ns_run_loop::run_run_loop_single_iteration;
 use crate::frameworks::foundation::ns_string;
 use crate::mem::{MutPtr, MutVoidPtr, SafeRead};
@@ -158,10 +158,13 @@ pub fn CFRunLoopGetMain(env: &mut Environment) -> CFRunLoopRef {
     msg_class![env; NSRunLoop mainRunLoop]
 }
 
-fn CFRunLoopCopyCurrentMode(env: &mut Environment, _rl: CFRunLoopRef) -> CFRunLoopMode {
-    // We only support the default mode.
-    let s = ns_string::from_rust_string(env, kCFRunLoopDefaultMode.to_string());
-    crate::objc::autorelease(env, s)
+fn CFRunLoopCopyCurrentMode(env: &mut Environment, rl: CFRunLoopRef) -> CFRunLoopMode {
+    let mode = env
+        .objc
+        .borrow::<ns_run_loop::NSRunLoopHostObject>(rl)
+        .current_mode
+        .clone();
+    mode.map_or(nil, |mode| ns_string::from_rust_string(env, mode))
 }
 
 fn CFRunLoopCopyAllModes(env: &mut Environment, _rl: CFRunLoopRef) -> CFTypeRef {
@@ -267,8 +270,57 @@ fn CFRunLoopStop(env: &mut Environment, rl: CFRunLoopRef) {
         .stopped = true;
 }
 
-fn CFRunLoopWakeUp(_env: &mut Environment, _rl: CFRunLoopRef) {
-    log_dbg!("CFRunLoopWakeUp: stubbed");
+fn CFRunLoopWakeUp(env: &mut Environment, rl: CFRunLoopRef) {
+    let thread = env
+        .objc
+        .borrow::<ns_run_loop::NSRunLoopHostObject>(rl)
+        .owner_thread;
+    if matches!(
+        env.threads[thread].blocked_by,
+        crate::environment::ThreadBlock::Sleeping(_)
+    ) {
+        env.threads[thread].blocked_by = crate::environment::ThreadBlock::NotBlocked;
+    }
+}
+
+fn CFRunLoopAddCommonMode(env: &mut Environment, rl: CFRunLoopRef, mode: CFRunLoopMode) {
+    let mode = ns_string::to_rust_string(env, mode).into_owned();
+    env.objc
+        .borrow_mut::<ns_run_loop::NSRunLoopHostObject>(rl)
+        .common_modes
+        .insert(mode);
+}
+
+// Blocks are copied at submission and run on the specified run loop in one
+// of the requested modes. Submission itself does not wake the run loop.
+// https://github.com/swiftlang/swift-corelibs-foundation/blob/main/Sources/CoreFoundation/CFRunLoop.c
+fn CFRunLoopPerformBlock(
+    env: &mut Environment,
+    rl: CFRunLoopRef,
+    modes: CFTypeRef,
+    block: MutVoidPtr,
+) {
+    if block.is_null() {
+        return;
+    }
+    let string = env.objc.get_known_class("NSString", &mut env.mem);
+    let is_string: bool = msg![env; modes isKindOfClass:string];
+    let modes = if is_string {
+        vec![ns_string::to_rust_string(env, modes).into_owned()]
+    } else {
+        let count: i32 = msg![env; modes count];
+        (0..count)
+            .map(|index| {
+                let mode: id = msg![env; modes objectAtIndex:(index as u32)];
+                ns_string::to_rust_string(env, mode).into_owned()
+            })
+            .collect()
+    };
+    let block = crate::libc::blocks::_Block_copy(env, block.cast_const()).cast_mut();
+    env.objc
+        .borrow_mut::<ns_run_loop::NSRunLoopHostObject>(rl)
+        .blocks
+        .push((modes, block));
 }
 
 // MARK: - Sources
@@ -588,9 +640,7 @@ pub(crate) fn fire_observers(env: &mut Environment, run_loop: id, activity: CFRu
     for observer in observers {
         retain(env, observer);
         let (valid, activities, repeats, callout, info) = {
-            let host = env
-                .objc
-                .borrow::<CFRunLoopObserverHostObject>(observer);
+            let host = env.objc.borrow::<CFRunLoopObserverHostObject>(observer);
             (
                 host.valid,
                 host.activities,
@@ -790,6 +840,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFRunLoopRunInMode(_, _, _)),
     export_c_func!(CFRunLoopStop(_)),
     export_c_func!(CFRunLoopWakeUp(_)),
+    export_c_func!(CFRunLoopAddCommonMode(_, _)),
+    export_c_func!(CFRunLoopPerformBlock(_, _, _)),
     // Sources
     export_c_func!(CFRunLoopAddSource(_, _, _)),
     export_c_func!(CFRunLoopRemoveSource(_, _, _)),

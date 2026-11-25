@@ -644,3 +644,20 @@ int test_dispatch_objc_ownership(void) {
   [pool drain];
   return result;
 }
+
+// CFRunLoopPerformBlock does not execute inline and respects its mode list.
+// https://developer.apple.com/documentation/corefoundation/cfrunloopperformblock(_:_:_:)
+extern void CFRunLoopPerformBlock(void *, const void *, dispatch_block_t);
+int test_run_loop_block_modes(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  id loop = [NSRunLoop mainRunLoop];
+  __block int calls = 0;
+  CFRunLoopPerformBlock(loop, @"fixture-mode", ^{ calls++; });
+  int result = calls == 0 ? 0 : -1;
+  pump_dispatch_main_loop();
+  if (calls != 0) result = -2;
+  [loop runMode:@"fixture-mode" beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.001]];
+  if (calls != 1) result = -3;
+  [pool drain];
+  return result;
+}

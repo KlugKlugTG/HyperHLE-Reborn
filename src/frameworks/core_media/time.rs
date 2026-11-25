@@ -221,7 +221,7 @@ fn CMTimeCopyDescription(env: &mut Environment, _allocator: MutVoidPtr, time: CM
     ns_string::from_rust_string(env, description)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(C, packed)]
 struct CMTimeRange {
     start: CMTime,

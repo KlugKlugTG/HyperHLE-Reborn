@@ -698,6 +698,7 @@ int test_runtime_import_helpers(void);
 int test_binary_heap_callbacks(void);
 int test_value_transformer_registry(void);
 int test_dispatch_objc_ownership(void);
+int test_run_loop_block_modes(void);
 int test_dispatch_main_queue_async(void);     // DispatchMainQueue.m
 int test_dispatch_main_queue_serial(void);    // DispatchMainQueue.m
 int test_dispatch_main_queue_sync(void);      // DispatchMainQueue.m
@@ -7564,6 +7565,7 @@ struct {
     FUNC_DEF(test_performSelectorOnMainThread_mainThreadDeferred),
     FUNC_DEF(test_dispatch_main_queue_async),
     FUNC_DEF(test_dispatch_objc_ownership),
+    FUNC_DEF(test_run_loop_block_modes),
     FUNC_DEF(test_value_transformer_registry),
     FUNC_DEF(test_runtime_import_helpers),
     FUNC_DEF(test_binary_heap_callbacks),
