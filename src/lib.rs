@@ -53,6 +53,7 @@ mod objc;
 mod options;
 mod paths;
 mod perf_hints;
+mod runtime_profile;
 mod stack;
 mod guest_clock;
 mod trainer;

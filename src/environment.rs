@@ -1849,6 +1849,7 @@ impl Environment {
     /// they return back to the main run loop ([Environment::run]) should set
     /// `tail_call`.
     pub fn sleep(&mut self, duration: Duration) {
+        let _profile = crate::runtime_profile::scope(self.current_thread, "host.sleep");
         log_dbg!(
             "Thread {} is going to sleep for {:?}.",
             self.current_thread,
@@ -2648,6 +2649,7 @@ impl Environment {
         self.threads[self.current_thread].host_context = old_context.take();
         *old_context = Some(new_host_ctx);
         self.current_thread = new_thread;
+        crate::runtime_profile::switch_thread(new_thread);
         self.set_tpidruro_for_current_thread();
     }
 
@@ -3941,7 +3943,10 @@ impl Environment {
                                 }
                             }
                             let previous_origin = self.replace_direct_guest_call(true);
-                            f.call_from_guest(self);
+                            {
+                                let _profile = crate::runtime_profile::scope(self.current_thread, self.dyld.svc_symbol(svc));
+                                f.call_from_guest(self);
+                            }
                             self.replace_direct_guest_call(previous_origin);
 
                             let guest_control_flow_redirected =
@@ -4064,9 +4069,10 @@ impl Environment {
                 .remaining_ticks
                 .is_none_or(|remaining_ticks| remaining_ticks > 0)
             {
-                let state = self
-                    .cpu
-                    .run_or_step(&mut self.mem, self.remaining_ticks.as_mut());
+                let state = {
+                    let _profile = crate::runtime_profile::scope(self.current_thread, "guest.cpu");
+                    self.cpu.run_or_step(&mut self.mem, self.remaining_ticks.as_mut())
+                };
                 let diag_pc = self.cpu.regs()[crate::cpu::Cpu::PC];
                 std::sync::atomic::AtomicU32::store(
                     &crate::environment::LAST_GUEST_PC,

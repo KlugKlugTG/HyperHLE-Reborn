@@ -54,7 +54,7 @@ pub const CORE_MEDIA: super::HostDylib = super::HostDylib {
     aliases: &[],
     class_exports: &[],
     constant_exports: &[frameworks::core_media::CONSTANTS],
-    function_exports: &[frameworks::core_media::FUNCTIONS],
+    function_exports: &[frameworks::core_media::FUNCTIONS, frameworks::core_media::TIME_FUNCTIONS],
 };
 
 // MapKit (stub — no real map rendering yet, just satisfies the dependency)

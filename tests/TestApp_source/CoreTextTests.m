@@ -7,6 +7,7 @@
 #import "system_headers.h"
 #include <math.h>
 #include <string.h>
+#include <stdio.h>
 
 @interface NSNumber (CoreTextTestLiterals)
 + (NSNumber *)numberWithInt:(int)value;
@@ -283,8 +284,10 @@ int test_CTFont_draw_glyphs_bitmap(void) {
         outside++;
     }
   }
-  if (left < 20 || right < 20 || outside)
+  if (left < 20 || right < 20 || outside) {
+    printf("CTFont glyph coverage: left=%u right=%u outside=%u\n", left, right, outside);
     result = -3;
+  }
   if (!CGAffineTransformEqualToTransform(CGContextGetTextMatrix(context),
                                          matrix))
     result = -4;

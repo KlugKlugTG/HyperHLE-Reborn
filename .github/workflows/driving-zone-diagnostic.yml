@@ -13,7 +13,7 @@ on:
       tap_sequence:
         description: Screenshot and tap steps
         type: string
-        default: "1:- 90:- 1:0.5,0.2 15:-"
+        default: "1:- 30:0.5,0.2 5:0.89,0.92 5:0.89,0.92 20:-"
 
 permissions:
   contents: read
@@ -36,8 +36,9 @@ jobs:
       LIBGL_ALWAYS_SOFTWARE: "1"
       LP_NUM_THREADS: "2"
       TOUCHHLE_FRAME_TIMES: "1"
+      TOUCHHLE_PROFILE_RUNTIME: "1"
       BUILD_RUN: ${{ inputs.emulator_run_id || '45651929952' }}
-      TAPS: ${{ inputs.tap_sequence || '1:- 90:- 1:0.5,0.2 15:-' }}
+      TAPS: ${{ inputs.tap_sequence || '1:- 30:0.5,0.2 5:0.89,0.92 5:0.89,0.92 20:-' }}
     steps:
       - uses: actions/checkout@v4
       - name: Install runtime and profiling tools
@@ -123,9 +124,12 @@ jobs:
             perf_exe=$(rg --files -L /usr/lib/linux-tools* | rg '/perf$' | head -n 1)
             test -n "$perf_exe"
             sleep 15
-            sudo "$perf_exe" record -F 99 -e cpu-clock:u -g --call-graph dwarf,16384 -o "$GITHUB_WORKSPACE/results/startup-perf.data" -p "$game_pid" -- sleep 30
+            if ! sudo "$perf_exe" record -F 99 -e cpu-clock:u -g --call-graph dwarf,16384 -o "$GITHUB_WORKSPACE/results/startup-perf.data" -p "$game_pid" -- sleep 20; then
+              echo 'Sampling PMU unavailable; require coroutine-aware runtime profile below.'
+              exit 0
+            fi
             sudo "$perf_exe" report --stdio --no-children -i "$GITHUB_WORKSPACE/results/startup-perf.data" > results/startup-perf.txt
-            sleep 45
+            sleep 10
             sudo "$perf_exe" record -F 99 -e cpu-clock:u -g --call-graph dwarf,16384 -o "$GITHUB_WORKSPACE/results/gameplay-perf.data" -p "$game_pid" -- sleep 20
             sudo "$perf_exe" report --stdio --no-children -i "$GITHUB_WORKSPACE/results/gameplay-perf.data" > results/gameplay-perf.txt
           ) > results/perf.log 2>&1 &
@@ -136,6 +140,8 @@ jobs:
           wait "$profile"
           profile_status=$?
           cat results/perf.log
+          rg 'RUNTIME-PROFILE category=guest.cpu' emulator/HyperHLE_log.txt > results/guest-cpu-profile.txt
+          rg 'RUNTIME-PROFILE' emulator/HyperHLE_log.txt > results/runtime-profile.txt
           test "$game_status" = 0 && test "$profile_status" = 0
       - name: Preserve diagnostics without the private input
         if: always()

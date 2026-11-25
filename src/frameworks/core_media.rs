@@ -26,6 +26,9 @@
 //! dylib they were declared under, so the binding still resolves correctly
 //! whether the app links CoreMedia or CoreVideo.
 
+mod time;
+pub(crate) use time::FUNCTIONS as TIME_FUNCTIONS;
+
 use crate::abi::{GuestArg, GuestFunction};
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::media_toolbox::CMTime;
@@ -41,31 +44,24 @@ use crate::Environment;
 /// kCMTimePositiveInfinity, …) fit the same template, so we expose
 /// each as a separate slot.
 fn cm_time_zero(env: &mut Environment) -> ConstVoidPtr {
-    let p: MutPtr<u8> = env.mem.alloc(24).cast();
-    for i in 0..24 {
-        env.mem.write(p + i, 0);
-    }
-    p.cast().cast_const()
+    env.mem
+        .alloc_and_write(CMTime::from_seconds(0))
+        .cast()
+        .cast_const()
 }
 
-/// `kCMTimeInvalid` has flags=0 (kCMTimeFlags_Valid bit clear). Same
-/// 24-byte layout as kCMTimeZero, every byte zero.
 fn cm_time_invalid(env: &mut Environment) -> ConstVoidPtr {
-    cm_time_zero(env)
+    env.mem
+        .alloc_and_write(CMTime::default())
+        .cast()
+        .cast_const()
 }
 
-/// `kCMTimeIndefinite`: value=0, timescale=0, flags=kCMTimeFlags_Valid|
-/// kCMTimeFlags_Indefinite (=0x3), epoch=0. Apps usually only check for
-/// (flags & kCMTimeFlags_Valid) and ignore the rest, so a flags-only
-/// difference from kCMTimeZero is enough.
 fn cm_time_indefinite(env: &mut Environment) -> ConstVoidPtr {
-    let p: MutPtr<u8> = env.mem.alloc(24).cast();
-    for i in 0..24 {
-        env.mem.write(p + i, 0);
-    }
-    // Bytes 12..16 are the `flags` field (after value:i64, timescale:i32).
-    env.mem.write(p + 12u32, 0x03);
-    p.cast().cast_const()
+    env.mem
+        .alloc_and_write(CMTime::from_parts(0, 0, 0x11, 0))
+        .cast()
+        .cast_const()
 }
 
 /// `kCMTimePositiveInfinity` and `kCMTimeNegativeInfinity` use flags
@@ -176,29 +172,12 @@ pub const CONSTANTS: ConstantExports = &[
 /// which is the symbol the touchHLE-targeted apps reference here.
 /// <https://developer.apple.com/documentation/coremedia/cmtimemake(_:_:)>
 fn CMTimeMake(env: &mut Environment, out: MutPtr<u8>, value: i64, timescale: i32) -> MutPtr<u8> {
-    // Apple ARM 32-bit ABI lays out `CMTime` as:
-    //   offset  0: int64_t  value      (8 bytes, naturally aligned)
-    //   offset  8: int32_t  timescale  (4 bytes)
-    //   offset 12: uint32_t flags      (4 bytes; bit 0 = kCMTimeFlags_Valid)
-    //   offset 16: int64_t  epoch      (8 bytes)  → total = 24 bytes
-    // <https://developer.apple.com/documentation/coremedia/cmtime>
-    let value_bytes = value.to_le_bytes();
-    for (i, b) in value_bytes.iter().enumerate() {
-        env.mem.write(out + (i as u32), *b);
-    }
-    let timescale_bytes = timescale.to_le_bytes();
-    for (i, b) in timescale_bytes.iter().enumerate() {
-        env.mem.write(out + 8u32 + (i as u32), *b);
-    }
-    // `flags = kCMTimeFlags_Valid` (0x1).
-    env.mem.write(out + 12u32, 0x01);
-    env.mem.write(out + 13u32, 0x00);
-    env.mem.write(out + 14u32, 0x00);
-    env.mem.write(out + 15u32, 0x00);
-    // `epoch = 0` — zero out bytes 16..24.
-    for i in 16..24u32 {
-        env.mem.write(out + i, 0);
-    }
+    let time = if timescale > 0 {
+        CMTime::from_parts(value, timescale, 1, 0)
+    } else {
+        CMTime::default()
+    };
+    write_cm_time(env, out, time);
     out
 }
 
@@ -224,12 +203,6 @@ fn CMTimeGetSeconds(_env: &mut Environment, time: CMTime) -> f64 {
     time.as_seconds()
 }
 
-const CM_TIME_FLAGS_VALID: u32 = 0x1;
-
-fn cm_time_is_valid(time: CMTime) -> bool {
-    time.timescale() > 0 && (time.flags() & CM_TIME_FLAGS_VALID) != 0
-}
-
 fn write_cm_time(env: &mut Environment, out: MutPtr<u8>, time: CMTime) {
     let mut words = [0u32; 6];
     time.to_regs(&mut words);
@@ -241,23 +214,7 @@ fn write_cm_time(env: &mut Environment, out: MutPtr<u8>, time: CMTime) {
     }
 }
 
-fn write_invalid_cm_time(env: &mut Environment, out: MutPtr<u8>) {
-    write_cm_time(env, out, CMTime::default());
-}
 
-fn gcd(mut a: i64, mut b: i64) -> i64 {
-    while b != 0 {
-        let r = a % b;
-        a = b;
-        b = r;
-    }
-    a.abs().max(1)
-}
-
-/// Adds or subtracts two `CMTime` values exactly in their least common
-/// timescale. Apple's `CMTimeAdd`/`CMTimeSubtract` return an invalid time
-/// when either operand is invalid or the result would overflow.
-/// <https://developer.apple.com/documentation/coremedia/cmtimeadd(_:_:)>
 fn cm_time_arithmetic(
     env: &mut Environment,
     out: MutPtr<u8>,
@@ -265,33 +222,7 @@ fn cm_time_arithmetic(
     rhs: CMTime,
     subtract: bool,
 ) -> MutPtr<u8> {
-    if !cm_time_is_valid(lhs) || !cm_time_is_valid(rhs) {
-        write_invalid_cm_time(env, out);
-        return out;
-    }
-    let l_scale = lhs.timescale() as i64;
-    let r_scale = rhs.timescale() as i64;
-    let common = l_scale / gcd(l_scale, r_scale) * r_scale;
-    if common <= 0 || common > i32::MAX as i64 {
-        write_invalid_cm_time(env, out);
-        return out;
-    }
-    let l_value = lhs.value() as i128 * (common / l_scale) as i128;
-    let r_value = rhs.value() as i128 * (common / r_scale) as i128;
-    let value = if subtract {
-        l_value - r_value
-    } else {
-        l_value + r_value
-    };
-    let value = match i64::try_from(value) {
-        Ok(value) => value,
-        Err(_) => {
-            write_invalid_cm_time(env, out);
-            return out;
-        }
-    };
-    let result = CMTime::from_parts(value, common as i32, CM_TIME_FLAGS_VALID, 0);
-    write_cm_time(env, out, result);
+    write_cm_time(env, out, time::arithmetic(lhs, rhs, subtract));
     out
 }
 
@@ -306,21 +237,7 @@ fn CMTimeSubtract(env: &mut Environment, out: MutPtr<u8>, lhs: CMTime, rhs: CMTi
 /// `int32_t CMTimeCompare(CMTime time1, CMTime time2)`
 /// <https://developer.apple.com/documentation/coremedia/cmtimesetisfinite>
 fn CMTimeCompare(_env: &mut Environment, lhs: CMTime, rhs: CMTime) -> i32 {
-    let a = lhs.as_seconds();
-    let b = rhs.as_seconds();
-    // Apple documents an ordering only for valid, finite times. Treat the
-    // NaN/indefinite cases as equal so callers that sort or de-duplicate
-    // timestamps do not get an undefined comparison.
-    if a.is_nan() || b.is_nan() {
-        return 0;
-    }
-    if a < b {
-        -1
-    } else if a > b {
-        1
-    } else {
-        0
-    }
+    time::compare(lhs, rhs)
 }
 
 /// `CMTimeRange CMTimeRangeMake(CMTime start, CMTime duration)` — the
@@ -346,18 +263,7 @@ fn CMTimeRangeFromTimeToTime(
     end: CMTime,
 ) -> MutPtr<u8> {
     write_cm_time(env, out, start);
-    let mut duration_out = [0u8; 24];
-    // Reuse the arithmetic path by writing into a stack-like guest buffer.
-    // `MutPtr` has no stack storage, so allocate a tiny scratch block.
-    let scratch: MutPtr<u8> = env.mem.alloc(24).cast();
-    cm_time_arithmetic(env, scratch, end, start, true);
-    for i in 0..24u32 {
-        duration_out[i as usize] = env.mem.read(scratch + i);
-    }
-    env.mem.free(scratch.cast());
-    for (i, byte) in duration_out.into_iter().enumerate() {
-        env.mem.write(out + 24u32 + i as u32, byte);
-    }
+    cm_time_arithmetic(env, out + 24u32, end, start, true);
     out
 }
 
@@ -440,7 +346,13 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CMTimeRangeFromTimeToTime(_, _, _)),
     export_c_func!(CMSampleBufferCreate(_, _, _, _, _, _, _, _, _, _, _, _)),
     export_c_func!(CMSampleBufferSetDataReady(_)),
-    export_c_func!(CMSampleBufferSetDataBufferFromAudioBufferList(_, _, _, _, _)),
+    export_c_func!(CMSampleBufferSetDataBufferFromAudioBufferList(
+        _,
+        _,
+        _,
+        _,
+        _
+    )),
     export_c_func!(CMSampleBufferGetPresentationTimeStamp(_, _)),
     export_c_func!(CMAudioFormatDescriptionCreate(_, _, _, _, _, _, _, _)),
     export_c_func!(CMTimeMakeWithSeconds(_, _, _)),

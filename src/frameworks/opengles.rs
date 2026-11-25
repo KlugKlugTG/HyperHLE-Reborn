@@ -151,6 +151,7 @@ fn sync_context<'objc, 'win: 'objc>(
     current_thread: crate::ThreadId,
 ) -> Option<crate::gles::CurrentGLES<'objc>> {
     let gles_ctx = get_thread_context(state, objc, current_thread)?;
+    let _profile = crate::runtime_profile::scope(current_thread, "gles.context-current");
     Some(gles_ctx.make_current(window))
 }
 
