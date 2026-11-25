@@ -115,18 +115,28 @@ const kEAGLRenderingAPIOpenGLES3: EAGLRenderingAPI = 3;
 /// rendering with shader entry points (`glUseProgram`, `glCreateShader`, …)
 /// route through the real native ES 2.0 backend instead of falling through
 /// to the GLES 1.1-only stubs in `gles_generic`.
+///
+/// With `--no-gles3` (`no_gles3`) the result is capped at ES 2.0: a context
+/// creation that asks for ES 3.0 is refused before this function is reached
+/// (see [`rejects_gles3_request`]), and nothing else may silently hand the
+/// app an ES 3.0 driver either.
 fn effective_eagl_api(
     requested: EAGLRenderingAPI,
     prefer_gles2_context: bool,
     force_gles1_context: bool,
+    no_gles3: bool,
 ) -> EAGLRenderingAPI {
     // Hardcoded driver pin: TOUCHHLE_FORCE_EAGL_API forces the reported/
     // effective EAGL rendering API (1, 2 or 3) regardless of what the guest
     // app requested. This pins the GPU driver surface the app sees, mirroring
     // TOUCHHLE_FORCE_GLES1 on the context-creation side.
+    //
+    // `--no-gles3` still wins over the pin: a context that pretends the GPU
+    // has no ES 3.0 support must not hand out an ES 3.0 driver after all.
     if let Ok(forced) = std::env::var("TOUCHHLE_FORCE_EAGL_API") {
         let forced = forced.trim();
         if let Ok(v) = forced.parse::<EAGLRenderingAPI>() {
+            let v = clamp_forced_api_for_no_gles3(v, no_gles3);
             if (1..=3).contains(&v) && v != requested {
                 log!(
                     "EAGL: TOUCHHLE_FORCE_EAGL_API active, overriding requested API {} with {}",
@@ -154,6 +164,84 @@ fn effective_eagl_api(
         return kEAGLRenderingAPIOpenGLES2;
     }
     requested
+}
+
+/// Apply the `--no-gles3` pretence to a forced EAGL API.
+///
+/// `TOUCHHLE_FORCE_EAGL_API=3` normally pins the driver to an ES 3.0 one, but
+/// with `--no-gles3` the emulated GPU is supposed to have no ES 3.0 support at
+/// all, so the pin is capped to the newest API such a device would offer.
+fn clamp_forced_api_for_no_gles3(api: EAGLRenderingAPI, no_gles3: bool) -> EAGLRenderingAPI {
+    if no_gles3 && api == kEAGLRenderingAPIOpenGLES3 {
+        log!(
+            "EAGL: --no-gles3 active, capping TOUCHHLE_FORCE_EAGL_API=3 at \
+             kEAGLRenderingAPIOpenGLES2"
+        );
+        kEAGLRenderingAPIOpenGLES2
+    } else {
+        api
+    }
+}
+
+/// Should an `initWithAPI:` request be refused because `--no-gles3` is set?
+///
+/// On every iPhone/iPad before the A7 the GPU has no OpenGL ES 3.0 driver, so
+/// `-[EAGLContext initWithAPI:kEAGLRenderingAPIOpenGLES3]` returns `nil`.
+/// Engines that ship both a 3.0 and an older renderer (Unity 4.x, many
+/// cocos2d-x and Gameloft titles) feature-test exactly that way: a `nil`
+/// context sends them down their ES 2.0 / ES 1.1 path. Returning `nil` here
+/// reproduces the real device instead of quietly upgrading the app to a
+/// driver it did not ask for.
+fn rejects_gles3_request(requested: EAGLRenderingAPI, no_gles3: bool) -> bool {
+    no_gles3 && requested == kEAGLRenderingAPIOpenGLES3
+}
+
+#[cfg(test)]
+mod no_gles3_tests {
+    use super::*;
+
+    #[test]
+    fn gles3_context_requests_are_refused_only_with_the_pretence_on() {
+        assert!(rejects_gles3_request(kEAGLRenderingAPIOpenGLES3, true));
+        assert!(!rejects_gles3_request(kEAGLRenderingAPIOpenGLES3, false));
+        assert!(!rejects_gles3_request(kEAGLRenderingAPIOpenGLES2, true));
+        assert!(!rejects_gles3_request(kEAGLRenderingAPIOpenGLES1, true));
+    }
+
+    #[test]
+    fn a_forced_api_pin_cannot_hand_out_es3_when_the_gpu_has_none() {
+        assert_eq!(clamp_forced_api_for_no_gles3(3, true), 2);
+        assert_eq!(clamp_forced_api_for_no_gles3(2, true), 2);
+        assert_eq!(clamp_forced_api_for_no_gles3(1, true), 1);
+        assert_eq!(clamp_forced_api_for_no_gles3(3, false), 3);
+    }
+
+    #[test]
+    fn the_effective_api_never_reaches_es3_with_the_pretence_on() {
+        for requested in 1..=3 {
+            assert_ne!(
+                effective_eagl_api(requested, false, false, true),
+                kEAGLRenderingAPIOpenGLES3
+            );
+            assert_ne!(
+                effective_eagl_api(requested, true, false, true),
+                kEAGLRenderingAPIOpenGLES3
+            );
+        }
+        // The other context downgrades/upgrades still behave as before.
+        assert_eq!(
+            effective_eagl_api(2, false, true, true),
+            kEAGLRenderingAPIOpenGLES1
+        );
+        assert_eq!(
+            effective_eagl_api(1, true, false, true),
+            kEAGLRenderingAPIOpenGLES2
+        );
+        assert_eq!(
+            effective_eagl_api(3, false, false, false),
+            kEAGLRenderingAPIOpenGLES3
+        );
+    }
 }
 
 /// Host-side mirror of a few pieces of guest-visible OpenGL ES state.
@@ -690,6 +778,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         return nil;
     }
 
+    if rejects_gles3_request(api, env.options.no_gles3) {
+        log!(
+            "App requested EAGL initWithAPI:3 (kEAGLRenderingAPIOpenGLES3) sharegroup:{:?}, \
+             returning nil: --no-gles3 reports that the GPU has no OpenGL ES 3.0 support",
+            group
+        );
+        return nil;
+    }
+
     if group == nil {
         return msg![env; this initWithAPI:api];
     }
@@ -718,6 +815,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         api,
         env.options.prefer_gles2_context,
         env.options.force_gles1_context,
+        env.options.no_gles3,
     );
 
     let mut gles_ins = match effective_api {
@@ -769,12 +867,21 @@ pub const CLASSES: ClassExports = objc_classes! {
         return nil;
     }
 
+    if rejects_gles3_request(api, env.options.no_gles3) {
+        log!(
+            "App requested EAGL initWithAPI:3 (kEAGLRenderingAPIOpenGLES3), returning nil: \
+             --no-gles3 reports that the GPU has no OpenGL ES 3.0 support"
+        );
+        return nil;
+    }
+
     let resource_group_token = env.objc.borrow::<EAGLContextHostObject>(this).present_token;
 
     let effective_api = effective_eagl_api(
         api,
         env.options.prefer_gles2_context,
         env.options.force_gles1_context,
+        env.options.no_gles3,
     );
 
     let mut gles_ins = match effective_api {

@@ -554,6 +554,9 @@ struct AppPickerDelegateHostObject {
     show_lock_screen: Option<bool>,
     force_composition: Option<bool>,
     gles_native: Option<bool>,
+    /// `Some(..)` only when the user just flipped the switch: `None` means no
+    /// change is pending. The saved state is tri-state (see `PickerSettings`).
+    no_gles3: Option<bool>,
     fullscreen: Option<bool>,
     device_model_tag: Option<i32>,
     device_model_toggle: bool,
@@ -727,6 +730,12 @@ struct PickerSettings {
     /// an options file which enables the fix (e.g. GTA III defaults).
     rotation_fix: Option<bool>,
     fix_movie_player: Option<bool>,
+    /// `--no-gles3`: pretend the GPU has no OpenGL ES 3.0 support, so apps
+    /// that feature-test for it take their older GLES renderer instead.
+    /// `None` leaves the choice to the command line and the app-specific
+    /// options files; `Some(..)` is an explicit override from Settings >
+    /// Graphics, including an explicit "off".
+    no_gles3: Option<bool>,
     /// `None` leaves the FPS limit to the command line and the app-specific
     /// options files. `Some(..)` is an explicit choice from the Display
     /// section, which is re-emitted on every later launch.
@@ -765,6 +774,7 @@ impl PickerSettings {
             // app-specific defaults in the options files still apply.
             rotation_fix: options.rotation_fix.then_some(true),
             fix_movie_player: options.fix_movie_player.then_some(true),
+            no_gles3: options.no_gles3.then_some(true),
             // Both start as "untouched": the command line already sticks
             // around and the options files still get their say. Only the saved
             // settings file below can make these explicit.
@@ -822,6 +832,7 @@ impl PickerSettings {
                 }
                 "rotation_fix" => set_bool_override(value, &mut settings.rotation_fix),
                 "fix_movie_player" => set_bool_override(value, &mut settings.fix_movie_player),
+                "no_gles3" => set_bool_override(value, &mut settings.no_gles3),
                 "fps_limit" => {
                     settings.fps_limit = FpsLimit::from_short_name(value);
                 }
@@ -873,6 +884,7 @@ impl PickerSettings {
              overlay_corner={}\n\
              rotation_fix={}\n\
              fix_movie_player={}\n\
+             no_gles3={}\n\
              fps_limit={}\n\
              memory_limit_mb={}\n\
              cheat_engine={}\n\
@@ -895,6 +907,7 @@ impl PickerSettings {
             self.overlay_corner.short_name(),
             optional_bool(self.rotation_fix),
             optional_bool(self.fix_movie_player),
+            optional_bool(self.no_gles3),
             self.fps_limit.map_or("default", |limit| limit.short_name()),
             self.memory_limit_mb
                 .map_or_else(|| "default".to_string(), |mb| mb.to_string()),
@@ -1121,6 +1134,10 @@ const CLASSES: ClassExports = objc_classes! {
 - (())glesNative:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles_native = Some(switch_state);
+}
+- (())noGles3:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).no_gles3 = Some(switch_state);
 }
 - (())overlayModeFull {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).overlay_mode = Some(PerformanceOverlayMode::Full);
@@ -1510,6 +1527,7 @@ fn app_picker_inner(
     let mut quick_options_quick_menu = picker_settings.quick_menu;
     let mut quick_options_dladdr = picker_settings.dladdr;
     let mut quick_options_gles_native = picker_settings.gles_native;
+    let mut quick_options_no_gles3 = picker_settings.no_gles3;
     let mut device_state = DropdownState {
         selected: picker_settings.device_model_tag,
         ..Default::default()
@@ -2183,6 +2201,8 @@ fn app_picker_inner(
             quick_options_force_composition_override = Some(force_composition);
         } else if let Some(gles_native) = std::mem::take(&mut host_obj.gles_native) {
             quick_options_gles_native = gles_native || !crate::window::angle_backend_available();
+        } else if let Some(no_gles3) = std::mem::take(&mut host_obj.no_gles3) {
+            quick_options_no_gles3 = Some(no_gles3);
         } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
             quick_options_fullscreen = fullscreen;
         }
@@ -2236,6 +2256,7 @@ fn app_picker_inner(
         picker_settings.overlay_corner = quick_options_overlay_corner;
         picker_settings.rotation_fix = quick_options_rotation_fix;
         picker_settings.fix_movie_player = quick_options_fix_movie_player;
+        picker_settings.no_gles3 = quick_options_no_gles3;
         picker_settings.fps_limit = quick_options_fps_limit;
         picker_settings.memory_limit_mb = quick_options_memory_limit_mb;
         picker_settings.cheat_engine = quick_options_cheat_engine;
@@ -2380,6 +2401,12 @@ fn app_picker_inner(
         quick_options_rotation_fix,
         quick_options_fix_movie_player,
     ));
+    // Like the two fixes above, only emitted once the Settings screen made an
+    // explicit choice, so an app-specific `--no-gles3` in the options files
+    // survives an untouched switch.
+    if let Some(enabled) = quick_options_no_gles3 {
+        option_args.push(quick_options_no_gles3_argument(enabled).to_string());
+    }
     // Always passed explicitly (like `--trainer`/`--no-trainer`): the base
     // default is now OFF, so the switch has to be able to turn the native
     // driver back on, and the picker's choice should win over any
@@ -4501,6 +4528,15 @@ fn setup_settings(
             picker_settings.gles_native,
                 gles_native_switch_enabled,
             ),
+            // Pretend the GPU has no ES 3.0 driver, like an iPhone/iPad older
+            // than the A7. Engines that ship both a 3.0 and an older renderer
+            // then use the older one instead of failing on the 3.0 path.
+            SettingsRow::Toggle(
+                "No GLES 3",
+                "noGles3:",
+                picker_settings.no_gles3.unwrap_or(false),
+                true,
+            ),
             SettingsRow::Toggle(
                 "May fix graphics issues",
                 "forceComposition:",
@@ -5669,6 +5705,16 @@ fn quick_options_rotation_fix_argument(enabled: bool) -> &'static str {
     }
 }
 
+/// `--no-gles3` pretends the GPU has no OpenGL ES 3.0 support; `--gles3`
+/// (the explicit "off" of the switch) restores the default.
+fn quick_options_no_gles3_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--no-gles3"
+    } else {
+        "--gles3"
+    }
+}
+
 fn quick_options_fix_movie_player_argument(enabled: bool) -> &'static str {
     if enabled {
         "--fix-movie-player"
@@ -5807,6 +5853,32 @@ mod quick_options_force_composition_tests {
             quick_options_force_composition_argument(false),
             "--no-force-composition"
         );
+    }
+}
+
+#[cfg(test)]
+mod quick_options_no_gles3_tests {
+    use super::*;
+
+    #[test]
+    fn switch_emits_explicit_arguments_both_ways() {
+        assert_eq!(quick_options_no_gles3_argument(true), "--no-gles3");
+        assert_eq!(quick_options_no_gles3_argument(false), "--gles3");
+    }
+
+    #[test]
+    fn an_untouched_switch_keeps_options_file_defaults() {
+        // "default" (what a never-flipped switch is saved as) must not emit
+        // anything, so an app-specific --no-gles3 in the options files still
+        // applies; flipping the switch either way is an explicit override.
+        let mut setting = None;
+        set_bool_override(optional_bool(setting), &mut setting);
+        assert_eq!(setting, None);
+
+        set_bool_override("true", &mut setting);
+        assert_eq!(setting, Some(true));
+        set_bool_override("false", &mut setting);
+        assert_eq!(setting, Some(false));
     }
 }
 
