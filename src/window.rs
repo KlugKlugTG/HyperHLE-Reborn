@@ -2503,10 +2503,16 @@ impl Window {
             if let Some(changes) = crate::button_bind::gamepad_button(button, pressed) {
                 for change in changes {
                     let touch = bound_button_touch(self, change);
-                    self.event_queue.push_back(if change.down {
-                        Event::TouchesDown(HashMap::from([touch]))
-                    } else {
-                        Event::TouchesUp(HashMap::from([touch]))
+                    self.event_queue.push_back(match change.action {
+                        crate::button_bind::MarkerAction::Down => {
+                            Event::TouchesDown(HashMap::from([touch]))
+                        }
+                        crate::button_bind::MarkerAction::Move => {
+                            Event::TouchesMove(HashMap::from([touch]))
+                        }
+                        crate::button_bind::MarkerAction::Up => {
+                            Event::TouchesUp(HashMap::from([touch]))
+                        }
                     });
                 }
             }
