@@ -51,7 +51,7 @@ const MAX_MARKERS: usize = 32;
 /// difference between a drag that starts at the rim and one that starts in
 /// the middle is invisible in a screenshot but decides whether walking works,
 /// so "is this the build with the fix" has to be answerable without guessing.
-const OVERLAY_REVISION: &str = "PADS R6 DPAD";
+const OVERLAY_REVISION: &str = "PADS R7 SWIPE";
 /// Distance, in unscaled pixels, a press has to travel before it counts as a
 /// drag rather than a tap.
 const DRAG_THRESHOLD: f32 = 10.0;
@@ -193,10 +193,20 @@ struct Pad {
     /// How far the stick is pushed in total, 0..1. Only the circle uses this.
     push: f32,
     /// Which of the eight directions is held, or `None` at rest. Only the cross
-    /// uses this: it is a D-pad, so it sends a touch that stays put while the
-    /// stick is held in that direction and never moves around the screen,
-    /// which is what stopped it wandering into a game's own joystick area.
+    /// uses this: it is a D-pad, and each direction is a swipe outwards from
+    /// the middle of the pad.
     held: Option<usize>,
+    /// The cross's swipe: where the finger is right now, and how long the
+    /// finger has been travelling. A swipe is put down at the middle, moved
+    /// outwards and lifted, and its speed is what a wheel's flick measures, so
+    /// the pad needs to know how far through the travel it is.
+    swipe: (f32, f32),
+    swipe_elapsed: f32,
+    /// The direction the current (or last) swipe travels towards. Remembered
+    /// separately from `held` because the button can be let go before the
+    /// finger has finished travelling, and the travel still has to be played
+    /// out: a tap that lifts halfway selects nothing.
+    swipe_dir: usize,
     /// Whether the pad's finger is down right now.
     touching: bool,
     /// How long the stick has been at rest. The finger is only lifted once
@@ -223,6 +233,9 @@ impl Pad {
             axis: (0.0, 0.0),
             push: 0.0,
             held: None,
+            swipe: (cx + CROSS_START, cy),
+            swipe_elapsed: 0.0,
+            swipe_dir: 0,
             touching: false,
             rest: 0.0,
             enabled: false,
@@ -258,13 +271,25 @@ impl Pad {
     /// direction's arrow, on the rim. It never moves while the direction is
     /// held, which is the whole point of a D-pad touch: the game's own
     /// joystick sees a finger resting in one place.
-    fn finger(self, direction: usize) -> (f32, f32) {
-        let (x, y) = PAD_DIRECTIONS_8[direction];
+    /// Where the cross's finger starts: just off the middle, so the game sees
+    /// a finger that has room to travel outwards in any direction.
+    fn swipe_start(self) -> (f32, f32) {
         let reach = self.reach.clamp(0.0, 1.0);
         (
-            self.cx + x * reach * self.radius * PAD_RIM,
-            self.cy + y * reach * self.radius * PAD_RIM,
+            self.cx + CROSS_START * reach * self.radius,
+            self.cy + CROSS_START * reach * self.radius,
         )
+    }
+
+    /// Where the cross's finger has got to on the way out: `t` is how far
+    /// through the swipe it is, 0..1.
+    fn swipe_at(self, direction: usize, t: f32) -> (f32, f32) {
+        let (x, y) = PAD_DIRECTIONS_8[direction];
+        let reach = self.reach.clamp(0.0, 1.0);
+        let distance = (CROSS_START + (CROSS_SWIPE - CROSS_START) * t.clamp(0.0, 1.0))
+            * reach
+            * self.radius;
+        (self.cx + x * distance, self.cy + y * distance)
     }
 }
 
@@ -321,6 +346,14 @@ const DPAD_BUTTONS: [(Button, u8); 4] = [
 ];
 /// How far out the direction arrows sit, as a fraction of the pad radius.
 const PAD_RIM: f32 = 0.78;
+/// How far out from the middle of the cross its finger starts, as a fraction
+/// of the radius. A weapon wheel is a wheel: it reads the *direction a finger
+/// travels from its middle*, not where the finger ends up. Starting on the rim
+/// would make every press look like a completed swipe with no travel at all.
+const CROSS_START: f32 = 0.05;
+/// How far a D-pad swipe travels, as a fraction of the radius. Long enough to
+/// clear a wheel's dead zone and reach the weapon ring.
+const CROSS_SWIPE: f32 = PAD_RIM;
 
 /// The eight directions a cross pad can send, going clockwise from up. Each is
 /// a unit vector in screen space (Y is down). A D-pad has to offer diagonals
@@ -836,7 +869,13 @@ fn apply_pad_push(
 fn pad_touch_at(pad: &Pad, action: PadAction) -> MarkerTouch {
     MarkerTouch {
         marker: PAD_FINGER_BASE + pad.kind.pad() as u8,
-        position: pad.finger_analogue(),
+        // The circle's finger follows its stick; the cross's follows its
+        // swipe. Reading the wrong one is why the cross sent every touch to
+        // the middle of the pad and a weapon wheel saw nothing move.
+        position: match pad.kind {
+            PadKind::Circle => pad.finger_analogue(),
+            PadKind::Cross => pad.swipe,
+        },
         action: match action {
             PadAction::Down => MarkerAction::Down,
             PadAction::Move => MarkerAction::Move,
@@ -856,71 +895,107 @@ fn pad_touch_at(pad: &Pad, action: PadAction) -> MarkerTouch {
 /// Changing direction is still one uninterrupted touch: the finger is not
 /// lifted, it simply ends up on the new direction's spot, so walking round a
 /// corner does not read as the stick being released.
+/// How long the cross's swipe takes, in seconds.
+///
+/// A wheel reads the direction of travel, and many also read how fast the swipe
+/// was, so the finger has to actually travel rather than appear at its
+/// destination. This is short enough that a tap still feels instant and long
+/// enough that the move events are spread over several samples, the way a real
+/// thumb's are.
+const CROSS_SWIPE_TIME: f32 = 0.09;
+
+/// Advances the cross: a held direction puts a finger down in the middle of the
+/// pad and slides it out along that direction.
+///
+/// A D-pad on a touch screen is a swipe, because that is what a weapon wheel
+/// (and most other on-screen four-way controls) actually reads: the direction
+/// the finger travels from the middle of the wheel. A touch that appears on the
+/// rim never travels anywhere, so the wheel sees nothing -- which is exactly
+/// why the D-pad appeared to do nothing at all.
+///
+/// The finger is dragged, never re-touched, so changing direction mid-swipe is
+/// one continuous gesture; lifting it is delayed by [PAD_RELEASE_DELAY] so a
+/// roll round the wheel does not read as a tap.
 fn apply_pad_direction(
     pad: &mut Pad,
     direction: Option<usize>,
     dt: f32,
     changes: &mut Vec<MarkerTouch>,
 ) {
-    let was = pad.held;
-    if direction == was {
-        // Nothing changed, except possibly the grace period running out.
-        if direction.is_none() && pad.touching {
-            pad.rest += dt.clamp(0.0, 0.1);
-            if pad.rest >= PAD_RELEASE_DELAY {
-                changes.push(pad_touch(pad, was.unwrap_or(0), PadAction::Up));
-                pad.touching = false;
-                pad.rest = 0.0;
-            }
-        }
-        return;
-    }
-    pad.held = direction;
+    let dt = dt.clamp(0.0, 0.1);
     match (direction, pad.touching) {
         (Some(direction), false) => {
+            // A new swipe: the finger goes down in the middle and starts out.
+            pad.held = Some(direction);
             pad.touching = true;
             pad.rest = 0.0;
-            changes.push(pad_touch(pad, direction, PadAction::Down));
+            pad.swipe_elapsed = 0.0;
+            pad.swipe_dir = direction;
+            pad.swipe = pad.swipe_start();
+            changes.push(pad_touch_at(pad, PadAction::Down));
+            changes.push(pad_touch_at(pad, PadAction::Move));
         }
         (Some(direction), true) => {
-            // A change of direction is a Move to the new spot, never an Up
-            // followed by a Down: the game must see one finger being dragged.
             pad.rest = 0.0;
-            changes.push(pad_touch(pad, direction, PadAction::Move));
+            if direction != pad.held.unwrap_or(direction) {
+                // A new direction: start the travel over from the middle, on
+                // the same finger. The game sees one thumb changing its mind.
+                pad.held = Some(direction);
+                pad.swipe_elapsed = 0.0;
+                pad.swipe_dir = direction;
+                pad.swipe = pad.swipe_start();
+                changes.push(pad_touch_at(pad, PadAction::Move));
+            } else {
+                pad.swipe_elapsed += dt;
+            }
+            // Travel outwards while the swipe is still running, so the wheel
+            // sees the finger move rather than jump.
+            if pad.swipe_elapsed <= CROSS_SWIPE_TIME {
+                let t = pad.swipe_elapsed / CROSS_SWIPE_TIME;
+                pad.swipe_dir = direction;
+                pad.swipe = pad.swipe_at(direction, t);
+                changes.push(pad_touch_at(pad, PadAction::Move));
+            }
         }
         (None, true) => {
-            // Coming to rest: keep the finger down for a moment so sweeping
-            // through the middle to reverse does not count as letting go.
+            // The button is up. A tap is often shorter than the swipe, so the
+            // travel is finished here before the grace period even starts:
+            // lifting halfway through would leave the finger near the middle,
+            // and a wheel would read that as no direction at all.
+            pad.held = None;
+            if pad.swipe_elapsed < CROSS_SWIPE_TIME {
+                pad.swipe_elapsed = (pad.swipe_elapsed + dt).min(CROSS_SWIPE_TIME);
+                let t = pad.swipe_elapsed / CROSS_SWIPE_TIME;
+                pad.swipe = pad.swipe_at(pad.swipe_dir, t);
+                changes.push(pad_touch_at(pad, PadAction::Move));
+                // Do not start the release clock until the travel is done: the
+                // finger must arrive before it can leave.
+                return;
+            }
+            pad.rest += dt;
+            if pad.rest >= PAD_RELEASE_DELAY {
+                changes.push(pad_touch_at(pad, PadAction::Up));
+                pad.touching = false;
+                pad.rest = 0.0;
+                pad.swipe_elapsed = 0.0;
+            }
+        }
+        (None, false) => {
+            pad.held = None;
             pad.rest = 0.0;
         }
-        (None, false) => {}
     }
 }
 
 /// The Up for a pad that has to let go of its finger (it lost its stick, or it
 /// is being removed). Picks the right spot for the pad's kind.
 fn pad_release(pad: &mut Pad) -> MarkerTouch {
-    let touch = match pad.kind {
-        PadKind::Cross => pad_touch(pad, pad.held.unwrap_or(0), PadAction::Up),
-        PadKind::Circle => pad_touch_at(pad, PadAction::Up),
-    };
+    let touch = pad_touch_at(pad, PadAction::Up);
     pad.held = None;
     pad.axis = (0.0, 0.0);
     pad.push = 0.0;
+    pad.swipe_elapsed = 0.0;
     touch
-}
-
-/// The pad's touch, on one direction's spot.
-fn pad_touch(pad: &Pad, direction: usize, action: PadAction) -> MarkerTouch {
-    MarkerTouch {
-        marker: PAD_FINGER_BASE + pad.kind.pad() as u8,
-        position: pad.finger(direction),
-        action: match action {
-            PadAction::Down => MarkerAction::Down,
-            PadAction::Move => MarkerAction::Move,
-            PadAction::Up => MarkerAction::Up,
-        },
-    }
 }
 
 fn lerp2(from: (f32, f32), to: (f32, f32), t: f32) -> (f32, f32) {
@@ -1923,13 +1998,15 @@ fn pad_outline(kind: PadKind, px: f32, py: f32, radius: f32) -> Vec<(f32, f32)> 
 /// the touch it stands for never does either.
 fn knob_position(pad: &Pad, px: f32, py: f32, radius: f32) -> (f32, f32) {
     if pad.kind == PadKind::Cross {
-        return match pad.held {
-            Some(direction) => {
-                let (x, y) = PAD_DIRECTIONS_8[direction];
-                (px + x * KNOB_TRAVEL * radius, py + y * KNOB_TRAVEL * radius)
-            }
-            None => (px, py),
-        };
+        // The knob sits where the swipe's finger is, so the pad shows the
+        // gesture it is sending: out from the middle along the held direction.
+        if pad.held.is_none() && !pad.touching {
+            return (px, py);
+        }
+        return (
+            px + (pad.swipe.0 - pad.cx) / pad.radius * radius,
+            py + (pad.swipe.1 - pad.cy) / pad.radius * radius,
+        );
     }
     let (x, y) = normalize_push(pad.axis.0, pad.axis.1);
     let travel = pad.push.clamp(0.0, 1.0) * KNOB_TRAVEL;
@@ -2786,7 +2863,7 @@ mod tests {
             .iter()
             .filter(|change| change.marker == PAD_FINGER_BASE + 1)
             .collect();
-        assert_eq!(cross_changes.len(), 1, "{changes:?}");
+        assert!(!cross_changes.is_empty(), "{changes:?}");
         assert_eq!(cross_changes[0].action, MarkerAction::Down);
         // Both are live: the camera's finger and the cross's.
         assert!(pad_of(&ui, PadKind::Cross).touching);
@@ -2800,13 +2877,19 @@ mod tests {
         // The cross kept its direction through all of that.
         assert_eq!(pad_of(&ui, PadKind::Cross).held, Some(0));
         assert!(pad_of(&ui, PadKind::Cross).touching);
-        // Nothing the right stick did touched the cross's finger.
+        // Once the swipe has finished, the right stick cannot move the cross's
+        // finger: that was the original bug, camera dragging a weapon choice.
+        for _ in 0..8 {
+            pads_move_inner(&mut ui, [0.0; 4], 0.02);
+        }
+        let settled = ui.pads[1].swipe;
+        let turning = push_sticks_dt(&mut ui, [0.0, 0.0, -1.0, 0.0], 0.016);
         assert!(
-            !walking
-                .iter()
-                .any(|change| change.marker == PAD_FINGER_BASE + 1),
-            "the camera must not move the cross: {walking:?}"
+            turning.iter().any(|change| change.marker == LOOK_FINGER),
+            "the camera still drags: {turning:?}"
         );
+        assert_eq!(ui.pads[1].swipe, settled, "the camera left the cross alone");
+        assert_eq!(pad_of(&ui, PadKind::Cross).held, Some(0));
     }
 
     /// Camera mode used to take the right stick away from the cross, which is
@@ -2817,14 +2900,12 @@ mod tests {
             let mut ui = pads_ui();
             ui.look = look;
             let changes = press_dpad(&mut ui, &[Button::DPadLeft]);
-            assert_eq!(
-                changes.len(),
-                1,
+            assert!(
+                changes.iter().any(|change| change.action == MarkerAction::Down),
                 "camera {}: the cross must still press",
                 if look { "ON" } else { "OFF" }
             );
             assert_eq!(pad_of(&ui, PadKind::Cross).held, Some(6));
-            assert!(!changes.is_empty());
         }
     }
 
@@ -2926,8 +3007,272 @@ mod tests {
         assert!(pad_of(&ui, PadKind::Cross).touching);
     }
 
+    /// The core of the D-pad-as-swipe change: pressing a direction slides a
+    /// finger from the middle of the pad outwards, and it covers real distance.
+    /// A touch that merely appeared somewhere would give a wheel no direction
+    /// to read, which is why the old D-pad did nothing at all.
+    #[test]
+    fn a_dpad_press_is_a_swipe_from_the_middle() {
+        let mut ui = pads_ui();
+        let centre = (ui.pads[1].cx, ui.pads[1].cy);
+        let changes = press_dpad_dt(&mut ui, &[Button::DPadRight], 0.0);
+        let down = changes
+            .iter()
+            .find(|change| change.action == MarkerAction::Down)
+            .expect("the swipe starts");
+        // It goes down in the middle of the pad, not on the rim.
+        let radius = ui.pads[1].radius;
+        let from_centre = (down.position.0 - centre.0).hypot(down.position.1 - centre.1);
+        assert!(
+            from_centre < radius * 0.2,
+            "the finger starts near the middle: {from_centre} vs radius {radius}"
+        );
+        // Then it travels outwards, one Move at a time.
+        let mut travelled = from_centre;
+        let mut moves = 0;
+        for _ in 0..12 {
+            let changes = pads_move_inner(&mut ui, [0.0; 4], 0.02);
+            for change in changes {
+                if change.action == MarkerAction::Move {
+                    moves += 1;
+                    travelled = (change.position.0 - centre.0).hypot(change.position.1 - centre.1);
+                }
+            }
+        }
+        assert!(moves >= 3, "the swipe is spread over samples, not one jump: {moves}");
+        // `radius` is stored as a fraction of the shorter screen side, so the
+        // travel to compare against is the same fraction of the viewport.
+        assert!(
+            travelled > radius * 0.5,
+            "the finger actually crossed the pad: {travelled} vs half radius {radius}"
+        );
+        // It travelled to the right, which is the direction that was pressed.
+        let last = ui.pads[1].swipe;
+        assert!(last.0 > centre.0, "the finger went right: {:?}", last);
+        assert!((last.1 - centre.1).abs() < radius * 0.1, "and not up or down");
+    }
+
+    /// Up, down, left, right each slide their own way.
+    #[test]
+    fn each_dpad_button_swipes_its_own_way() {
+        for (button, dx, dy) in [
+            (Button::DPadUp, 0.0, -1.0),
+            (Button::DPadDown, 0.0, 1.0),
+            (Button::DPadLeft, -1.0, 0.0),
+            (Button::DPadRight, 1.0, 0.0),
+        ] {
+            let mut ui = pads_ui();
+            press_dpad_dt(&mut ui, &[button], 0.0);
+            for _ in 0..10 {
+                pads_move_inner(&mut ui, [0.0; 4], 0.02);
+            }
+            let centre = (ui.pads[1].cx, ui.pads[1].cy);
+            let tip = ui.pads[1].swipe;
+            let moved = (tip.0 - centre.0, tip.1 - centre.1);
+            let length = moved.0.hypot(moved.1);
+            assert!(length > ui.pads[1].radius * 0.4, "{:?} did not travel", button);
+            // The angle matches the button.
+            assert!(
+                moved.0 * dx + moved.1 * dy > length * 0.9,
+                "{:?} swiped {:?}, wanted ({}, {})",
+                button,
+                moved,
+                dx,
+                dy
+            );
+        }
+    }
+
+    /// Lifting the button lets go after the grace period, wherever the swipe
+    /// got to, so a tap plays out as a tap.
+    #[test]
+    fn a_swipe_is_lifted_where_it_stopped() {
+        let mut ui = pads_ui();
+        press_dpad_dt(&mut ui, &[Button::DPadUp], 0.0);
+        for _ in 0..8 {
+            pads_move_inner(&mut ui, [0.0; 4], 0.02);
+        }
+        let tip = ui.pads[1].swipe;
+        // Releasing must not move the finger: it only starts the grace period.
+        release_dpad_dt(&mut ui, &[Button::DPadUp], 0.02);
+        let mut up = None;
+        for _ in 0..12 {
+            for change in pads_move_inner(&mut ui, [0.0; 4], PAD_RELEASE_DELAY * 0.6) {
+                if change.action == MarkerAction::Up {
+                    up = Some(change.position);
+                }
+            }
+        }
+        let up = up.expect("the finger lifts");
+        assert!(
+            (up.0 - tip.0).abs() < 1e-3 && (up.1 - tip.1).abs() < 1e-3,
+            "the lift is where the swipe stopped: {:?} vs {:?}",
+            up,
+            tip
+        );
+    }
+
+    /// A weapon wheel is a wheel: it needs the finger to *start* near the
+    /// middle and travel out. A touch that lands straight on the rim is a
+    /// complete swipe with no travel, which most wheels read as nothing at
+    /// all -- the reason the old D-pad appeared dead.
+    #[test]
+    fn the_swipe_starts_near_the_middle_not_on_the_rim() {
+        let mut ui = pads_ui();
+        let radius = ui.pads[1].radius;
+        let centre = (ui.pads[1].cx, ui.pads[1].cy);
+        // Every direction starts close to the middle...
+        for button in [
+            Button::DPadUp,
+            Button::DPadDown,
+            Button::DPadLeft,
+            Button::DPadRight,
+        ] {
+            let mut ui2 = pads_ui();
+            press_dpad_dt(&mut ui2, &[button], 0.0);
+            let start = ui2.pads[1].swipe;
+            let from_centre = (start.0 - centre.0).hypot(start.1 - centre.1);
+            assert!(
+                from_centre < radius * 0.15,
+                "{:?} started {:?}, which is {} from the middle of a {} pad",
+                button,
+                start,
+                from_centre,
+                radius
+            );
+        }
+        // ...and the press really is a travel, not a jump: the Down is near the
+        // middle and the next Move is further out.
+        let changes = press_dpad_dt(&mut ui, &[Button::DPadRight], 0.0);
+        let down = changes
+            .iter()
+            .find(|change| change.action == MarkerAction::Down)
+            .unwrap()
+            .position;
+        for _ in 0..3 {
+            pads_move_inner(&mut ui, [0.0; 4], 0.02);
+        }
+        let now = ui.pads[1].swipe;
+        assert!(
+            now.0 - down.0 > radius * 0.2,
+            "the finger travelled outwards: {:?} -> {:?}",
+            down,
+            now
+        );
+    }
+
+    /// The swipe is driven by time, so it must finish even if the direction
+    /// never changes again, and stop growing afterwards.
+    #[test]
+    fn a_held_direction_finishes_its_swipe_and_stops() {
+        let mut ui = pads_ui();
+        press_dpad_dt(&mut ui, &[Button::DPadUp], 0.0);
+        let mut last = ui.pads[1].swipe;
+        for _ in 0..20 {
+            pads_move_inner(&mut ui, [0.0; 4], 0.02);
+            let now = ui.pads[1].swipe;
+            assert!(now.1 <= last.1 + 1e-6, "the finger never goes backwards");
+            last = now;
+        }
+        let settled = ui.pads[1].swipe;
+        for _ in 0..5 {
+            pads_move_inner(&mut ui, [0.0; 4], 0.02);
+        }
+        assert_eq!(ui.pads[1].swipe, settled, "the swipe does not keep growing");
+        // It reached the rim's neighbourhood rather than stopping short.
+        let travel = (settled.1 - ui.pads[1].cy).abs();
+        assert!(
+            travel > ui.pads[1].radius * 0.6,
+            "the swipe got most of the way out: {} of {}",
+            travel,
+            ui.pads[1].radius
+        );
+    }
+
+    /// The player taps a weapon-wheel direction quickly -- quicker than the
+    /// swipe takes. The finger must still travel all the way out before it
+    /// lifts, or the game sees a touch near the middle of the wheel and picks
+    /// nothing. This is the case that would still look "dead" if the release
+    /// simply cut the swipe short.
+    #[test]
+    fn a_quick_tap_still_swipes_all_the_way_out() {
+        let mut ui = pads_ui();
+        let centre = (ui.pads[1].cx, ui.pads[1].cy);
+        let radius = ui.pads[1].radius;
+
+        // Down, then up almost at once: no time to travel.
+        apply_gamepad(&mut ui, Button::DPadDown, true);
+        let mut events: Vec<MarkerTouch> = Vec::new();
+        events.extend(pads_move_inner(&mut ui, [0.0; 4], 0.016));
+        apply_gamepad(&mut ui, Button::DPadDown, false);
+        events.extend(pads_move_inner(&mut ui, [0.0; 4], 0.016));
+
+        // The finger must still be travelling, inside the pad.
+        let mid = ui.pads[1].swipe;
+        let mid_travel = (mid.1 - centre.1).abs();
+        assert!(
+            (mid_travel - (CROSS_SWIPE * radius)).abs() > radius * 0.05,
+            "the tap was cut short at {} of {}",
+            mid_travel,
+            CROSS_SWIPE * radius
+        );
+
+        // Let time pass with no button held: the travel finishes, then lifts.
+        let mut lifted_after = None;
+        let mut furthest = mid_travel;
+        for step in 0..40 {
+            for change in pads_move_inner(&mut ui, [0.0; 4], 0.016) {
+                events.push(change);
+                if change.action == MarkerAction::Up {
+                    lifted_after = Some(step);
+                    furthest = (change.position.1 - centre.1).abs();
+                }
+            }
+        }
+        let lifted_after = lifted_after.expect("the finger does eventually lift");
+        assert!(
+            lifted_after > 0,
+            "it travelled before lifting, not on the same poll"
+        );
+        // Where it lifted is the fully-swiped spot, not the middle.
+        assert!(
+            furthest > radius * 0.6,
+            "the tap reached the direction: {} of {}",
+            furthest,
+            radius
+        );
+        // And the up happens down-screen, which is the direction pressed.
+        assert!(furthest > (mid_travel).max(radius * 0.6));
+        assert!(!ui.pads[1].touching);
+    }
+
     fn pad_of(ui: &Ui, kind: PadKind) -> Pad {
         ui.pads[kind.pad()]
+    }
+
+    /// Presses D-pad buttons and runs one poll with the given `dt`, so the
+    /// swipe has a real slice of time to travel through.
+    fn press_dpad_dt(ui: &mut Ui, buttons: &[Button], dt: f32) -> Vec<MarkerTouch> {
+        let mut changes = Vec::new();
+        for &button in buttons {
+            if let Some(more) = apply_gamepad(ui, button, true) {
+                changes.extend(more);
+            }
+        }
+        changes.extend(pads_move_inner(ui, [0.0; 4], dt));
+        changes
+    }
+
+    /// Releases D-pad buttons and runs one poll with the given `dt`.
+    fn release_dpad_dt(ui: &mut Ui, buttons: &[Button], dt: f32) -> Vec<MarkerTouch> {
+        let mut changes = Vec::new();
+        for &button in buttons {
+            if let Some(more) = apply_gamepad(ui, button, false) {
+                changes.extend(more);
+            }
+        }
+        changes.extend(pads_move_inner(ui, [0.0; 4], dt));
+        changes
     }
 
     /// Presses D-pad buttons on the cross pad and returns what it sent.
@@ -3034,20 +3379,24 @@ mod tests {
 
         // The D-pad drives the cross, and only the cross.
         let changes = press_dpad(&mut ui, &[Button::DPadRight]);
-        assert_eq!(changes.len(), 1);
+        // A swipe: one Down, then Moves as the finger travels out.
         assert_eq!(changes[0].action, MarkerAction::Down);
-        assert_eq!(changes[0].marker, PAD_FINGER_BASE + 1);
+        assert!(changes
+            .iter()
+            .all(|change| change.marker == PAD_FINGER_BASE + 1));
+        assert!(changes.len() > 1, "the finger travels: {changes:?}");
         let cross = pad_of(&ui, PadKind::Cross);
         assert_eq!(cross.held, Some(2), "right is direction 2");
         assert!(cross.touching);
         assert_eq!(pad_of(&ui, PadKind::Circle).axis, (0.0, 0.0));
 
-        // The left stick drives the circle, and only the circle.
-        let changes = push_sticks(&mut ui, [0.0, -1.0, 0.0, 0.0]);
-        assert!(changes
-            .iter()
-            .all(|change| change.marker == PAD_FINGER_BASE));
-        assert!(!changes.is_empty());
+        // The left stick drives the circle, and only the circle. The cross may
+        // still be finishing its swipe, so look at the circle's own finger.
+        let circle_changes: Vec<_> = push_sticks(&mut ui, [0.0, -1.0, 0.0, 0.0])
+            .into_iter()
+            .filter(|change| change.marker == PAD_FINGER_BASE)
+            .collect();
+        assert!(!circle_changes.is_empty(), "the left stick walks");
     }
 
     /// The bug that made walking feel broken: each direction used to be its
@@ -3161,28 +3510,28 @@ mod tests {
     /// which made the character drift on a phone shooter while the player was
     /// only turning.
     #[test]
-    fn the_cross_touch_never_slides() {
+    fn the_right_stick_cannot_move_the_cross() {
         let mut ui = pads_ui();
-        let changes = press_dpad(&mut ui, &[Button::DPadRight]);
-        let down = changes
-            .iter()
-            .find(|change| change.action == MarkerAction::Down)
-            .expect("the cross pressed");
-        let spot = down.position;
-        // Wiggle the right stick while the button stays down: no event at all.
-        // This is the bug the player hit -- turning the camera used to move a
-        // finger that was choosing a weapon.
+        press_dpad(&mut ui, &[Button::DPadRight]);
+        for _ in 0..8 {
+            pads_move_inner(&mut ui, [0.0; 4], 0.02);
+        }
+        // Settled at the end of its swipe.
+        let settled = ui.pads[1].swipe;
+        // Wiggle the right stick while the button stays down: the finger must
+        // not move. This is the bug the player hit -- turning the camera used
+        // to drag a finger that was choosing a weapon.
         for (x, y) in [(0.9, 0.05), (1.0, -0.1), (0.75, 0.1), (0.0, -1.0)] {
             let changes = push_sticks(&mut ui, [0.0, 0.0, x, y]);
             assert!(
-                changes.is_empty(),
+                !changes
+                    .iter()
+                    .any(|change| change.marker == PAD_FINGER_BASE + 1),
                 "the right stick must not touch the cross: {changes:?}"
             );
         }
+        assert_eq!(ui.pads[1].swipe, settled, "the finger has not moved");
         assert!(pad_of(&ui, PadKind::Cross).touching);
-        // The spot it touched is the right arrow's, not a sliding position.
-        let right = circle_rim(&ui, 1, 2);
-        assert!((spot.0 - right.0).abs() < 1e-4 && (spot.1 - right.1).abs() < 1e-4);
     }
 
     /// Where the cross's arrow for `direction` sits on a standard viewport.

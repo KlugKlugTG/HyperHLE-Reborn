@@ -491,13 +491,15 @@ Other options:
         no releasing and re-touching, which is what made walking feel like it
         needed the stick let go before a direction was noticed.
 
-        The cross sends one fixed touch per direction, on that direction's
-        arrow, where it stays until the direction changes. A D-pad is how games
-        with a weapon wheel are meant to be driven: press up and the wheel
-        picks whatever is up, press up and right together for a diagonal, roll
-        from one button to the next and the finger moves without ever lifting.
-        A tap that goes down and up within a single frame is still held for a
-        moment, so the game reads it as a tap rather than missing it.
+        The cross sends a swipe per direction: the finger goes down in the
+        middle of the pad and slides out along that direction, over about a
+        tenth of a second. That is what a weapon wheel and most other on-screen
+        four-way controls actually read -- the direction a finger travels from
+        the middle of the wheel -- so a press selects the weapon on that side,
+        up plus right together picks the diagonal, and rolling from one button
+        to the next keeps a single finger down, moving. A tap that goes down and
+        up within a single frame still plays out as a full swipe and is held
+        for a moment, so the game reads it as a tap rather than missing it.
 
         The right stick drives neither pad. It belongs to camera mode, so
         turning the camera cannot move a finger that is choosing a weapon, and
