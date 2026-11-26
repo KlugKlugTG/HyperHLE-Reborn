@@ -710,6 +710,13 @@ pub enum FingerId {
     /// overlay. The id is the marker's own id, which stays stable while the
     /// marker exists.
     BoundButton(u8),
+    /// A movement pad's swipe: [crate::button_bind::PAD_FINGER_BASE] plus the
+    /// pad and direction, so each of a pad's four directions is its own finger
+    /// and two of them can be down at once.
+    PadArm(u8),
+    /// The camera drag of the "Bind buttons" camera mode, which the right
+    /// stick drives across the screen.
+    LookCamera,
 }
 pub type Coords = (f32, f32);
 
@@ -1005,6 +1012,9 @@ pub struct Window {
     event_pump: sdl2::EventPump,
     event_queue: VecDeque<Event>,
     last_polled: Instant,
+    /// The time of the poll before it, which is the step the "Bind buttons"
+    /// camera integrates over.
+    last_poll_dt: f32,
     /// TEST HOOK: injected tap coordinates for the GD music-bypass autoplay
     /// test ( TOUCHHLE_GD_AUTOPLAY ), scheduled in popped-frame counts.
     auto_taps: Vec<(u64, f32, f32)>,
@@ -1450,6 +1460,7 @@ impl Window {
                 taps
             },
             last_polled: Instant::now() - Duration::from_secs(1),
+            last_poll_dt: 0.0,
             high_priority_event: None,
             enable_event_polling: true,
             #[cfg(target_os = "macos")]
@@ -1665,6 +1676,7 @@ impl Window {
         if now.duration_since(self.last_polled) < Duration::from_secs_f64(1.0 / 120.0) {
             return;
         }
+        self.last_poll_dt = now.duration_since(self.last_polled).as_secs_f32();
         self.last_polled = now;
 
         fn transform_input_coords(
@@ -1780,7 +1792,14 @@ impl Window {
                 bind_marker_window_coords(window, change.position),
                 false,
             );
-            (FingerId::BoundButton(change.marker), coords)
+            let finger = if change.marker >= crate::button_bind::LOOK_FINGER {
+                FingerId::LookCamera
+            } else if change.marker >= crate::button_bind::PAD_FINGER_BASE {
+                FingerId::PadArm(change.marker)
+            } else {
+                FingerId::BoundButton(change.marker)
+            };
+            (finger, coords)
         }
         fn transform_virt_accel_coords(window: &Window, (in_x, in_y): (i32, i32)) -> (f32, f32) {
             let coords = window.mouse_drawable_coords((in_x, in_y));
@@ -1817,6 +1836,9 @@ impl Window {
         let axis_inputs = self.bind_axis_inputs(options);
         let mut bind_edges =
             crate::button_bind::axis_edges(&mut self.bind_axis_tracker, axis_inputs);
+        // The pads are analogue: they take the sticks themselves, not edges.
+        let pad_changes =
+            crate::button_bind::pads_move(axis_inputs.sticks, self.last_poll_dt);
         let mut controller_updated = false;
         // event_pump doesn't have a method to peek on events
         // so, we keep track of an unconsumed one from a previous loop iteration
@@ -2516,6 +2538,19 @@ impl Window {
                     });
                 }
             }
+        }
+        // The movement pads' swipes.
+        for change in pad_changes {
+            let touch = bound_button_touch(self, change);
+            self.event_queue.push_back(match change.action {
+                crate::button_bind::MarkerAction::Down => {
+                    Event::TouchesDown(HashMap::from([touch]))
+                }
+                crate::button_bind::MarkerAction::Move => {
+                    Event::TouchesMove(HashMap::from([touch]))
+                }
+                crate::button_bind::MarkerAction::Up => Event::TouchesUp(HashMap::from([touch])),
+            });
         }
         // Marker touches the overlay still owes the guest: the Up of a
         // marker that went away while its button was held, and the Move of a

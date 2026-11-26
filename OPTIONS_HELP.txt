@@ -475,6 +475,29 @@ Other options:
         pushing it down-left presses both LeftStickLeft and LeftStickDown.
         A trigger counts as pressed once it is pulled past half-travel.
 
+        Two movement pads are always on the screen while this is enabled: a
+        circle at the bottom left, driven by the left stick, and a triangle at
+        the bottom right, driven by the right stick. Each of a pad's four
+        directions sends a touch: the finger starts on that direction's arrow
+        and slides towards the middle of the pad as the stick is pushed
+        further, which is the swipe most mobile games use for walking. The
+        two pads are independent, and pushing the stick diagonally presses
+        two directions at once, so the character walks diagonally. A pad
+        ignores its stick while any marker is bound to one of that stick's
+        directions, so the stick either walks or taps, never both.
+
+        Drag a pad to move it. Drag the small grip on its rim to change its
+        size. Pads and markers are saved together for the app in
+        HyperHLE_button_bindings.txt.
+
+        Camera buttons in the menu turn on camera mode: the right stick then
+        drags a finger across the middle of the screen instead of driving the
+        triangle pad, which is the look-around gesture most mobile games use.
+        Pushing the stick further drags faster. A long turn re-grabs from the
+        middle of the screen when the finger reaches the edge, so holding the
+        stick keeps the camera turning. The setting is saved with the app, and
+        walking with the left stick works at the same time.
+
     --no-bind-buttons
         Hide the "Bind buttons" overlay (the default).
 
