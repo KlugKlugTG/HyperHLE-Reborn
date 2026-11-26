@@ -475,20 +475,29 @@ Other options:
         pushing it down-left presses both LeftStickLeft and LeftStickDown.
         A trigger counts as pressed once it is pulled past half-travel.
 
-        Two movement pads are always on the screen while this is enabled: a
-        circle at the bottom left, driven by the left stick, and a triangle at
-        the bottom right, driven by the right stick. Each of a pad's four
-        directions sends a touch: the finger starts on that direction's arrow
-        and slides towards the middle of the pad as the stick is pushed
-        further, which is the swipe most mobile games use for walking. The
-        two pads are independent, and pushing the stick diagonally presses
-        two directions at once, so the character walks diagonally. A pad
-        ignores its stick while any marker is bound to one of that stick's
-        directions, so the stick either walks or taps, never both.
+        Two movement pads can be added from the same menu, and are off until
+        they are: "Circle: on/off" is a ring at the bottom left driven by the
+        left stick, and "Triangle: on/off" is a triangle at the bottom right
+        driven by the right stick. Removing a pad releases any finger it was
+        holding.
+
+        Each of a pad's four directions sends its own touch. The finger goes
+        down in the middle of the pad and is dragged outwards towards that
+        direction's arrow as the stick is pushed, so a light push is a short
+        drag and a full push reaches the rim: this is the analogue swipe that
+        mobile games which use a stick for walking expect. Letting go lifts the
+        finger where it got to. The two pads are independent, and pushing
+        diagonally presses two directions at once, so the character walks
+        diagonally. A pad ignores its stick while any marker is bound to one of
+        that stick's directions, so a stick either walks or taps, never both.
 
         Drag a pad to move it. Drag the small grip on its rim to change its
         size. Pads and markers are saved together for the app in
         HyperHLE_button_bindings.txt.
+
+        "Hide buttons" fades the markers and pads almost completely, so they
+        stop covering the game while still working. The overlay's own button
+        stays fully visible, so the setting can be undone.
 
         Camera buttons in the menu turn on camera mode: the right stick then
         drags a finger across the middle of the screen instead of driving the

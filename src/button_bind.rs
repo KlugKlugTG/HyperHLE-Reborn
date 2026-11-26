@@ -58,7 +58,7 @@ const MARKER_SIZE: f32 = 46.0;
 
 /// Where the pads sit by default: bottom-left and bottom-right, which is
 /// where thumbs already rest in a two-hands-on-a-pad game.
-const PAD_DEFAULT_CENTERS: [(f32, f32); PAD_COUNT] = [(0.18, 0.68), (0.82, 0.68)];
+const PAD_DEFAULT_CENTERS: [(f32, f32); PAD_COUNT] = [(0.20, 0.70), (0.80, 0.70)];
 /// Pad radius as a fraction of the shorter viewport side.
 const PAD_DEFAULT_RADIUS: f32 = 0.15;
 const PAD_MIN_RADIUS: f32 = 16.0;
@@ -88,6 +88,10 @@ const LOOK_MARGIN: f32 = 0.12;
 const LOOK_CENTRE: (f32, f32) = (0.5, 0.5);
 /// A look drag only counts while the stick is past this.
 const LOOK_DEADZONE: f32 = 0.15;
+
+/// How visible markers and pads are while "hide buttons" is on: faint enough
+/// to stop covering the game, strong enough to see where they are.
+const HIDDEN_ALPHA: f32 = 0.18;
 const PAD_COUNT: usize = 2;
 
 // Widget ids of the overlay chrome. Everything the overlay draws is also a
@@ -100,6 +104,9 @@ const W_ADD: u16 = 10;
 const W_CLEAR: u16 = 11;
 const W_CLOSE: u16 = 12;
 const W_LOOK: u16 = 13;
+const W_HIDE: u16 = 14;
+const W_ADD_CIRCLE: u16 = 15;
+const W_ADD_TRIANGLE: u16 = 16;
 /// Marker ids start here, so `W_MARKER_BASE + index` identifies a marker.
 const W_MARKER_BASE: u16 = 100;
 /// Pad ids start here: `W_PAD_BASE + index` is a pad's knob, plus `PAD_COUNT`
@@ -148,10 +155,11 @@ impl Marker {
 ///
 /// A pad is not a marker: markers inject a finger at a fixed spot, while a
 /// pad is a virtual analogue stick. The stick's position selects one of the
-/// four directions, and the pad's own knob is drawn under the thumb. The touch
-/// it sends starts at `point(Direction)` — the direction's arrow, on the rim —
-/// and is dragged towards `centre()` in steps, which is the gesture that
-/// most mobile games use for walking.
+/// four directions, and the pad's own knob is drawn under the thumb. Each
+/// direction's touch goes down at the centre of the pad and is dragged
+/// outwards towards that direction's arrow as the stick is pushed, in
+/// proportion to how far: a light push is a short drag, a full push reaches
+/// the rim. That is the analogue swipe most mobile games use for walking.
 #[derive(Clone, Copy, Debug)]
 struct Pad {
     /// Which stick drives this pad, and which glyph is drawn.
@@ -167,6 +175,9 @@ struct Pad {
     dir: [f32; 4],
     /// Whether a finger is down on each direction's touch right now.
     down: [bool; 4],
+    /// Whether the pad exists. Pads are added from the menu like markers, so
+    /// an app that does not need them keeps the screen clear.
+    enabled: bool,
 }
 
 impl Pad {
@@ -178,6 +189,7 @@ impl Pad {
             radius: PAD_DEFAULT_RADIUS,
             dir: [0.0; 4],
             down: [false; 4],
+            enabled: false,
         }
     }
 
@@ -283,6 +295,10 @@ struct Ui {
     /// Set when a gamepad press just bound a marker; [gamepad_button] logs
     /// it after dropping the lock.
     just_bound: Option<Button>,
+    /// "Hide buttons": draws markers and pads almost invisibly, so they stop
+    /// covering the game, while still working. The overlay's own button stays
+    /// fully visible so it can be undone.
+    hidden: bool,
 }
 
 impl Ui {
@@ -311,6 +327,7 @@ impl Ui {
             app_id: String::new(),
             next_id: 0,
             just_bound: None,
+            hidden: false,
         }
     }
 }
@@ -435,10 +452,10 @@ fn direction_pressed(value: f32, positive: bool) -> bool {
 /// individual button edges.
 ///
 /// Pulling a stick moves that pad's knob, and each direction that crosses
-/// [PAD_ACTIVATION] starts a touch at that direction's arrow on the rim; the
-/// finger then slides towards the centre as the stick goes further, which is
-/// the swipe most mobile games use for walking. Directions are independent,
-/// so a diagonal presses two of them at once.
+/// [PAD_ACTIVATION] starts a touch at the centre of the pad; the finger then
+/// slides outwards as the stick goes further, so how far it travels follows
+/// how hard the stick is pushed. Directions are independent, so a diagonal
+/// presses two of them at once.
 pub fn pads_move(sticks: [f32; 4], dt: f32) -> Vec<MarkerTouch> {
     let Ok(mut ui) = UI.lock() else {
         return Vec::new();
@@ -455,6 +472,9 @@ fn pads_move_inner(ui: &mut Ui, sticks: [f32; 4], dt: f32) -> Vec<MarkerTouch> {
     let mut changes = Vec::new();
     for kind in [PadKind::Circle, PadKind::Triangle] {
         let index = kind.pad();
+        if !ui.pads[index].enabled {
+            continue;
+        }
         // The right stick drives the camera when look mode is on, so the
         // triangle below it would be fighting the camera for the same stick.
         if index == 1 && ui.look {
@@ -553,7 +573,15 @@ fn apply_pad_directions(pad: &mut Pad, dir: [f32; 4], changes: &mut Vec<MarkerTo
             (true, false) => {
                 pad.dir[direction] = now;
                 pad.down[direction] = true;
-                changes.push(pad_touch(pad, direction, PadAction::Down));
+                // The finger goes down in the middle of the pad and is then
+                // dragged out to where the stick is, so the game sees a real
+                // swipe. Going down straight at the rim would show a finger
+                // appearing at the edge with no movement, which game
+                // walk-sticks read as "not walking".
+                changes.push(pad_touch_at(pad, direction, 0.0, PadAction::Down));
+                if now > MOVE_EPSILON {
+                    changes.push(pad_touch(pad, direction, PadAction::Move));
+                }
             }
             (true, true) => {
                 pad.dir[direction] = now;
@@ -564,9 +592,12 @@ fn apply_pad_directions(pad: &mut Pad, dir: [f32; 4], changes: &mut Vec<MarkerTo
                 }
             }
             (false, true) => {
+                // The Up has to be built before the push is cleared: it is
+                // where the finger actually got to, so the game sees one clean
+                // swipe outwards instead of a drag back to the middle.
+                changes.push(pad_touch(pad, direction, PadAction::Up));
                 pad.dir[direction] = 0.0;
                 pad.down[direction] = false;
-                changes.push(pad_touch(pad, direction, PadAction::Up));
             }
             (false, false) => {
                 pad.dir[direction] = 0.0;
@@ -581,13 +612,20 @@ fn apply_pad_directions(pad: &mut Pad, dir: [f32; 4], changes: &mut Vec<MarkerTo
 /// pad, so the gesture is a short swipe in the direction of movement. It keeps
 /// its finger id (`FingerId::PadArm`) across the whole push.
 fn pad_touch(pad: &Pad, direction: usize, action: PadAction) -> MarkerTouch {
+    pad_touch_at(pad, direction, pad.dir[direction], action)
+}
+
+/// [pad_touch] at an explicit push amount, so the initial downward touch can
+/// sit at the centre before the finger starts travelling.
+fn pad_touch_at(pad: &Pad, direction: usize, along: f32, action: PadAction) -> MarkerTouch {
     let centre = (pad.cx, pad.cy);
-    let along = pad.dir[direction].clamp(0.0, 1.0);
-    let position = match action {
-        // A releasing finger ends up at the centre, like a completed swipe.
-        PadAction::Up => centre,
-        PadAction::Down | PadAction::Move => lerp2(pad.point(direction), centre, along),
-    };
+    // The finger sits `along` of the way from the middle of the pad to that
+    // direction's arrow: a short push is a short drag just past the
+    // activation threshold, a full push reaches the rim. Lifting where the
+    // finger got to keeps the whole thing one clean swipe; jumping back to the
+    // centre first would be a second, backwards drag that walking controls
+    // read as a change of direction.
+    let position = lerp2(centre, pad.point(direction), along.clamp(0.0, 1.0));
     MarkerTouch {
         marker: PAD_FINGER_BASE + (pad.kind.pad() * 4 + direction) as u8,
         position,
@@ -690,6 +728,7 @@ pub fn init(enabled: bool, app_id: Option<&str>) {
     ];
     ui.pad_press_moved = false;
     ui.look = false;
+    ui.hidden = false;
     ui.look_touching = false;
     ui.look_at = LOOK_CENTRE;
     if let Some(app_id) = app_id {
@@ -697,9 +736,10 @@ pub fn init(enabled: bool, app_id: Option<&str>) {
         if enabled {
             let (markers, pads) = load_entry_in(&bindings_path(), app_id);
             ui.markers = markers;
-            if let Some((pads, look)) = pads {
+            if let Some((pads, look, hidden)) = pads {
                 ui.pads = pads;
                 ui.look = look;
+                ui.hidden = hidden;
             }
         }
     }
@@ -783,19 +823,20 @@ fn parse_markers(text: &str) -> Vec<Marker> {
 }
 
 /// `circle,x,y,radius;triangle,...`, the pads half of an app's line.
-fn format_pads(pads: &[Pad; PAD_COUNT], look: bool) -> String {
+fn format_pads(pads: &[Pad; PAD_COUNT], look: bool, hidden: bool) -> String {
     let mut text = pads
         .iter()
         .map(|pad| {
             format!(
-                "{},{:.3},{:.3},{:.3}",
+                "{},{:.3},{:.3},{:.3},{}",
                 match pad.kind {
                     PadKind::Circle => "circle",
                     PadKind::Triangle => "triangle",
                 },
                 pad.cx,
                 pad.cy,
-                pad.radius
+                pad.radius,
+                if pad.enabled { "on" } else { "off" }
             )
         })
         .collect::<Vec<_>>()
@@ -803,12 +844,15 @@ fn format_pads(pads: &[Pad; PAD_COUNT], look: bool) -> String {
     if look {
         text.push_str(";look");
     }
+    if hidden {
+        text.push_str(";hidden");
+    }
     text
 }
 
 /// The inverse of [`format_pads`]. A missing or malformed pad keeps its
 /// default, so files written before the pads existed still load.
-fn parse_pads(text: &str) -> Option<([Pad; PAD_COUNT], bool)> {
+fn parse_pads(text: &str) -> Option<([Pad; PAD_COUNT], bool, bool)> {
     let mut pads = [
         Pad::new(PadKind::Circle, PAD_DEFAULT_CENTERS[0].0, PAD_DEFAULT_CENTERS[0].1),
         Pad::new(
@@ -819,9 +863,15 @@ fn parse_pads(text: &str) -> Option<([Pad; PAD_COUNT], bool)> {
     ];
     let mut found = false;
     let mut look = false;
+    let mut hidden = false;
     for entry in text.split(';') {
         if entry.trim() == "look" {
             look = true;
+            found = true;
+            continue;
+        }
+        if entry.trim() == "hidden" {
+            hidden = true;
             found = true;
             continue;
         }
@@ -834,6 +884,7 @@ fn parse_pads(text: &str) -> Option<([Pad; PAD_COUNT], bool)> {
         ) else {
             continue;
         };
+        let state = fields.next().map(str::trim);
         let kind = match name.trim() {
             "circle" => PadKind::Circle,
             "triangle" => PadKind::Triangle,
@@ -853,9 +904,12 @@ fn parse_pads(text: &str) -> Option<([Pad; PAD_COUNT], bool)> {
         pad.cx = x.clamp(0.0, 1.0);
         pad.cy = y.clamp(0.0, 1.0);
         pad.radius = radius.clamp(0.02, 0.5);
+        // Files written before pads could be switched off have no state, and
+        // those were the builds where both pads were always on.
+        pad.enabled = state != Some("off");
         found = true;
     }
-    found.then_some((pads, look))
+    found.then_some((pads, look, hidden))
 }
 
 /// Everything saved for an app: its markers (empty for a file written before
@@ -863,7 +917,7 @@ fn parse_pads(text: &str) -> Option<([Pad; PAD_COUNT], bool)> {
 fn load_entry_in(
     path: &std::path::Path,
     app_id: &str,
-) -> (Vec<Marker>, Option<([Pad; PAD_COUNT], bool)>) {
+) -> (Vec<Marker>, Option<([Pad; PAD_COUNT], bool, bool)>) {
     if app_id.is_empty() {
         return (Vec::new(), None);
     }
@@ -918,16 +972,17 @@ fn save_to(ui: &Ui, path: &std::path::Path) {
     // The pads always exist, so an app's line is written as soon as either
     // half has been changed; otherwise the line goes away entirely.
     let pads_changed = ui.pads.iter().any(|pad| {
-        pad.cx != PAD_DEFAULT_CENTERS[pad.kind.pad()].0
+        pad.enabled
+            || pad.cx != PAD_DEFAULT_CENTERS[pad.kind.pad()].0
             || pad.cy != PAD_DEFAULT_CENTERS[pad.kind.pad()].1
             || pad.radius != PAD_DEFAULT_RADIUS
     });
-    if !ui.markers.is_empty() || pads_changed || ui.look {
+    if !ui.markers.is_empty() || pads_changed || ui.look || ui.hidden {
         contents.push_str(&ui.app_id);
         contents.push_str(": ");
         contents.push_str(&format_markers(&ui.markers));
         contents.push_str(" | ");
-        contents.push_str(&format_pads(&ui.pads, ui.look));
+        contents.push_str(&format_pads(&ui.pads, ui.look, ui.hidden));
         contents.push('\n');
     }
     if let Err(error) = std::fs::write(path, contents) {
@@ -948,6 +1003,23 @@ fn release_marker(ui: &mut Ui, index: usize) {
         position: (marker.x, marker.y),
         action: MarkerAction::Up,
     });
+}
+
+/// Adds or removes one of the movement pads. Removing a pad lifts any finger
+/// it was holding, so the game never sees a touch without its Up.
+fn toggle_pad(ui: &mut Ui, index: usize) {
+    let pad = &mut ui.pads[index];
+    pad.enabled = !pad.enabled;
+    if !pad.enabled {
+        for direction in 0..4 {
+            if std::mem::replace(&mut pad.down[direction], false) {
+                let touch = pad_touch_at(pad, direction, pad.dir[direction], PadAction::Up);
+                queue_change(touch);
+            }
+            pad.dir[direction] = 0.0;
+        }
+    }
+    save(ui);
 }
 
 fn add_marker(ui: &mut Ui) {
@@ -1109,30 +1181,45 @@ fn compute_layout(ui: &Ui, viewport: (u32, u32, u32, u32)) -> Layout {
         w: button_size,
         h: button_size,
     };
+    // The menu's rows, in the order they are drawn and hit-tested.
+    const MENU_ROWS: [u16; 7] = [
+        W_ADD,
+        W_ADD_CIRCLE,
+        W_ADD_TRIANGLE,
+        W_LOOK,
+        W_HIDE,
+        W_CLEAR,
+        W_CLOSE,
+    ];
     let menu = if ui.menu_open {
+        let ids = MENU_ROWS;
         let width = (vw - 12.0 * s).clamp(80.0, (240.0 * s).max(80.0));
         let x = (vw - width) / 2.0;
         let y = button.y + button.h + 6.0 * s;
         let header_h = 22.0 * s;
-        let row_h = 28.0 * s;
         let hint_h = 37.0 * s;
-        let height = header_h + row_h * 4.0 + hint_h + 6.0 * s;
-        let ids = [W_ADD, W_LOOK, W_CLEAR, W_CLOSE];
+        // Seven rows do not fit a short window, so the rows shrink rather
+        // than spill off the bottom of the screen. The menu is a menu for a
+        // gamepad overlay, not a document: every row has to stay reachable.
+        let available = (vh - y - 4.0 * s).max(0.0);
+        let row_h = ((available - header_h - hint_h - 6.0 * s) / ids.len() as f32)
+            .clamp(14.0 * s, 28.0 * s);
+        let height = header_h + row_h * ids.len() as f32 + hint_h + 6.0 * s;
         let mut rows = Vec::with_capacity(ids.len());
         for (index, id) in ids.iter().enumerate() {
             rows.push((
                 *id,
                 Rect {
                     x: x + 6.0 * s,
-                    y: y + header_h + index as f32 * row_h + 2.0 * s,
+                    y: y + header_h + index as f32 * row_h + 1.0 * s,
                     w: width - 12.0 * s,
-                    h: row_h - 4.0 * s,
+                    h: row_h - 2.0 * s,
                 },
             ));
         }
         let hint = Rect {
             x: x + 8.0 * s,
-            y: y + header_h + 4.0 * row_h + 2.0 * s,
+            y: y + header_h + ids.len() as f32 * row_h + 2.0 * s,
             w: width - 16.0 * s,
             h: hint_h,
         };
@@ -1167,6 +1254,9 @@ fn compute_layout(ui: &Ui, viewport: (u32, u32, u32, u32)) -> Layout {
         })
         .collect();
     let pads = ui.pads.map(|pad| {
+        if !pad.enabled {
+            return (0.0, 0.0, 0.0);
+        }
         let radius = pad.radius_px(viewport);
         // Keep the whole pad on screen even if the saved position would put
         // part of it outside (or the window got smaller since it was saved).
@@ -1256,8 +1346,15 @@ unsafe fn build_scene(
     // The pads: a ring for the circle, a triangle for the triangle, with the
     // knob under the thumb and the four arrows lit as the stick pushes.
     for (index, (px, py, radius)) in layout.pads.iter().enumerate() {
+        if *radius <= 0.0 {
+            continue;
+        }
         let pad = &ui.pads[index];
-        draw_pad(gles, &mut scene, pad, *px, *py, *radius);
+        if !pad.enabled {
+            continue;
+        }
+        let alpha = if ui.hidden { HIDDEN_ALPHA } else { 1.0 };
+        draw_pad(gles, &mut scene, pad, *px, *py, *radius, alpha);
     }
 
     for (index, rect) in &layout.markers {
@@ -1272,6 +1369,11 @@ unsafe fn build_scene(
             (COL_HELD, COL_HELD_BORDER)
         } else {
             (COL_MARKER, COL_MARKER_BORDER)
+        };
+        let (fill, border) = if ui.hidden {
+            (fade(fill, HIDDEN_ALPHA), fade(border, HIDDEN_ALPHA))
+        } else {
+            (fill, border)
         };
         scene.rect(rect.x, rect.y, rect.w, rect.h, border);
         let inset = (rect.w * 0.08).max(1.0);
@@ -1295,13 +1397,18 @@ unsafe fn build_scene(
             .min(rect.w / (label.chars().count() as f32 * 0.62).max(1.0));
         let label_size = label_size.max(1.0);
         let label_width = (label.chars().count() as f32) * label_size * 0.6;
+        let label_color = if ui.hidden {
+            fade(COL_TEXT, HIDDEN_ALPHA)
+        } else {
+            COL_TEXT
+        };
         scene.text(
             gles,
             &label,
             rect.x + (rect.w - label_width) / 2.0,
             rect.y + rect.h * 0.5 - label_size / 2.0,
             label_size,
-            COL_TEXT,
+            label_color,
         );
     }
     Some(scene)
@@ -1320,10 +1427,14 @@ unsafe fn draw_pad(
     px: f32,
     py: f32,
     radius: f32,
+    alpha: f32,
 ) {
+    let pad_col = fade(COL_PAD, alpha);
+    let knob_col = fade(COL_PAD_KNOB, alpha);
+    let knob_border = fade(COL_PAD_KNOB_BORDER, alpha);
     let dot = (radius * 0.055).max(1.5);
     let mut dot_at = |x: f32, y: f32| {
-        scene.rect(x - dot / 2.0, y - dot / 2.0, dot, dot, COL_PAD);
+        scene.rect(x - dot / 2.0, y - dot / 2.0, dot, dot, pad_col);
     };
 
     match pad.kind {
@@ -1359,9 +1470,9 @@ unsafe fn draw_pad(
         let (ax, ay) = (px + dx * radius * PAD_RIM, py + dy * radius * PAD_RIM);
         let pushed = pad.dir[direction].clamp(0.0, 1.0);
         let color = if pad.down[direction] {
-            COL_PAD_ARROW
+            fade(COL_PAD_ARROW, alpha)
         } else {
-            dim(COL_PAD_ARROW_IDLE, 1.0 - 0.35 * pushed)
+            fade(dim(COL_PAD_ARROW_IDLE, 1.0 - 0.35 * pushed), alpha)
         };
         // Centred on the rim point, by eye: the atlas has no bearings.
         let width = label_size * 0.6;
@@ -1385,23 +1496,23 @@ unsafe fn draw_pad(
         ky - knob / 2.0,
         knob,
         knob,
-        COL_PAD_KNOB_BORDER,
+        knob_border,
     );
     scene.rect(
         kx - knob / 2.0 + border,
         ky - knob / 2.0 + border,
         knob - 2.0 * border,
         knob - 2.0 * border,
-        COL_PAD_KNOB,
+        knob_col,
     );
     let handle = pad_handle_rect(pad, px, py, radius);
-    scene.rect(handle.x, handle.y, handle.w, handle.h, COL_PAD_KNOB_BORDER);
+    scene.rect(handle.x, handle.y, handle.w, handle.h, knob_border);
     // Two dots in the corner read as a "grab here and pull" grip.
     let dot = ((handle.w * 0.18).max(1.5)).min(handle.w / 3.0);
     let step = (handle.w - 2.0 * dot) / 3.0;
     for i in 0..2 {
         let at = dot + step * i as f32;
-        scene.rect(handle.x + at, handle.y + at, dot, dot, COL_PAD_KNOB);
+        scene.rect(handle.x + at, handle.y + at, dot, dot, knob_col);
     }
 }
 
@@ -1429,6 +1540,11 @@ fn normalize_push(x: f32, y: f32) -> (f32, f32) {
 
 fn dim(color: (f32, f32, f32, f32), factor: f32) -> (f32, f32, f32, f32) {
     (color.0 * factor, color.1 * factor, color.2 * factor, color.3)
+}
+
+/// Multiplies a colour's alpha, for "hide buttons".
+fn fade(color: (f32, f32, f32, f32), alpha: f32) -> (f32, f32, f32, f32) {
+    (color.0, color.1, color.2, color.3 * alpha)
 }
 
 /// Draws the overlay on a fixed-function (GLES 1.x) present path.
@@ -1703,6 +1819,25 @@ fn touch_up_inner_abs(ui: &mut Ui, abs: (f32, f32), viewport: (u32, u32, u32, u3
         W_ADD => {
             if hit {
                 add_marker(ui);
+            }
+        }
+        W_ADD_CIRCLE => {
+            if hit {
+                toggle_pad(ui, 0);
+            }
+        }
+        W_ADD_TRIANGLE => {
+            if hit {
+                toggle_pad(ui, 1);
+            }
+        }
+        W_HIDE => {
+            if hit {
+                // The overlay's own button stays visible: without it there
+                // would be no way to bring anything back.
+                ui.hidden = !ui.hidden;
+                ui.menu_open = false;
+                save(ui);
             }
         }
         W_CLEAR => {
@@ -2128,9 +2263,13 @@ mod tests {
 
     // ---- movement pads ----
 
+    /// An overlay with both movement pads added, which is what the pad tests
+    /// need; `Ui::new()` starts with neither, like a fresh app.
     fn pads_ui() -> Ui {
         let mut ui = Ui::new();
         ui.enabled = true;
+        ui.pads[0].enabled = true;
+        ui.pads[1].enabled = true;
         ui
     }
 
@@ -2163,13 +2302,18 @@ mod tests {
         let mut ui = pads_ui();
         // Push only the right stick.
         let changes = push_sticks(&mut ui, [0.0, 0.0, 1.0, 0.0]);
-        assert_eq!(changes.len(), 1);
+        // A press goes down in the middle and then travels out, so the game
+        // sees a swipe rather than a finger appearing on the rim.
         assert_eq!(changes[0].action, MarkerAction::Down);
+        assert_eq!(changes[1].action, MarkerAction::Move);
+        assert!(changes[1].position.0 > changes[0].position.0);
         // The triangle's right arrow, not the circle's.
         let pad = pad_of(&ui, PadKind::Triangle);
         assert!(pad.dir[3] > 0.0);
         assert_eq!(pad_of(&ui, PadKind::Circle).dir, [0.0; 4]);
-        assert_eq!(changes[0].marker, PAD_FINGER_BASE + 4 + 3);
+        for change in &changes {
+            assert_eq!(change.marker, PAD_FINGER_BASE + 4 + 3);
+        }
     }
 
     #[test]
@@ -2179,17 +2323,24 @@ mod tests {
         let changes = push_sticks(&mut ui, [-1.0, 1.0, 0.0, 0.0]);
         let downs: Vec<_> = changes
             .iter()
+            .filter(|change| change.action == MarkerAction::Down)
             .map(|change| change.marker - PAD_FINGER_BASE)
             .collect();
         assert_eq!(downs, vec![1, 2]);
+        // Both directions also travelled outwards, each along its own axis.
+        let moves: Vec<_> = changes
+            .iter()
+            .filter(|change| change.action == MarkerAction::Move)
+            .map(|change| change.marker - PAD_FINGER_BASE)
+            .collect();
+        assert_eq!(moves, vec![1, 2]);
         let circle = pad_of(&ui, PadKind::Circle);
         assert!(circle.down[1] && circle.down[2]);
         assert!(!circle.down[0] && !circle.down[3]);
         // Holding it still sends nothing new...
         assert!(push_sticks(&mut ui, [-1.0, 1.0, 0.0, 0.0]).is_empty());
         // ...and centring releases exactly the two that were down.
-        let ups = push_sticks(&mut ui, [0.0, 0.0, 0.0, 0.0]);
-        let ups: Vec<_> = ups
+        let ups: Vec<_> = push_sticks(&mut ui, [0.0, 0.0, 0.0, 0.0])
             .iter()
             .map(|change| (change.marker - PAD_FINGER_BASE, change.action))
             .collect();
@@ -2209,40 +2360,59 @@ mod tests {
     }
 
     #[test]
-    fn a_touch_starts_on_the_rim_and_walks_to_the_centre() {
+    fn a_pad_touch_starts_in_the_middle_and_travels_outwards() {
         let mut ui = pads_ui();
         let circle = pad_of(&ui, PadKind::Circle);
         let rim = circle.point(3);
+        // A full push: the finger goes down at the centre and ends on the rim.
         let changes = push_sticks(&mut ui, [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(changes[0].action, MarkerAction::Down);
-        // Fully pushed: the finger is at the centre, i.e. a full swipe.
         assert!((changes[0].position.0 - circle.cx).abs() < 1e-6);
         assert!((changes[0].position.1 - circle.cy).abs() < 1e-6);
-        // A partial push walks part of the way from the rim to the centre,
-        // and further push walks further.
+        // Half a push: the finger goes down in the middle and is dragged
+        // half way out.
         let mut ui = pads_ui();
         let half = PAD_ACTIVATION + (1.0 - PAD_ACTIVATION) * 0.5;
         let changes = push_sticks(&mut ui, [half, 0.0, 0.0, 0.0]);
-        let expected = (
-            (rim.0 + circle.cx) / 2.0,
-            (rim.1 + circle.cy) / 2.0,
-        );
-        assert!((changes[0].position.0 - expected.0).abs() < 1e-5);
-        assert!((changes[0].position.1 - expected.1).abs() < 1e-5);
-        // Just past the threshold it is still near the rim, so the swipe is
-        // short for a light push.
+        assert_eq!(changes[0].action, MarkerAction::Down);
+        assert!((changes[0].position.0 - circle.cx).abs() < 1e-6);
+        let expected = ((circle.cx + rim.0) / 2.0, (circle.cy + rim.1) / 2.0);
+        let moved = changes
+            .iter()
+            .find(|change| change.action == MarkerAction::Move)
+            .expect("the finger travelled");
+        assert!((moved.position.0 - expected.0).abs() < 1e-5);
+        assert!((moved.position.1 - expected.1).abs() < 1e-5);
+        // A light push: a short drag, so the finger barely leaves the middle.
         let mut ui = pads_ui();
         let light = PAD_ACTIVATION + (1.0 - PAD_ACTIVATION) * 0.1;
         let changes = push_sticks(&mut ui, [light, 0.0, 0.0, 0.0]);
-        let from_rim = (changes[0].position.0 - rim.0).abs();
-        let to_centre = (circle.cx - rim.0).abs();
-        assert!(from_rim < to_centre * 0.2);
+        let travelled = changes
+            .iter()
+            .map(|change| (change.position.0 - circle.cx).abs())
+            .fold(0.0f32, f32::max);
+        let full = (rim.0 - circle.cx).abs();
+        assert!(travelled < full * 0.2, "a light push is a short drag");
+        // Releasing lifts the finger where it got to, at either strength, so
+        // the game sees one clean swipe and not a drag back to the middle.
+        let releases = push_sticks(&mut ui, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(releases[0].action, MarkerAction::Up);
+        let last = changes.last().unwrap();
+        assert!((releases[0].position.0 - last.position.0).abs() < 1e-6);
+        // And the same for a full push, which ends on the rim.
+        let mut ui = pads_ui();
+        let changes = push_sticks(&mut ui, [1.0, 0.0, 0.0, 0.0]);
+        assert!((changes.last().unwrap().position.0 - rim.0).abs() < 1e-5);
+        let releases = push_sticks(&mut ui, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(releases[0].action, MarkerAction::Up);
+        assert!((releases[0].position.0 - rim.0).abs() < 1e-5);
     }
 
     #[test]
     fn a_partial_push_sends_a_move_as_the_stick_goes_further() {
         let mut ui = pads_ui();
-        push_sticks(&mut ui, [PAD_ACTIVATION * 1.2, 0.0, 0.0, 0.0]);
+        let light = PAD_ACTIVATION + (1.0 - PAD_ACTIVATION) * 0.2;
+        push_sticks(&mut ui, [light, 0.0, 0.0, 0.0]);
         let first = pad_of(&ui, PadKind::Circle).dir[3];
         let changes = push_sticks(&mut ui, [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(changes.len(), 1);
@@ -2346,8 +2516,9 @@ mod tests {
         ui.markers.push(Marker::new(0, 0.5, 0.4));
         save_to(&ui, &path);
         let (markers, pads) = load_entry_in(&path, "com.test.pads");
-        let (pads, look) = pads.expect("the file has the pads section");
+        let (pads, look, hidden) = pads.expect("the file has the pads section");
         assert!(!look);
+        assert!(!hidden);
         assert_eq!(markers.len(), 1);
         assert!((pads[0].radius - 0.22).abs() < 0.001);
         assert!((pads[1].cx - 0.70).abs() < 0.001);
@@ -2453,8 +2624,116 @@ mod tests {
         ui.look = true;
         save_to(&ui, &path);
         let (_, pads) = load_entry_in(&path, "com.test.look");
-        let (_, look) = pads.expect("the file has an entry");
+        let (_, look, _) = pads.expect("the file has an entry");
         assert!(look);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pads_are_added_from_the_menu_like_markers() {
+        let mut ui = Ui::new();
+        ui.enabled = true;
+        // A fresh app has no pads on screen at all.
+        assert!(!ui.pads[0].enabled && !ui.pads[1].enabled);
+        let layout = compute_layout(&ui, VIEWPORT);
+        assert_eq!(layout.pads[0].2, 0.0);
+        assert_eq!(layout.pads[1].2, 0.0);
+        // A tap on where a pad would be goes to the game, not to a pad.
+        assert!(!touch_down_inner_abs(&mut ui, (96.0, 224.0), VIEWPORT));
+        // The menu adds them.
+        ui.menu_open = true;
+        let layout = compute_layout(&ui, VIEWPORT);
+        let menu = layout.menu.unwrap();
+        let row = |id: u16| {
+            let (_, rect) = menu.rows.iter().find(|(row_id, _)| *row_id == id).unwrap();
+            (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0)
+        };
+        let at = row(W_ADD_CIRCLE);
+        tap(&mut ui, at, VIEWPORT);
+        assert!(ui.pads[0].enabled && !ui.pads[1].enabled);
+        assert!(compute_layout(&ui, VIEWPORT).pads[0].2 > 0.0);
+        // And takes them away again.
+        ui.menu_open = true;
+        let layout = compute_layout(&ui, VIEWPORT);
+        let menu = layout.menu.unwrap();
+        let at = {
+            let (_, rect) = menu.rows.iter().find(|(row_id, _)| *row_id == W_ADD_CIRCLE).unwrap();
+            (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0)
+        };
+        tap(&mut ui, at, VIEWPORT);
+        assert!(!ui.pads[0].enabled);
+    }
+
+    #[test]
+    fn removing_a_pad_lifts_the_fingers_it_was_holding() {
+        let mut ui = pads_ui();
+        push_sticks(&mut ui, [-1.0, 1.0, 0.0, 0.0]);
+        assert!(pad_of(&ui, PadKind::Circle).down[1] && pad_of(&ui, PadKind::Circle).down[2]);
+        toggle_pad(&mut ui, 0);
+        assert!(!ui.pads[0].enabled);
+        let mut ups = 0;
+        while let Some(change) = take_pending_change() {
+            if change.action == MarkerAction::Up {
+                ups += 1;
+            }
+        }
+        assert_eq!(ups, 2, "both held directions are released");
+    }
+
+    #[test]
+    fn hidden_buttons_still_work() {
+        let mut ui = pads_ui();
+        ui.hidden = true;
+        // A hidden pad's stick still sends its swipe...
+        let changes = push_sticks(&mut ui, [-1.0, 0.0, 0.0, 0.0]);
+        assert!(changes.iter().any(|change| change.action == MarkerAction::Down));
+        // ...and its marker can still be tapped and dragged.
+        let mut marker = Marker::new(0, 0.5, 0.5);
+        marker.button = Some(Button::X);
+        ui.markers.push(marker);
+        assert!(touch_down_inner_abs(&mut ui, (240.0, 160.0), VIEWPORT));
+        assert!(touch_up_inner_abs(&mut ui, (240.0, 160.0), VIEWPORT));
+        assert_eq!(ui.bind_target, Some(0));
+    }
+
+    #[test]
+    fn the_hide_row_toggles_and_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("hyperhle-hide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = bindings_path_in(&dir);
+        let mut ui = pads_ui();
+        ui.app_id = "com.test.hide".to_string();
+        ui.menu_open = true;
+        let layout = compute_layout(&ui, VIEWPORT);
+        let menu = layout.menu.unwrap();
+        let (_, rect) = menu.rows.iter().find(|(id, _)| *id == W_HIDE).unwrap();
+        let at = (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
+        tap(&mut ui, at, VIEWPORT);
+        assert!(ui.hidden);
+        assert!(!ui.menu_open);
+        save_to(&ui, &path);
+        let (_, pads) = load_entry_in(&path, "com.test.hide");
+        let (_, _, hidden) = pads.expect("the app has state");
+        assert!(hidden);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_app_has_no_pads_and_says_so_in_the_file() {
+        let dir = std::env::temp_dir().join(format!("hyperhle-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = bindings_path_in(&dir);
+        let mut ui = Ui::new();
+        ui.app_id = "com.test.fresh".to_string();
+        save_to(&ui, &path);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("com.test.fresh"), "nothing changed, no line");
+        ui.pads[0].enabled = true;
+        save_to(&ui, &path);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("circle,") && saved.contains(",on"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
