@@ -51,7 +51,7 @@ const MAX_MARKERS: usize = 32;
 /// difference between a drag that starts at the rim and one that starts in
 /// the middle is invisible in a screenshot but decides whether walking works,
 /// so "is this the build with the fix" has to be answerable without guessing.
-const OVERLAY_REVISION: &str = "PADS R3";
+const OVERLAY_REVISION: &str = "PADS R4";
 /// Distance, in unscaled pixels, a press has to travel before it counts as a
 /// drag rather than a tap.
 const DRAG_THRESHOLD: f32 = 10.0;
@@ -80,6 +80,11 @@ const RESIZE_THRESHOLD: f32 = 6.0;
 const PAD_ACTIVATION: f32 = 0.18;
 /// A push has to change by this much before the game is sent another Move.
 const MOVE_EPSILON: f32 = 0.02;
+/// How long the stick has to stay at rest before the pad lifts its finger.
+/// Sweeping from forward to backward goes through the middle, and a real
+/// thumb never leaves the glass doing that; lifting the finger there makes the
+/// game stop the character until the stick is released.
+const PAD_RELEASE_DELAY: f32 = 0.12;
 
 // Camera ("look") mode.
 /// How fast a fully pushed right stick drags the look finger, in fractions of
@@ -157,16 +162,16 @@ impl Marker {
     }
 }
 
-/// One of the two movement pads: a circle or a cross whose four
-/// directions are driven by a stick, and which sends a touch to the game.
+/// One of the two movement pads: a circle or a cross driven by a stick, which
+/// sends one analogue touch to the game.
 ///
-/// A pad is not a marker: markers inject a finger at a fixed spot, while a
-/// pad is a virtual analogue stick. The stick's position selects one of the
-/// four directions, and the pad's own knob is drawn under the thumb. Each
-/// direction's touch goes down at the centre of the pad and is dragged
-/// outwards towards that direction's arrow as the stick is pushed, in
-/// proportion to how far: a light push is a short drag, a full push reaches
-/// the rim. That is the analogue swipe most mobile games use for walking.
+/// A pad is not a marker: markers inject a finger at a fixed spot, while a pad
+/// is a virtual analogue stick. The finger goes down in the middle of the pad
+/// and is dragged in the direction the stick is pushed, as far as it is
+/// pushed: a light push is a short drag, a full push reaches the rim. Because
+/// there is exactly one finger for the whole pad, it can slide from up to
+/// down-left without ever being lifted, which is what a game's own stick does
+/// and what walking needs.
 #[derive(Clone, Copy, Debug)]
 struct Pad {
     /// Which stick drives this pad, and which glyph is drawn.
@@ -178,10 +183,19 @@ struct Pad {
     cy: f32,
     /// The radius, as a fraction of the shorter viewport side.
     radius: f32,
-    /// How far each of the four directions is pushed, after [PAD_ACTIVATION].
-    dir: [f32; 4],
-    /// Whether a finger is down on each direction's touch right now.
-    down: [bool; 4],
+    /// The stick's push, -1..1 on each axis, with the inner threshold applied.
+    /// X is right-positive, Y is down-positive, like the touch screen.
+    axis: (f32, f32),
+    /// How far the stick is pushed in total, 0..1: the length of `axis`,
+    /// clamped, since a square stick can push past the diagonal. This is how
+    /// far the finger is dragged from the middle of the pad.
+    push: f32,
+    /// Whether the pad's finger is down right now.
+    touching: bool,
+    /// How long the stick has been back at rest. The finger is only lifted
+    /// once this passes [PAD_RELEASE_DELAY], so sweeping the stick through the
+    /// middle to reverse direction does not count as letting go.
+    rest: f32,
     /// Whether the pad exists. Pads are added from the menu like markers, so
     /// an app that does not need them keeps the screen clear.
     enabled: bool,
@@ -199,8 +213,10 @@ impl Pad {
             cx,
             cy,
             radius: PAD_DEFAULT_RADIUS,
-            dir: [0.0; 4],
-            down: [false; 4],
+            axis: (0.0, 0.0),
+            push: 0.0,
+            touching: false,
+            rest: 0.0,
             enabled: false,
             reach: 1.0,
         }
@@ -217,6 +233,17 @@ impl Pad {
     fn point(self, direction: usize) -> (f32, f32) {
         let (dx, dy) = PAD_DIRECTIONS[direction];
         (self.cx + dx * self.radius * PAD_RIM, self.cy + dy * self.radius * PAD_RIM)
+    }
+
+    /// The finger's position for the current push. The direction is the
+    /// stick's own, so diagonals and every angle in between work.
+    fn finger(self) -> (f32, f32) {
+        let (x, y) = normalize_push(self.axis.0, self.axis.1);
+        let reach = self.push.clamp(0.0, 1.0) * self.reach.clamp(0.0, 1.0);
+        (
+            self.cx + x * reach * self.radius * PAD_RIM,
+            self.cy + y * reach * self.radius * PAD_RIM,
+        )
     }
 }
 
@@ -392,21 +419,26 @@ impl Default for AxisInputs {
 ///
 /// A direction only leaves 0 once the stick is past [PAD_ACTIVATION], and
 /// reaches 1.0 when the stick is fully pushed.
-fn stick_directions(sticks: [f32; 4], stick: usize) -> [f32; 4] {
+fn stick_axis(sticks: [f32; 4], stick: usize) -> ((f32, f32), f32) {
     let x = sticks[stick * 2];
     let y = sticks[stick * 2 + 1];
-    // Below the threshold the direction is idle; above it the push rises
-    // from 0 to 1, so a wobbly thumb can never make the character creep.
-    let amount = |value: f32, positive: bool| {
-        let amount = if positive { value } else { -value };
-        ((amount - PAD_ACTIVATION) / (1.0 - PAD_ACTIVATION)).clamp(0.0, 1.0)
-    };
-    [
-        amount(y, false),
-        amount(y, true),
-        amount(x, false),
-        amount(x, true),
-    ]
+    // The deadzone is applied to the whole vector, not to each axis, so a
+    // diagonal push is not tilted towards whichever axis happens to clear
+    // the threshold first. The stick's angle is kept exactly as it is.
+    let (nx, ny) = normalize_to_threshold(x, y, PAD_ACTIVATION);
+    let push = (nx.hypot(ny)).min(1.0);
+    ((nx, ny), push)
+}
+
+/// Applies a radial deadzone: the vector keeps its direction, and its length
+/// goes from 0 at `threshold` to 1 at full push, never past 1.
+fn normalize_to_threshold(x: f32, y: f32, threshold: f32) -> (f32, f32) {
+    let length = x.hypot(y);
+    if length <= threshold || length <= f32::EPSILON {
+        return (0.0, 0.0);
+    }
+    let scale = ((length - threshold) / (1.0 - threshold)).min(1.0) / length;
+    (x * scale, y * scale)
 }
 
 /// Turns a sequence of [AxisInputs] samples into button edges.
@@ -492,7 +524,9 @@ fn pads_move_inner(ui: &mut Ui, sticks: [f32; 4], dt: f32) -> Vec<MarkerTouch> {
         // cross below it would be fighting the camera for the same stick.
         if index == 1 && ui.look {
             // The cross still shows where the stick is, but sends nothing.
-            ui.pads[index].dir = stick_directions(sticks, kind.stick());
+            let (axis, push) = stick_axis(sticks, kind.stick());
+            ui.pads[index].axis = axis;
+            ui.pads[index].push = push;
             continue;
         }
         // A stick either walks or presses markers, not both: if the player
@@ -503,14 +537,15 @@ fn pads_move_inner(ui: &mut Ui, sticks: [f32; 4], dt: f32) -> Vec<MarkerTouch> {
                 .button
                 .is_some_and(|button| PAD_DIRECTION_BUTTONS[index].contains(&button))
         });
+        let (axis, push) = stick_axis(sticks, kind.stick());
         if taken {
             // Keep the knob and arrows showing where the stick is, but send
             // nothing: the stick belongs to the markers.
-            ui.pads[index].dir = stick_directions(sticks, kind.stick());
+            ui.pads[index].axis = axis;
+            ui.pads[index].push = push;
             continue;
         }
-        let dir = stick_directions(sticks, kind.stick());
-        apply_pad_directions(&mut ui.pads[index], dir, &mut changes);
+        apply_pad_push(&mut ui.pads[index], axis, push, dt, &mut changes);
     }
     look_move(ui, sticks, dt, &mut changes);
     changes
@@ -577,72 +612,86 @@ pub const LOOK_FINGER: u8 = 128;
 
 /// One pad's worth of a stick sample: starts, moves and ends the touches of
 /// the directions that changed.
-fn apply_pad_directions(pad: &mut Pad, dir: [f32; 4], changes: &mut Vec<MarkerTouch>) {
-    for direction in 0..4 {
-        let was = pad.dir[direction];
-        let now = dir[direction];
-        let pushed = now > 0.0;
-        match (pushed, pad.down[direction]) {
-            (true, false) => {
-                pad.dir[direction] = now;
-                pad.down[direction] = true;
-                // The finger goes down in the middle of the pad and is then
-                // dragged out to where the stick is, so the game sees a real
-                // swipe. Going down straight at the rim would show a finger
-                // appearing at the edge with no movement, which game
-                // walk-sticks read as "not walking".
-                changes.push(pad_touch_at(pad, direction, 0.0, PadAction::Down));
-                if now > MOVE_EPSILON {
-                    changes.push(pad_touch(pad, direction, PadAction::Move));
-                }
-            }
-            (true, true) => {
-                pad.dir[direction] = now;
-                // Only tell the game when the finger actually moved: a stick
-                // held still would otherwise queue a Move on every poll.
-                if (now - was).abs() > MOVE_EPSILON {
-                    changes.push(pad_touch(pad, direction, PadAction::Move));
-                }
-            }
-            (false, true) => {
-                // The Up has to be built before the push is cleared: it is
-                // where the finger actually got to, so the game sees one clean
-                // swipe outwards instead of a drag back to the middle.
-                changes.push(pad_touch(pad, direction, PadAction::Up));
-                pad.dir[direction] = 0.0;
-                pad.down[direction] = false;
-            }
-            (false, false) => {
-                pad.dir[direction] = 0.0;
+/// One pad's worth of a stick sample: drives its single finger.
+///
+/// The finger goes down in the middle of the pad with the first push, slides
+/// wherever the stick points while it is held, and lifts when the stick comes
+/// back inside the threshold. Because it is one finger, turning from forward to
+/// left, or reversing from forward to back, is an ordinary move: the game never
+/// has to notice a second finger, which is what made walking jittery when each
+/// direction had its own.
+fn apply_pad_push(
+    pad: &mut Pad,
+    axis: (f32, f32),
+    push: f32,
+    dt: f32,
+    changes: &mut Vec<MarkerTouch>,
+) {
+    let was = (pad.axis, pad.push);
+    // A copy from before this sample, for the Up: the finger has to lift where
+    // it actually got to, not where the released stick now says it is.
+    let before = *pad;
+    pad.axis = axis;
+    pad.push = push;
+    if push <= 0.0 {
+        pad.rest += dt.clamp(0.0, 0.1);
+    } else {
+        pad.rest = 0.0;
+    }
+    // The finger stays down through a moment of rest, so reversing the stick
+    // is a Move and not a release followed by a new touch. While it rests it
+    // also stays where it is: sliding it back to the middle would be the
+    // backwards drag that walking controls read as a direction change.
+    let resting = push <= 0.0 && pad.touching && pad.rest < PAD_RELEASE_DELAY;
+    if resting {
+        pad.axis = before.axis;
+        pad.push = before.push;
+    }
+    let pushed = push > 0.0 || resting;
+    match (pushed, pad.touching) {
+        (true, false) => {
+            pad.touching = true;
+            // Down at the middle, then out to the stick's position, so the
+            // game sees a real swipe rather than a finger appearing at the
+            // rim with no movement.
+            let mut start = *pad;
+            start.push = 0.0;
+            changes.push(pad_touch(&start, PadAction::Down));
+            if push > MOVE_EPSILON {
+                changes.push(pad_touch(pad, PadAction::Move));
             }
         }
+        (true, true) => {
+            // Only tell the game when the finger actually moved: a stick held
+            // still, or resting inside the grace period, would otherwise queue
+            // a Move on every poll.
+            if !resting {
+                let moved = (axis.0 - was.0 .0).abs()
+                    + (axis.1 - was.0 .1).abs()
+                    + (push - was.1).abs();
+                if moved > MOVE_EPSILON {
+                    changes.push(pad_touch(pad, PadAction::Move));
+                }
+            }
+        }
+        (false, true) => {
+            // The Up is where the finger got to: lifting it back at the middle
+            // would be a backwards drag the game reads as a direction change.
+            changes.push(pad_touch(&before, PadAction::Up));
+            pad.touching = false;
+            pad.axis = (0.0, 0.0);
+            pad.push = 0.0;
+            pad.rest = 0.0;
+        }
+        (false, false) => {}
     }
 }
 
-/// The touch for one direction of a pad, at its current push.
-///
-/// The finger starts on the arrow on the rim and walks to the centre of the
-/// pad, so the gesture is a short swipe in the direction of movement. It keeps
-/// its finger id (`FingerId::PadArm`) across the whole push.
-fn pad_touch(pad: &Pad, direction: usize, action: PadAction) -> MarkerTouch {
-    pad_touch_at(pad, direction, pad.dir[direction], action)
-}
-
-/// [pad_touch] at an explicit push amount, so the initial downward touch can
-/// sit at the centre before the finger starts travelling.
-fn pad_touch_at(pad: &Pad, direction: usize, along: f32, action: PadAction) -> MarkerTouch {
-    let centre = (pad.cx, pad.cy);
-    // The finger sits `along` of the way from the middle of the pad to that
-    // direction's arrow: a short push is a short drag just past the
-    // activation threshold, a full push reaches the rim. Lifting where the
-    // finger got to keeps the whole thing one clean swipe; jumping back to the
-    // centre first would be a second, backwards drag that walking controls
-    // read as a change of direction.
-    let travel = (along.clamp(0.0, 1.0) * pad.reach).clamp(0.0, 1.0);
-    let position = lerp2(centre, pad.point(direction), travel);
+/// The pad's touch, at its current push.
+fn pad_touch(pad: &Pad, action: PadAction) -> MarkerTouch {
     MarkerTouch {
-        marker: PAD_FINGER_BASE + (pad.kind.pad() * 4 + direction) as u8,
-        position,
+        marker: PAD_FINGER_BASE + pad.kind.pad() as u8,
+        position: pad.finger(),
         action: match action {
             PadAction::Down => MarkerAction::Down,
             PadAction::Move => MarkerAction::Move,
@@ -1051,13 +1100,11 @@ fn toggle_pad(ui: &mut Ui, index: usize) {
     let pad = &mut ui.pads[index];
     pad.enabled = !pad.enabled;
     if !pad.enabled {
-        for direction in 0..4 {
-            if std::mem::replace(&mut pad.down[direction], false) {
-                let touch = pad_touch_at(pad, direction, pad.dir[direction], PadAction::Up);
-                queue_change(touch);
-            }
-            pad.dir[direction] = 0.0;
+        if std::mem::replace(&mut pad.touching, false) {
+            queue_change(pad_touch(pad, PadAction::Up));
         }
+        pad.axis = (0.0, 0.0);
+        pad.push = 0.0;
     }
     save(ui);
 }
@@ -1512,11 +1559,14 @@ unsafe fn draw_pad(
     for (direction, text) in ["^", "v", "<", ">"].iter().enumerate() {
         let (dx, dy) = PAD_DIRECTIONS[direction];
         let (ax, ay) = (px + dx * radius * PAD_RIM, py + dy * radius * PAD_RIM);
-        let pushed = pad.dir[direction].clamp(0.0, 1.0);
-        let color = if pad.down[direction] {
+        // An arrow lights up as the stick leans towards it, so a diagonal
+        // lights two.
+        let (dx, dy) = PAD_DIRECTIONS[direction];
+        let lean = (dx * pad.axis.0 + dy * pad.axis.1).max(0.0) * pad.push;
+        let color = if pad.touching && lean > 0.05 {
             fade(COL_PAD_ARROW, alpha)
         } else {
-            fade(dim(COL_PAD_ARROW_IDLE, 1.0 - 0.35 * pushed), alpha)
+            fade(dim(COL_PAD_ARROW_IDLE, 1.0 - 0.35 * lean), alpha)
         };
         // Centred on the rim point, by eye: the atlas has no bearings.
         let width = label_size * 0.6;
@@ -1592,13 +1642,9 @@ fn pad_outline(kind: PadKind, px: f32, py: f32, radius: f32) -> Vec<(f32, f32)> 
 /// The knob's centre in viewport pixels: the stick's push, limited to the
 /// pad's travel.
 fn knob_position(pad: &Pad, px: f32, py: f32, radius: f32) -> (f32, f32) {
-    let right = pad.dir[3] - pad.dir[2];
-    let down = pad.dir[1] - pad.dir[0];
-    let (x, y) = normalize_push(right, down);
-    (
-        px + x * radius * KNOB_TRAVEL,
-        py + y * radius * KNOB_TRAVEL,
-    )
+    let (x, y) = normalize_push(pad.axis.0, pad.axis.1);
+    let travel = pad.push.clamp(0.0, 1.0) * KNOB_TRAVEL;
+    (px + x * travel * radius, py + y * travel * radius)
 }
 
 /// Scales a push so it never leaves the unit circle, keeping its direction.
@@ -2371,6 +2417,18 @@ mod tests {
         pads_move_inner(ui, sticks, dt)
     }
 
+    /// Centres the stick and runs out the release grace period, collecting
+    /// every change on the way, so the finger really does lift.
+    fn release_sticks(ui: &mut Ui) -> Vec<MarkerTouch> {
+        let mut changes = Vec::new();
+        // Several short samples, like real polls, until the grace period is
+        // comfortably past.
+        for _ in 0..6 {
+            changes.extend(push_sticks_dt(ui, [0.0; 4], PAD_RELEASE_DELAY * 0.5));
+        }
+        changes
+    }
+
     #[test]
     fn the_pads_start_bottom_left_and_bottom_right() {
         let ui = Ui::new();
@@ -2421,47 +2479,121 @@ mod tests {
         assert_eq!(changes[0].action, MarkerAction::Down);
         assert_eq!(changes[1].action, MarkerAction::Move);
         assert!(changes[1].position.0 > changes[0].position.0);
-        // The cross's right arrow, not the circle's.
+        // The cross, not the circle.
         let pad = pad_of(&ui, PadKind::Cross);
-        assert!(pad.dir[3] > 0.0);
-        assert_eq!(pad_of(&ui, PadKind::Circle).dir, [0.0; 4]);
+        assert!(pad.axis.0 > 0.0 && pad.touching);
+        let circle = pad_of(&ui, PadKind::Circle);
+        assert_eq!(circle.axis, (0.0, 0.0));
+        assert!(!circle.touching);
         for change in &changes {
-            assert_eq!(change.marker, PAD_FINGER_BASE + 4 + 3);
+            assert_eq!(change.marker, PAD_FINGER_BASE + 1);
         }
     }
 
+    /// The bug that made walking feel broken: each direction used to be its
+    /// own finger, so a game that tracks one finger ignored the second one and
+    /// the player had to lift the stick before the change registered. A pad is
+    /// one finger, so every direction change is an ordinary Move.
     #[test]
-    fn a_diagonal_presses_two_directions_at_once() {
+    fn a_pad_is_one_finger_that_can_turn_anywhere() {
         let mut ui = pads_ui();
-        // Down-left on the left stick: the shape a player walks on.
+        // Walk forwards...
+        let changes = push_sticks(&mut ui, [0.0, -1.0, 0.0, 0.0]);
+        assert_eq!(changes[0].action, MarkerAction::Down);
+        let finger = changes[0].marker;
+        assert!(changes.iter().all(|change| change.marker == finger));
+        // ...then turn down-left without lifting: a single Move, same finger.
         let changes = push_sticks(&mut ui, [-1.0, 1.0, 0.0, 0.0]);
-        let downs: Vec<_> = changes
-            .iter()
-            .filter(|change| change.action == MarkerAction::Down)
-            .map(|change| change.marker - PAD_FINGER_BASE)
-            .collect();
-        assert_eq!(downs, vec![1, 2]);
-        // Both directions also travelled outwards, each along its own axis.
-        let moves: Vec<_> = changes
-            .iter()
-            .filter(|change| change.action == MarkerAction::Move)
-            .map(|change| change.marker - PAD_FINGER_BASE)
-            .collect();
-        assert_eq!(moves, vec![1, 2]);
+        assert_eq!(changes.len(), 1, "turning is one move, not a new finger");
+        assert_eq!(changes[0].action, MarkerAction::Move);
+        assert_eq!(changes[0].marker, finger);
         let circle = pad_of(&ui, PadKind::Circle);
-        assert!(circle.down[1] && circle.down[2]);
-        assert!(!circle.down[0] && !circle.down[3]);
-        // Holding it still sends nothing new...
-        assert!(push_sticks(&mut ui, [-1.0, 1.0, 0.0, 0.0]).is_empty());
-        // ...and centring releases exactly the two that were down.
-        let ups: Vec<_> = push_sticks(&mut ui, [0.0, 0.0, 0.0, 0.0])
-            .iter()
-            .map(|change| (change.marker - PAD_FINGER_BASE, change.action))
-            .collect();
-        assert_eq!(
-            ups,
-            vec![(1, MarkerAction::Up), (2, MarkerAction::Up)]
+        // The finger went from above the middle to below and to the left.
+        assert!(changes[0].position.1 > circle.cy);
+        assert!(changes[0].position.0 < circle.cx);
+        // Reversing straight backwards is also just a move.
+        let changes = push_sticks(&mut ui, [0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].action, MarkerAction::Move);
+        assert_eq!(changes[0].marker, finger);
+        // Only coming back to rest lifts it, once.
+        let changes = release_sticks(&mut ui);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].action, MarkerAction::Up);
+        assert_eq!(changes[0].marker, finger);
+    }
+
+    /// Walking forward and then reversing must be one uninterrupted touch: no
+    /// Up in between, or the game sees the stick released and the character
+    /// stops until the player lifts and pushes again.
+    #[test]
+    fn reversing_while_walking_never_lifts_the_finger() {
+        let mut ui = pads_ui();
+        let forward = push_sticks(&mut ui, [0.0, -1.0, 0.0, 0.0]);
+        assert_eq!(forward[0].action, MarkerAction::Down);
+        // Sweep from forward to backward through the middle, as a thumb would.
+        let mut saw_up = false;
+        let mut actions = Vec::new();
+        for y in [-1.0, -0.6, -0.2, 0.0, 0.2, 0.6, 1.0] {
+            for change in push_sticks(&mut ui, [0.0, y, 0.0, 0.0]) {
+                if change.action == MarkerAction::Up {
+                    saw_up = true;
+                }
+                actions.push(change.action);
+            }
+        }
+        assert!(
+            !saw_up,
+            "the finger stays down through the whole sweep: {actions:?}"
         );
+        assert_eq!(
+            *actions.last().unwrap(),
+            MarkerAction::Move,
+            "and the last thing the game sees is a move"
+        );
+        // The finger really did end up behind the middle.
+        let circle = pad_of(&ui, PadKind::Circle);
+        let end = push_sticks(&mut ui, [0.0, 1.0, 0.0, 0.0]);
+        assert!(end.is_empty(), "holding it still is silent");
+        assert!(circle.push > 0.0);
+        assert!(circle.finger().1 > circle.cy || circle.axis.1 > 0.0);
+    }
+
+    /// A diagonal must actually be a diagonal: the finger sits on the stick's
+    /// own angle, so walking diagonally goes diagonally.
+    #[test]
+    fn a_diagonal_finger_follows_the_sticks_angle() {
+        let mut ui = pads_ui();
+        push_sticks(&mut ui, [0.0, -1.0, 0.0, 0.0]);
+        let changes = push_sticks(&mut ui, [-1.0, 1.0, 0.0, 0.0]);
+        let circle = pad_of(&ui, PadKind::Circle);
+        let (dx, dy) = (
+            changes[0].position.0 - circle.cx,
+            changes[0].position.1 - circle.cy,
+        );
+        // Down-left at 45 degrees: equal parts, both non-zero.
+        assert!(dx < 0.0 && dy > 0.0);
+        assert!((dx.abs() - dy.abs()).abs() < 1e-3, "{dx} vs {dy}");
+    }
+
+    #[test]
+    fn a_brief_pause_does_not_lift_the_finger_but_a_long_one_does() {
+        let mut ui = pads_ui();
+        push_sticks_dt(&mut ui, [0.0, -1.0, 0.0, 0.0], 0.016);
+        // A pause shorter than the grace period: still down.
+        let changes = push_sticks_dt(&mut ui, [0.0; 4], PAD_RELEASE_DELAY * 0.4);
+        assert!(changes.is_empty(), "a short pause is not a release");
+        assert!(pad_of(&ui, PadKind::Circle).touching);
+        // Resuming the same deflection is silent: the finger never moved.
+        assert!(push_sticks_dt(&mut ui, [0.0, -1.0, 0.0, 0.0], 0.016).is_empty());
+        // Resuming at a different deflection is a Move, not a new Down.
+        let changes = push_sticks_dt(&mut ui, [1.0, -0.4, 0.0, 0.0], 0.016);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].action, MarkerAction::Move);
+        // Resting for longer does lift it.
+        let changes = release_sticks(&mut ui);
+        assert_eq!(changes.last().unwrap().action, MarkerAction::Up);
+        assert!(!pad_of(&ui, PadKind::Circle).touching);
     }
 
     #[test]
@@ -2470,7 +2602,9 @@ mod tests {
         // Inside the activation threshold: nothing down.
         let deadzone_amount = PAD_ACTIVATION * 0.5;
         assert!(push_sticks(&mut ui, [deadzone_amount, 0.0, 0.0, 0.0]).is_empty());
-        assert_eq!(pad_of(&ui, PadKind::Circle).dir, [0.0; 4]);
+        let circle = pad_of(&ui, PadKind::Circle);
+        assert_eq!(circle.axis, (0.0, 0.0));
+        assert!(!circle.touching);
     }
 
     #[test]
@@ -2483,20 +2617,15 @@ mod tests {
         assert_eq!(changes[0].action, MarkerAction::Down);
         assert!((changes[0].position.0 - circle.cx).abs() < 1e-6);
         assert!((changes[0].position.1 - circle.cy).abs() < 1e-6);
-        // Half a push: the finger goes down in the middle and is dragged
-        // half way out.
+        // A full push in another direction is still one clean swipe.
         let mut ui = pads_ui();
-        let half = PAD_ACTIVATION + (1.0 - PAD_ACTIVATION) * 0.5;
-        let changes = push_sticks(&mut ui, [half, 0.0, 0.0, 0.0]);
+        let changes = push_sticks(&mut ui, [0.0, 1.0, 0.0, 0.0]);
         assert_eq!(changes[0].action, MarkerAction::Down);
         assert!((changes[0].position.0 - circle.cx).abs() < 1e-6);
-        let expected = ((circle.cx + rim.0) / 2.0, (circle.cy + rim.1) / 2.0);
-        let moved = changes
-            .iter()
-            .find(|change| change.action == MarkerAction::Move)
-            .expect("the finger travelled");
-        assert!((moved.position.0 - expected.0).abs() < 1e-5);
-        assert!((moved.position.1 - expected.1).abs() < 1e-5);
+        assert!((changes[0].position.1 - circle.cy).abs() < 1e-6);
+        let moved = changes.last().expect("the finger travelled");
+        let full_travel = (circle.point(1).1 - circle.cy).abs();
+        assert!((moved.position.1 - circle.cy - full_travel).abs() < 1e-4);
         // A light push: a short drag, so the finger barely leaves the middle.
         let mut ui = pads_ui();
         let light = PAD_ACTIVATION + (1.0 - PAD_ACTIVATION) * 0.1;
@@ -2509,7 +2638,7 @@ mod tests {
         assert!(travelled < full * 0.2, "a light push is a short drag");
         // Releasing lifts the finger where it got to, at either strength, so
         // the game sees one clean swipe and not a drag back to the middle.
-        let releases = push_sticks(&mut ui, [0.0, 0.0, 0.0, 0.0]);
+        let releases = release_sticks(&mut ui);
         assert_eq!(releases[0].action, MarkerAction::Up);
         let last = changes.last().unwrap();
         assert!((releases[0].position.0 - last.position.0).abs() < 1e-6);
@@ -2517,7 +2646,7 @@ mod tests {
         let mut ui = pads_ui();
         let changes = push_sticks(&mut ui, [1.0, 0.0, 0.0, 0.0]);
         assert!((changes.last().unwrap().position.0 - rim.0).abs() < 1e-5);
-        let releases = push_sticks(&mut ui, [0.0, 0.0, 0.0, 0.0]);
+        let releases = release_sticks(&mut ui);
         assert_eq!(releases[0].action, MarkerAction::Up);
         assert!((releases[0].position.0 - rim.0).abs() < 1e-5);
     }
@@ -2593,11 +2722,11 @@ mod tests {
         let mut ui = pads_ui();
         let light = PAD_ACTIVATION + (1.0 - PAD_ACTIVATION) * 0.2;
         push_sticks(&mut ui, [light, 0.0, 0.0, 0.0]);
-        let first = pad_of(&ui, PadKind::Circle).dir[3];
+        let first = pad_of(&ui, PadKind::Circle).push;
         let changes = push_sticks(&mut ui, [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].action, MarkerAction::Move);
-        assert!(pad_of(&ui, PadKind::Circle).dir[3] > first);
+        assert!(pad_of(&ui, PadKind::Circle).push > first);
         // The same value again is not a move.
         assert!(push_sticks(&mut ui, [1.0, 0.0, 0.0, 0.0]).is_empty());
     }
@@ -2675,12 +2804,14 @@ mod tests {
         marker.button = Some(Button::LeftStickUp);
         ui.markers.push(marker);
         let changes = push_sticks(&mut ui, [0.0, -1.0, 1.0, 0.0]);
-        // Only the cross answered.
-        assert!(changes.iter().all(|change| change.marker >= PAD_FINGER_BASE + 4));
+        // Only the cross answered, and it is one finger.
+        assert!(changes
+            .iter()
+            .all(|change| change.marker == PAD_FINGER_BASE + 1));
         // The circle still shows the stick, but has no finger down.
         let circle = pad_of(&ui, PadKind::Circle);
-        assert!(circle.dir[0] > 0.0);
-        assert!(circle.down.iter().all(|down| !down));
+        assert!(circle.axis.1 < 0.0, "the knob still shows the stick");
+        assert!(!circle.touching, "but it sends nothing");
     }
 
     #[test]
@@ -2771,9 +2902,9 @@ mod tests {
         let changes = push_sticks_dt(&mut ui, [0.0, 0.0, 0.0, 1.0], 0.0);
         assert!(changes.iter().all(|change| change.marker == LOOK_FINGER));
         let cross = pad_of(&ui, PadKind::Cross);
-        assert!(cross.down.iter().all(|down| !down));
+        assert!(!cross.touching);
         // The circle is unaffected: walking while looking around works.
-        assert!(!pad_of(&ui, PadKind::Circle).down[0]);
+        assert!(!pad_of(&ui, PadKind::Circle).touching);
         let mut ui = pads_ui();
         ui.look = true;
         let changes = push_sticks_dt(&mut ui, [0.0, -1.0, 0.0, 0.0], 0.0);
@@ -2894,7 +3025,7 @@ mod tests {
     fn removing_a_pad_lifts_the_fingers_it_was_holding() {
         let mut ui = pads_ui();
         push_sticks(&mut ui, [-1.0, 1.0, 0.0, 0.0]);
-        assert!(pad_of(&ui, PadKind::Circle).down[1] && pad_of(&ui, PadKind::Circle).down[2]);
+        assert!(pad_of(&ui, PadKind::Circle).touching);
         toggle_pad(&mut ui, 0);
         assert!(!ui.pads[0].enabled);
         let mut ups = 0;
@@ -2903,7 +3034,7 @@ mod tests {
                 ups += 1;
             }
         }
-        assert_eq!(ups, 2, "both held directions are released");
+        assert_eq!(ups, 1, "the pad's one finger is released");
     }
 
     #[test]

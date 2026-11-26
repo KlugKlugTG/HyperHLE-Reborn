@@ -480,15 +480,22 @@ Other options:
         left stick, and "Cross: on/off" is a cross at the bottom right driven
         by the right stick. Removing a pad releases any finger it was holding.
 
-        Each of a pad's four directions sends its own touch. The finger goes
-        down in the middle of the pad and is dragged outwards towards that
-        direction's arrow as the stick is pushed, so a light push is a short
-        drag and a full push reaches the rim: this is the analogue swipe that
-        mobile games which use a stick for walking expect. Letting go lifts the
-        finger where it got to. The two pads are independent, and pushing
-        diagonally presses two directions at once, so the character walks
-        diagonally. A pad ignores its stick while any marker is bound to one of
-        that stick's directions, so a stick either walks or taps, never both.
+        A pad sends one finger, like a real analogue stick, not one finger per
+        direction. The finger goes down in the middle of the pad and is dragged
+        in whatever direction the stick points, as far as it is pushed: a light
+        push is a short drag, a full push reaches the rim. Because it is one
+        finger, the direction can change freely while it is held, so walking
+        forward and then turning to walk right, or reversing to walk back, is a
+        single uninterrupted drag that the game reads as a stick being moved --
+        no releasing and re-touching, which is what made walking feel like it
+        needed the stick let go before a direction was noticed.
+
+        A short moment at rest keeps the finger down, so sweeping the stick
+        through the middle to reverse direction is not mistaken for letting go.
+        When the stick really is released, the finger lifts where it got to.
+        The two pads are independent. A pad ignores its stick while any marker
+        is bound to one of that stick's directions, so a stick either walks or
+        taps, never both.
 
         Drag a pad to move it. Drag the small grip on its rim to change its
         size. Pads and markers are saved together for the app in
