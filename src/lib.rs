@@ -58,6 +58,7 @@ mod stack;
 mod guest_clock;
 mod trainer;
 mod trainer_ui;
+mod button_bind;
 mod quick_menu;
 mod window;
 

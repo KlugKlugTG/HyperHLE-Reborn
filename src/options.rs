@@ -29,6 +29,112 @@ pub enum Button {
     X,
     Y,
     LeftShoulder,
+    RightShoulder,
+    /// Left trigger, the analog `LeftTrigger` axis past its trigger point.
+    LeftTrigger,
+    /// Right trigger, the analog `RightTrigger` axis past its trigger point.
+    RightTrigger,
+    // The four directions of each analog stick are separate buttons, so they
+    // can be bound to spots on the touch screen like any other button.
+    LeftStickLeft,
+    LeftStickRight,
+    LeftStickUp,
+    LeftStickDown,
+    RightStickLeft,
+    RightStickRight,
+    RightStickUp,
+    RightStickDown,
+}
+
+impl Button {
+    /// The name used by `--button-to-touch=`, the bindings file and the
+    /// marker labels of the "Bind buttons" overlay.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Button::DPadLeft => "DPadLeft",
+            Button::DPadUp => "DPadUp",
+            Button::DPadRight => "DPadRight",
+            Button::DPadDown => "DPadDown",
+            Button::Start => "Start",
+            Button::A => "A",
+            Button::B => "B",
+            Button::X => "X",
+            Button::Y => "Y",
+            Button::LeftShoulder => "LeftShoulder",
+            Button::RightShoulder => "RightShoulder",
+            Button::LeftTrigger => "LeftTrigger",
+            Button::RightTrigger => "RightTrigger",
+            Button::LeftStickLeft => "LeftStickLeft",
+            Button::LeftStickRight => "LeftStickRight",
+            Button::LeftStickUp => "LeftStickUp",
+            Button::LeftStickDown => "LeftStickDown",
+            Button::RightStickLeft => "RightStickLeft",
+            Button::RightStickRight => "RightStickRight",
+            Button::RightStickUp => "RightStickUp",
+            Button::RightStickDown => "RightStickDown",
+        }
+    }
+
+    /// The inverse of [Button::short_name].
+    pub fn from_short_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "DPadLeft" => Button::DPadLeft,
+            "DPadUp" => Button::DPadUp,
+            "DPadRight" => Button::DPadRight,
+            "DPadDown" => Button::DPadDown,
+            "Start" => Button::Start,
+            "A" => Button::A,
+            "B" => Button::B,
+            "X" => Button::X,
+            "Y" => Button::Y,
+            "LeftShoulder" => Button::LeftShoulder,
+            "RightShoulder" => Button::RightShoulder,
+            "LeftTrigger" => Button::LeftTrigger,
+            "RightTrigger" => Button::RightTrigger,
+            "LeftStickLeft" => Button::LeftStickLeft,
+            "LeftStickRight" => Button::LeftStickRight,
+            "LeftStickUp" => Button::LeftStickUp,
+            "LeftStickDown" => Button::LeftStickDown,
+            "RightStickLeft" => Button::RightStickLeft,
+            "RightStickRight" => Button::RightStickRight,
+            "RightStickUp" => Button::RightStickUp,
+            "RightStickDown" => Button::RightStickDown,
+            _ => return None,
+        })
+    }
+
+    /// The short label an on-screen marker shows for this button.
+    pub fn marker_label(self) -> &'static str {
+        match self {
+            Button::DPadLeft => "<",
+            Button::DPadUp => "^",
+            Button::DPadRight => ">",
+            Button::DPadDown => "v",
+            Button::Start => "ST",
+            Button::A => "A",
+            Button::B => "B",
+            Button::X => "X",
+            Button::Y => "Y",
+            Button::LeftShoulder => "LB",
+            Button::RightShoulder => "RB",
+            Button::LeftTrigger => "LT",
+            Button::RightTrigger => "RT",
+            Button::LeftStickLeft => "<LS",
+            Button::LeftStickRight => ">LS",
+            Button::LeftStickUp => "^LS",
+            Button::LeftStickDown => "vLS",
+            Button::RightStickLeft => "<RS",
+            Button::RightStickRight => ">RS",
+            Button::RightStickUp => "^RS",
+            Button::RightStickDown => "vRS",
+        }
+    }
+
+    /// The name the overlay shows once the button is bound. The bindings
+    /// file always keeps the [Button::short_name] spelling instead.
+    pub fn display_name(self) -> &'static str {
+        self.marker_label()
+    }
 }
 
 /// Highest iOS version currently exposed by the emulator compatibility layer.
@@ -177,6 +283,11 @@ pub struct Options {
     /// performance display, FPS limiter, RAM limiter) and an "Exit emulator"
     /// button that goes back to the app picker.
     pub quick_menu: bool,
+    /// `--bind-buttons`: show the BlueStacks-style "Bind buttons" overlay. A
+    /// button at the top centre of the screen opens a menu where on-screen
+    /// controls can be placed and bound to gamepad buttons, so a pad button
+    /// presses a spot on the touch screen.
+    pub bind_buttons: bool,
     pub initial_orientation: DeviceOrientation,
     /// iOS version reported to guest applications. `None` uses the latest compatibility version.
     pub ios_version: Option<(i32, i32, i32)>,
@@ -414,6 +525,7 @@ impl Default for Options {
             preserve_aspect_ratio: false,
             trainer_disabled: true,
             quick_menu: false,
+            bind_buttons: false,
             device_family: None,
             auto_device_family: false,
             host_screen_size: None,
@@ -638,19 +750,8 @@ impl Options {
             let (x, y) = coords
                 .split_once(',')
                 .ok_or_else(|| "--button-to-touch= requires three values".to_string())?;
-            let button = match button {
-                "DPadLeft" => Ok(Button::DPadLeft),
-                "DPadUp" => Ok(Button::DPadUp),
-                "DPadRight" => Ok(Button::DPadRight),
-                "DPadDown" => Ok(Button::DPadDown),
-                "Start" => Ok(Button::Start),
-                "A" => Ok(Button::A),
-                "B" => Ok(Button::B),
-                "X" => Ok(Button::X),
-                "Y" => Ok(Button::Y),
-                "LeftShoulder" => Ok(Button::LeftShoulder),
-                _ => Err("Invalid button for --button-to-touch=".to_string()),
-            }?;
+            let button = Button::from_short_name(button)
+                .ok_or_else(|| "Invalid button for --button-to-touch=".to_string())?;
             let x: f32 = x
                 .parse()
                 .map_err(|_| "Invalid X co-ordinate for --button-to-touch=".to_string())?;
@@ -886,6 +987,10 @@ impl Options {
             self.quick_menu = true;
         } else if arg == "--no-quick-menu" {
             self.quick_menu = false;
+        } else if arg == "--bind-buttons" {
+            self.bind_buttons = true;
+        } else if arg == "--no-bind-buttons" {
+            self.bind_buttons = false;
         } else {
             return Ok(false);
         };
@@ -1026,6 +1131,50 @@ mod option_parsing_tests {
     }
 
     #[test]
+    fn bind_buttons_is_opt_in_and_can_be_disabled() {
+        let mut options = Options::default();
+        assert!(!options.bind_buttons);
+
+        assert!(options.parse_argument("--bind-buttons").unwrap());
+        assert!(options.bind_buttons);
+
+        assert!(options.parse_argument("--no-bind-buttons").unwrap());
+        assert!(!options.bind_buttons);
+    }
+
+    #[test]
+    fn button_names_round_trip_and_feed_marker_labels() {
+        for button in [
+            Button::DPadLeft,
+            Button::DPadUp,
+            Button::DPadRight,
+            Button::DPadDown,
+            Button::Start,
+            Button::A,
+            Button::B,
+            Button::X,
+            Button::Y,
+            Button::LeftShoulder,
+            Button::RightShoulder,
+            Button::LeftTrigger,
+            Button::RightTrigger,
+            Button::LeftStickLeft,
+            Button::LeftStickRight,
+            Button::LeftStickUp,
+            Button::LeftStickDown,
+            Button::RightStickLeft,
+            Button::RightStickRight,
+            Button::RightStickUp,
+            Button::RightStickDown,
+        ] {
+            assert_eq!(Button::from_short_name(button.short_name()), Some(button));
+            assert!(!button.marker_label().is_empty());
+            assert!(!button.display_name().is_empty());
+        }
+        assert_eq!(Button::from_short_name("NoSuchButton"), None);
+    }
+
+    #[test]
     fn fix_movie_player_is_opt_in_and_can_be_disabled() {
         let mut options = Options::default();
         assert!(!options.fix_movie_player);
@@ -1144,6 +1293,24 @@ mod option_parsing_tests {
         assert!(options.parse_argument("--memory-limit=64").unwrap());
         assert!(options.parse_argument("--memory-limit=-1").is_err());
         assert_eq!(options.memory_limit_mb, Some(64));
+    }
+
+    /// The documented `--button-to-touch=` names all still parse, and the
+    /// names are shared with the bindings file of the "Bind buttons"
+    /// overlay, so a saved binding never silently stops loading.
+    #[test]
+    fn button_to_touch_accepts_every_documented_button_name() {
+        let mut options = Options::default();
+        assert!(options
+            .parse_argument("--button-to-touch=RightShoulder,10,10")
+            .unwrap());
+        assert_eq!(
+            options.button_to_touch.get(&Button::RightShoulder),
+            Some(&(10.0, 10.0))
+        );
+        assert!(options
+            .parse_argument("--button-to-touch=NoSuchButton,10,10")
+            .is_err());
     }
 
     #[test]

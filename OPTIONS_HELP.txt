@@ -171,9 +171,15 @@ Game controller options:
         screen of the device. Pressing the button will behave like touching that
         part of the screen.
 
-        This is three parts separated by commas: the name of a button (DPadLeft,
-        DPadUp, DPadRight, DPadDown, Start, LeftShoulder or Xbox-like
-        A, B, X or Y), the X co-ordinate and the Y co-ordinate.
+        This is three parts separated by commas: the name of a button, the X
+        co-ordinate and the Y co-ordinate. The button names are DPadLeft,
+        DPadUp, DPadRight, DPadDown, Start, A, B, X, Y, LeftShoulder,
+        RightShoulder, LeftTrigger, RightTrigger, and the four directions of
+        each stick: LeftStickLeft, LeftStickRight, LeftStickUp, LeftStickDown
+        and the same four with RightStick. A trigger counts as pressed once it
+        is pulled past half-travel, and a stick direction counts while the
+        stick is past its deadzone on that side (so down-left is both
+        LeftStickLeft and LeftStickDown).
         The co-ordinates are floating-point (decimal) numbers. 0,0 is the
         top-left corner. The bottom-right corner is 320,480 if the app is in
         portrait, and 480,320 if the app is in landscape.
@@ -448,6 +454,93 @@ Other options:
 
     --no-quick-menu
         Hide the quick menu button (the default).
+
+    --bind-buttons
+        Show a BlueStacks-style "Bind buttons" overlay ("Bind buttons" in the
+        graphical settings screen's Display section): a button at the top
+        centre of the screen opens a menu where on-screen buttons can be
+        added. Drag an added button to move it, then tap it and press a
+        gamepad button to bind the two: pressing that gamepad button while
+        the game runs holds a finger down on that spot of the simulated
+        screen. A button that is waiting for a gamepad button shows the pad
+        button's name once bound; tapping it again removes it. "Clear all"
+        removes every button of the app.
+
+        The bindings are saved per app in HyperHLE_button_bindings.txt, so
+        they survive a restart.
+
+        Every face button, D-pad direction, shoulder and trigger can be
+        bound, and so can each of the eight stick directions: pushing the
+        left stick left lights up a marker bound to LeftStickLeft, and
+        pushing it down-left presses both LeftStickLeft and LeftStickDown.
+        A trigger counts as pressed once it is pulled past half-travel.
+
+        Two pads can be added from the same menu, and are off until they are.
+        "Circle: on/off" is a ring at the bottom left, driven by the left
+        stick. "Cross: on/off" is a cross at the bottom right, driven by the
+        console's D-pad buttons. Removing a pad releases any finger it was
+        holding.
+
+        The circle sends one finger, like a real analogue stick, not one finger
+        per direction. The finger goes down in the middle of the pad and is
+        dragged in whatever direction the stick points, as far as it is pushed:
+        a light push is a short drag, a full push reaches the rim. Because it is
+        one finger, the direction can change freely while it is held, so walking
+        forward and then turning to walk right, or reversing to walk back, is a
+        single uninterrupted drag that the game reads as a stick being moved --
+        no releasing and re-touching, which is what made walking feel like it
+        needed the stick let go before a direction was noticed.
+
+        The cross sends a swipe per direction: the finger goes down in the
+        middle of the pad and slides out along that direction, over about a
+        tenth of a second. That is what a weapon wheel and most other on-screen
+        four-way controls actually read -- the direction a finger travels from
+        the middle of the wheel -- so a press selects the weapon on that side,
+        up plus right together picks the diagonal, and rolling from one button
+        to the next keeps a single finger down, moving. A tap that goes down and
+        up within a single frame still plays out as a full swipe and is held
+        for a moment, so the game reads it as a tap rather than missing it.
+
+        The right stick drives neither pad. It belongs to camera mode, so
+        turning the camera cannot move a finger that is choosing a weapon, and
+        the wheel and the camera can be used at the same time.
+
+        A short moment at rest keeps a finger down, so sweeping through the
+        middle to reverse direction is not mistaken for letting go. When the
+        stick or button really is released, the finger lifts where it got to.
+        A pad steps aside while any marker is bound to one of its own controls,
+        so a stick or D-pad direction either walks or taps, never both.
+
+        Drag a pad to move it. Drag the small grip on its rim to change its
+        size. Pads and markers are saved together for the app in
+        HyperHLE_button_bindings.txt.
+
+        The "Reach" row under each pad shortens how far a full push drags the
+        finger (100%, 85%, 70%, 55%, 40%). Use it when a full push on the
+        gamepad makes the character stop: the finger ends up further from the
+        middle of the game's own stick than that stick's zone allows, so it
+        leaves the dead zone the game expects. Lowering the reach keeps the
+        finger inside, and the drag stays proportional, so a light push is
+        still slower than a hard one.
+
+        "Hide buttons" fades the markers and pads almost completely, so they
+        stop covering the game while still working. The overlay's own button
+        stays fully visible, so the setting can be undone.
+
+        The "Camera" row turns on camera mode: the right stick then drags a
+        finger for the game's look-around control. Neither pad is affected,
+        because neither reads the right stick, so a weapon wheel stays usable
+        while the camera turns. Pushing the stick further drags faster. The drag
+        stays inside a small box on the right-hand third of the screen, well
+        clear of the left-hand area where phone shooters put their own movement
+        joystick, so turning the camera cannot move the character. When the
+        finger reaches the edge of that box it is lifted and re-grabbed in the
+        middle, so holding the stick keeps the camera turning. The setting is
+        saved with the app, and walking with the left stick works at the same
+        time.
+
+    --no-bind-buttons
+        Hide the "Bind buttons" overlay (the default).
 
     --force-composition
         Forces presentation of renderbuffer as if no fullscreen EAGL layer is
