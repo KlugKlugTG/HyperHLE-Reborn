@@ -317,42 +317,48 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let key_ns_string = get_static_str(env, "UIButtonStatefulContent");
     let dict: id = msg![env; coder decodeObjectForKey:key_ns_string];
-    assert!(dict != nil);
-    log_dbg!("UIButtonStatefulContent dict: {}", {
-        let desc: id = msg![env; dict description];
-        to_rust_string(env, desc)
-    });
+    // `UIButtonStatefulContent` is absent (nil) for buttons archived without
+    // any per-state content (e.g. a plain custom button from a NIB/XIB, or
+    // one whose title/image were never set). Real UIKit simply has no
+    // stateful content to restore in that case, so skip the loop instead
+    // of panicking.
+    if dict != nil {
+        log_dbg!("UIButtonStatefulContent dict: {}", {
+            let desc: id = msg![env; dict description];
+            to_rust_string(env, desc)
+        });
 
-    // Iterate over all state keys in the stateful content dictionary
-    let all_keys: id = msg![env; dict allKeys];
-    let keys_count: NSUInteger = msg![env; all_keys count];
-    for i in 0..keys_count {
-        let key_obj: id = msg![env; all_keys objectAtIndex:i];
-        let state_val: i64 = msg![env; key_obj longLongValue];
-        let state = state_val as UIControlState;
-        let button_content: id = msg![env; dict objectForKey:key_obj];
-        if button_content == nil {
-            continue;
-        }
+        // Iterate over all state keys in the stateful content dictionary
+        let all_keys: id = msg![env; dict allKeys];
+        let keys_count: NSUInteger = msg![env; all_keys count];
+        for i in 0..keys_count {
+            let key_obj: id = msg![env; all_keys objectAtIndex:i];
+            let state_val: i64 = msg![env; key_obj longLongValue];
+            let state = state_val as UIControlState;
+            let button_content: id = msg![env; dict objectForKey:key_obj];
+            if button_content == nil {
+                continue;
+            }
 
-        let title: id = msg![env; button_content title];
-        if title != nil {
-            log_dbg!("UIButton initWithCoder: title {} for state {}", to_rust_string(env, title), state);
-            () = msg![env; this setTitle:title forState:state];
-        }
-        let title_color: id = msg![env; button_content titleColor];
-        if title_color != nil {
-            () = msg![env; this setTitleColor:title_color forState:state];
-        }
-        let image: id = msg![env; button_content image];
-        if image != nil {
-            log_dbg!("UIButton initWithCoder: setting image {:?} for state {}", image, state);
-            () = msg![env; this setImage:image forState:state];
-        }
-        let bg_image: id = msg![env; button_content backgroundImage];
-        if bg_image != nil {
-            log_dbg!("UIButton initWithCoder: setting backgroundImage {:?} for state {}", bg_image, state);
-            () = msg![env; this setBackgroundImage:bg_image forState:state];
+            let title: id = msg![env; button_content title];
+            if title != nil {
+                log_dbg!("UIButton initWithCoder: title {} for state {}", to_rust_string(env, title), state);
+                () = msg![env; this setTitle:title forState:state];
+            }
+            let title_color: id = msg![env; button_content titleColor];
+            if title_color != nil {
+                () = msg![env; this setTitleColor:title_color forState:state];
+            }
+            let image: id = msg![env; button_content image];
+            if image != nil {
+                log_dbg!("UIButton initWithCoder: setting image {:?} for state {}", image, state);
+                () = msg![env; this setImage:image forState:state];
+            }
+            let bg_image: id = msg![env; button_content backgroundImage];
+            if bg_image != nil {
+                log_dbg!("UIButton initWithCoder: setting backgroundImage {:?} for state {}", bg_image, state);
+                () = msg![env; this setBackgroundImage:bg_image forState:state];
+            }
         }
     }
 
