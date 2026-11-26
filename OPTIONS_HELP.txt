@@ -513,13 +513,16 @@ Other options:
         stop covering the game while still working. The overlay's own button
         stays fully visible, so the setting can be undone.
 
-        Camera buttons in the menu turn on camera mode: the right stick then
-        drags a finger across the middle of the screen instead of driving the
-        cross pad, which is the look-around gesture most mobile games use.
-        Pushing the stick further drags faster. A long turn re-grabs from the
-        middle of the screen when the finger reaches the edge, so holding the
-        stick keeps the camera turning. The setting is saved with the app, and
-        walking with the left stick works at the same time.
+        The "Camera" row turns on camera mode: the right stick then drags a
+        finger for the game's look-around control, and the cross is not used at
+        all (and not drawn). Pushing the stick further drags faster. The drag
+        stays inside a small box on the right-hand third of the screen, well
+        clear of the left-hand area where phone shooters put their own movement
+        joystick, so turning the camera cannot move the character. When the
+        finger reaches the edge of that box it is lifted and re-grabbed in the
+        middle, so holding the stick keeps the camera turning. The setting is
+        saved with the app, and walking with the left stick works at the same
+        time.
 
     --no-bind-buttons
         Hide the "Bind buttons" overlay (the default).
