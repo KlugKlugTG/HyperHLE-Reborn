@@ -494,6 +494,14 @@ Other options:
         size. Pads and markers are saved together for the app in
         HyperHLE_button_bindings.txt.
 
+        The "Reach" row under each pad shortens how far a full push drags the
+        finger (100%, 85%, 70%, 55%, 40%). Use it when a full push on the
+        gamepad makes the character stop: the finger ends up further from the
+        middle of the game's own stick than that stick's zone allows, so it
+        leaves the dead zone the game expects. Lowering the reach keeps the
+        finger inside, and the drag stays proportional, so a light push is
+        still slower than a hard one.
+
         "Hide buttons" fades the markers and pads almost completely, so they
         stop covering the game while still working. The overlay's own button
         stays fully visible, so the setting can be undone.

@@ -47,6 +47,11 @@ const COL_HELD_BORDER: (f32, f32, f32, f32) = (1.00, 0.30, 0.25, 1.00);
 /// The most markers one app can have. Also keeps the marker ids that travel
 /// through [`crate::window::FingerId`] and the widget ids well within range.
 const MAX_MARKERS: usize = 32;
+/// Shown in the menu's header. Bump it whenever the pad gestures change: the
+/// difference between a drag that starts at the rim and one that starts in
+/// the middle is invisible in a screenshot but decides whether walking works,
+/// so "is this the build with the fix" has to be answerable without guessing.
+const OVERLAY_REVISION: &str = "PADS R3";
 /// Distance, in unscaled pixels, a press has to travel before it counts as a
 /// drag rather than a tap.
 const DRAG_THRESHOLD: f32 = 10.0;
@@ -107,6 +112,8 @@ const W_LOOK: u16 = 13;
 const W_HIDE: u16 = 14;
 const W_ADD_CIRCLE: u16 = 15;
 const W_ADD_CROSS: u16 = 16;
+const W_REACH_CIRCLE: u16 = 17;
+const W_REACH_CROSS: u16 = 18;
 /// Marker ids start here, so `W_MARKER_BASE + index` identifies a marker.
 const W_MARKER_BASE: u16 = 100;
 /// Pad ids start here: `W_PAD_BASE + index` is a pad's knob, plus `PAD_COUNT`
@@ -178,6 +185,11 @@ struct Pad {
     /// Whether the pad exists. Pads are added from the menu like markers, so
     /// an app that does not need them keeps the screen clear.
     enabled: bool,
+    /// How far a full push moves the finger, as a fraction of the normal
+    /// travel. Games differ in how big their own stick's zone is; if a full
+    /// push on the gamepad overshoots it, the finger can leave the game's
+    /// stick and the character stops. Lowering this keeps the finger inside.
+    reach: f32,
 }
 
 impl Pad {
@@ -190,6 +202,7 @@ impl Pad {
             dir: [0.0; 4],
             down: [false; 4],
             enabled: false,
+            reach: 1.0,
         }
     }
 
@@ -625,7 +638,8 @@ fn pad_touch_at(pad: &Pad, direction: usize, along: f32, action: PadAction) -> M
     // finger got to keeps the whole thing one clean swipe; jumping back to the
     // centre first would be a second, backwards drag that walking controls
     // read as a change of direction.
-    let position = lerp2(centre, pad.point(direction), along.clamp(0.0, 1.0));
+    let travel = (along.clamp(0.0, 1.0) * pad.reach).clamp(0.0, 1.0);
+    let position = lerp2(centre, pad.point(direction), travel);
     MarkerTouch {
         marker: PAD_FINGER_BASE + (pad.kind.pad() * 4 + direction) as u8,
         position,
@@ -828,7 +842,7 @@ fn format_pads(pads: &[Pad; PAD_COUNT], look: bool, hidden: bool) -> String {
         .iter()
         .map(|pad| {
             format!(
-                "{},{:.3},{:.3},{:.3},{}",
+                "{},{:.3},{:.3},{:.3},{},{:.2}",
                 match pad.kind {
                     PadKind::Circle => "circle",
                     PadKind::Cross => "cross",
@@ -836,7 +850,8 @@ fn format_pads(pads: &[Pad; PAD_COUNT], look: bool, hidden: bool) -> String {
                 pad.cx,
                 pad.cy,
                 pad.radius,
-                if pad.enabled { "on" } else { "off" }
+                if pad.enabled { "on" } else { "off" },
+                pad.reach
             )
         })
         .collect::<Vec<_>>()
@@ -885,6 +900,7 @@ fn parse_pads(text: &str) -> Option<([Pad; PAD_COUNT], bool, bool)> {
             continue;
         };
         let state = fields.next().map(str::trim);
+        let reach = fields.next().and_then(|reach| reach.trim().parse::<f32>().ok());
         let kind = match name.trim() {
             "circle" => PadKind::Circle,
             // "triangle" is what the cross pad was called before it was
@@ -909,6 +925,10 @@ fn parse_pads(text: &str) -> Option<([Pad; PAD_COUNT], bool, bool)> {
         // Files written before pads could be switched off have no state, and
         // those were the builds where both pads were always on.
         pad.enabled = state != Some("off");
+        // Files written before reach existed had the full travel.
+        if let Some(reach) = reach.filter(|reach| reach.is_finite()) {
+            pad.reach = reach.clamp(0.2, 1.0);
+        }
         found = true;
     }
     found.then_some((pads, look, hidden))
@@ -975,6 +995,7 @@ fn save_to(ui: &Ui, path: &std::path::Path) {
     // half has been changed; otherwise the line goes away entirely.
     let pads_changed = ui.pads.iter().any(|pad| {
         pad.enabled
+            || pad.reach != 1.0
             || pad.cx != PAD_DEFAULT_CENTERS[pad.kind.pad()].0
             || pad.cy != PAD_DEFAULT_CENTERS[pad.kind.pad()].1
             || pad.radius != PAD_DEFAULT_RADIUS
@@ -1005,6 +1026,23 @@ fn release_marker(ui: &mut Ui, index: usize) {
         position: (marker.x, marker.y),
         action: MarkerAction::Up,
     });
+}
+
+/// The menu label for a pad's reach, e.g. "REACH 100%".
+fn reach_label(pad: &Pad) -> String {
+    format!("REACH {}%", (pad.reach * 100.0).round() as i32)
+}
+
+/// One step of the reach adjuster: 100%, 85%, 70%, 55%, 40%, and back round.
+const REACH_STEPS: [f32; 5] = [0.40, 0.55, 0.70, 0.85, 1.00];
+
+/// Moves a pad's reach to the next step, downwards, wrapping at the bottom.
+fn cycle_reach(pad: &mut Pad) {
+    let current = REACH_STEPS
+        .iter()
+        .position(|step| (step - pad.reach).abs() < 0.01)
+        .unwrap_or(REACH_STEPS.len() - 1);
+    pad.reach = REACH_STEPS[(current + REACH_STEPS.len() - 1) % REACH_STEPS.len()];
 }
 
 /// Adds or removes one of the movement pads. Removing a pad lifts any finger
@@ -1184,10 +1222,12 @@ fn compute_layout(ui: &Ui, viewport: (u32, u32, u32, u32)) -> Layout {
         h: button_size,
     };
     // The menu's rows, in the order they are drawn and hit-tested.
-    const MENU_ROWS: [u16; 7] = [
+    const MENU_ROWS: [u16; 9] = [
         W_ADD,
         W_ADD_CIRCLE,
+        W_REACH_CIRCLE,
         W_ADD_CROSS,
+        W_REACH_CROSS,
         W_LOOK,
         W_HIDE,
         W_CLEAR,
@@ -1309,21 +1349,49 @@ unsafe fn build_scene(
         scene.rect(menu.rect.x, menu.rect.y, menu.rect.w, menu.rect.h, COL_PANEL);
         scene.text(
             gles,
-            "BIND BUTTONS",
+            OVERLAY_REVISION,
             menu.rect.x + 8.0 * s,
             menu.rect.y + 6.0 * s,
             11.0 * s,
             COL_TEXT_DIM,
         );
         for (id, row) in &menu.rows {
+            let on_off = |pad: &Pad| {
+                if pad.enabled {
+                    "ON"
+                } else {
+                    "OFF"
+                }
+            };
             let (label, color) = match *id {
-                W_ADD => ("ADD BUTTON", COL_ACCENT),
-                W_LOOK => (if ui.look { "CAMERA: ON" } else { "CAMERA: OFF" }, COL_ROW),
-                W_CLEAR => ("CLEAR ALL", COL_ROW),
-                _ => ("CLOSE", COL_ROW),
+                W_ADD => ("ADD BUTTON".to_string(), COL_ACCENT),
+                W_ADD_CIRCLE => (format!("CIRCLE: {}", on_off(&ui.pads[0])), COL_ROW),
+                W_ADD_CROSS => (format!("CROSS: {}", on_off(&ui.pads[1])), COL_ROW),
+                W_REACH_CIRCLE | W_REACH_CROSS => {
+                    let index = if *id == W_REACH_CIRCLE { 0 } else { 1 };
+                    (reach_label(&ui.pads[index]), COL_ROW)
+                }
+                W_LOOK => (
+                    if ui.look {
+                        "CAMERA: ON".to_string()
+                    } else {
+                        "CAMERA: OFF".to_string()
+                    },
+                    COL_ROW,
+                ),
+                W_HIDE => (
+                    if ui.hidden {
+                        "SHOW BUTTONS".to_string()
+                    } else {
+                        "HIDE BUTTONS".to_string()
+                    },
+                    COL_ROW,
+                ),
+                W_CLEAR => ("CLEAR ALL".to_string(), COL_ROW),
+                _ => ("CLOSE".to_string(), COL_ROW),
             };
             scene.rect(row.x, row.y, row.w, row.h, color);
-            scene.text(gles, label, row.x + 6.0 * s, row.y + 5.0 * s, 11.0 * s, COL_TEXT);
+            scene.text(gles, &label, row.x + 6.0 * s, row.y + 5.0 * s, 11.0 * s, COL_TEXT);
         }
         let hint = menu.hint;
         for (line, text) in [
@@ -1834,6 +1902,18 @@ fn touch_up_inner_abs(ui: &mut Ui, abs: (f32, f32), viewport: (u32, u32, u32, u3
         W_ADD_CROSS => {
             if hit {
                 toggle_pad(ui, 1);
+            }
+        }
+        W_REACH_CIRCLE => {
+            if hit && ui.pads[0].enabled {
+                cycle_reach(&mut ui.pads[0]);
+                save(ui);
+            }
+        }
+        W_REACH_CROSS => {
+            if hit && ui.pads[1].enabled {
+                cycle_reach(&mut ui.pads[1]);
+                save(ui);
             }
         }
         W_HIDE => {
@@ -2442,6 +2522,72 @@ mod tests {
         assert!((releases[0].position.0 - rim.0).abs() < 1e-5);
     }
 
+    /// The bug that made the circle feel broken: the finger has to travel
+    /// *further* the *harder* the stick is pushed. The game measures speed
+    /// from the distance between its own stick's centre and the finger, so an
+    /// inverted gesture walks at full speed on a tiny push and stands still at
+    /// full deflection.
+    #[test]
+    fn a_harder_push_always_means_a_longer_drag() {
+        let mut distances = Vec::new();
+        for fraction in [0.02, 0.1, 0.3, 0.5, 0.75, 1.0] {
+            let mut ui = pads_ui();
+            let value = PAD_ACTIVATION + (1.0 - PAD_ACTIVATION) * fraction;
+            let changes = push_sticks(&mut ui, [value, 0.0, 0.0, 0.0]);
+            let circle = pad_of(&ui, PadKind::Circle);
+            let last = changes.last().expect("the press sends something");
+            distances.push(((last.position.0 - circle.cx).hypot(last.position.1 - circle.cy)));
+        }
+        for pair in distances.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "a harder push drags further: {distances:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reach_shortens_the_drag_but_keeps_it_monotonic() {
+        let mut ui = pads_ui();
+        ui.pads[0].reach = 0.5;
+        let circle = pad_of(&ui, PadKind::Circle);
+        let changes = push_sticks(&mut ui, [1.0, 0.0, 0.0, 0.0]);
+        let last = changes.last().unwrap();
+        let travelled = (last.position.0 - circle.cx).abs();
+        let full = (circle.point(3).0 - circle.cx).abs();
+        assert!((travelled - full * 0.5).abs() < 1e-5, "half the reach");
+        // Still monotonic, so a light push is still a shorter drag.
+        let mut ui = pads_ui();
+        ui.pads[0].reach = 0.5;
+        let light = PAD_ACTIVATION + (1.0 - PAD_ACTIVATION) * 0.2;
+        let light_changes = push_sticks(&mut ui, [light, 0.0, 0.0, 0.0]);
+        let light_end = light_changes.last().unwrap();
+        let light_travelled = (light_end.position.0 - circle.cx).abs();
+        assert!(light_travelled < travelled);
+    }
+
+    #[test]
+    fn cycling_reach_goes_round_and_stays_in_range() {
+        let mut pad = Pad::new(PadKind::Circle, 0.2, 0.7);
+        assert_eq!(pad.reach, 1.0);
+        for _ in 0..REACH_STEPS.len() {
+            cycle_reach(&mut pad);
+            assert!(pad.reach >= 0.4 && pad.reach <= 1.0);
+        }
+        // A full cycle comes back to where it started.
+        assert!((pad.reach - 1.0).abs() < 1e-6);
+        assert_eq!(reach_label(&pad), "REACH 100%");
+    }
+
+    #[test]
+    fn a_saved_reach_survives_and_missing_reach_means_full() {
+        let parsed = parse_pads("circle,0.200,0.700,0.150,on,0.55").unwrap().0;
+        assert!((parsed[0].reach - 0.55).abs() < 0.01);
+        // Older entries have no reach field.
+        let parsed = parse_pads("circle,0.200,0.700,0.150,on").unwrap().0;
+        assert_eq!(parsed[0].reach, 1.0);
+    }
+
     #[test]
     fn a_partial_push_sends_a_move_as_the_stick_goes_further() {
         let mut ui = pads_ui();
@@ -2672,6 +2818,41 @@ mod tests {
         let (_, look, _) = pads.expect("the file has an entry");
         assert!(look);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every control the menu is supposed to offer has to be in the layout,
+    /// or it is unreachable: the row array and the touch handlers drifted
+    /// apart once already.
+    #[test]
+    fn the_menu_offers_every_control() {
+        let mut ui = Ui::new();
+        ui.enabled = true;
+        ui.menu_open = true;
+        let layout = compute_layout(&ui, VIEWPORT);
+        let menu = layout.menu.expect("the menu is open");
+        let ids: Vec<u16> = menu.rows.iter().map(|(id, _)| *id).collect();
+        for expected in [
+            W_ADD,
+            W_ADD_CIRCLE,
+            W_REACH_CIRCLE,
+            W_ADD_CROSS,
+            W_REACH_CROSS,
+            W_LOOK,
+            W_HIDE,
+            W_CLEAR,
+            W_CLOSE,
+        ] {
+            assert!(ids.contains(&expected), "the menu is missing {expected}");
+        }
+        // And each one is reachable from a tap in its middle.
+        for (id, rect) in &menu.rows {
+            let at = (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
+            ui.pending = W_NONE;
+            assert!(touch_down_inner_abs(&mut ui, at, VIEWPORT), "row {id} is tappable");
+            assert_eq!(ui.pending, *id, "the tap lands on row {id}");
+            touch_up_inner_abs(&mut ui, at, VIEWPORT);
+            ui.menu_open = true;
+        }
     }
 
     #[test]
