@@ -530,6 +530,8 @@ struct AppPickerDelegateHostObject {
     overlay_corner: Option<PerformanceOverlayCorner>,
     cheat_engine: Option<bool>,
     quick_menu: Option<bool>,
+    /// "Bind buttons" (Settings > Display): the BlueStacks-style overlay.
+    bind_buttons: Option<bool>,
     dladdr: Option<bool>,
     /// `Some(..)` only when the user just flipped the switch: `None` means no
     /// change is pending. The saved state is tri-state (see `PickerSettings`).
@@ -747,6 +749,8 @@ struct PickerSettings {
     cheat_engine: bool,
     /// Show the in-game quick menu (the pause button in the top-left corner).
     quick_menu: bool,
+    /// Show the "Bind buttons" overlay (the gamepad-to-touch markers).
+    bind_buttons: bool,
     network: bool,
     game_center_authenticated: bool,
     analog_stick_tilt_controls: bool,
@@ -782,6 +786,7 @@ impl PickerSettings {
             memory_limit_mb: None,
             cheat_engine: quick_options_trainer_enabled(options),
             quick_menu: options.quick_menu,
+            bind_buttons: options.bind_buttons,
             network: options.network_access,
             game_center_authenticated: options.game_center_authenticated,
             analog_stick_tilt_controls: options.analog_stick_tilt_controls,
@@ -844,6 +849,7 @@ impl PickerSettings {
                 }
                 "cheat_engine" => set_bool(value, &mut settings.cheat_engine),
                 "quick_menu" => set_bool(value, &mut settings.quick_menu),
+                "bind_buttons" => set_bool(value, &mut settings.bind_buttons),
                 "network" => set_bool(value, &mut settings.network),
                 "game_center_authenticated" => {
                     set_bool(value, &mut settings.game_center_authenticated)
@@ -889,6 +895,7 @@ impl PickerSettings {
              memory_limit_mb={}\n\
              cheat_engine={}\n\
              quick_menu={}\n\
+             bind_buttons={}\n\
              network={}\n\
              game_center_authenticated={}\n\
              analog_stick_tilt_controls={}\n\
@@ -913,6 +920,7 @@ impl PickerSettings {
                 .map_or_else(|| "default".to_string(), |mb| mb.to_string()),
             self.cheat_engine,
             self.quick_menu,
+            self.bind_buttons,
             self.network,
             self.game_center_authenticated,
             self.analog_stick_tilt_controls,
@@ -1206,6 +1214,10 @@ const CLASSES: ClassExports = objc_classes! {
 - (())quickMenu:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).quick_menu = Some(switch_state);
+}
+- (())bindButtons:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).bind_buttons = Some(switch_state);
 }
 - (())dladdr:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -1525,6 +1537,7 @@ fn app_picker_inner(
     let mut quick_options_force_composition_override = Some(picker_settings.force_composition);
     let mut quick_options_cheat_engine = picker_settings.cheat_engine;
     let mut quick_options_quick_menu = picker_settings.quick_menu;
+    let mut quick_options_bind_buttons = picker_settings.bind_buttons;
     let mut quick_options_dladdr = picker_settings.dladdr;
     let mut quick_options_gles_native = picker_settings.gles_native;
     let mut quick_options_no_gles3 = picker_settings.no_gles3;
@@ -2149,6 +2162,8 @@ fn app_picker_inner(
             picker_settings.game_center_authenticated = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.quick_menu) {
             quick_options_quick_menu = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.bind_buttons) {
+            quick_options_bind_buttons = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.dladdr) {
             quick_options_dladdr = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.cheat_engine) {
@@ -2261,6 +2276,7 @@ fn app_picker_inner(
         picker_settings.memory_limit_mb = quick_options_memory_limit_mb;
         picker_settings.cheat_engine = quick_options_cheat_engine;
         picker_settings.quick_menu = quick_options_quick_menu;
+        picker_settings.bind_buttons = quick_options_bind_buttons;
         picker_settings.dladdr = quick_options_dladdr;
         picker_settings.network = quick_options_network;
         picker_settings.analog_stick_tilt_controls = quick_options_analog_stick_tilt_controls;
@@ -2356,6 +2372,14 @@ fn app_picker_inner(
             "--quick-menu"
         } else {
             "--no-quick-menu"
+        }
+        .to_string(),
+    );
+    option_args.push(
+        if picker_settings.bind_buttons {
+            "--bind-buttons"
+        } else {
+            "--no-bind-buttons"
         }
         .to_string(),
     );
@@ -4493,6 +4517,12 @@ fn setup_settings(
             ],
         ),
     ];
+    display_rows.push(SettingsRow::Toggle(
+        "Bind buttons",
+        "bindButtons:",
+        picker_settings.bind_buttons,
+        true,
+    ));
     if show_fullscreen_row {
         display_rows.push(SettingsRow::Toggle(
             "Fullscreen (override)",

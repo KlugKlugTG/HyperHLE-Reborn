@@ -706,6 +706,10 @@ pub enum FingerId {
     ButtonToTouch(crate::options::Button),
     StickToTouch,
     DpadToTouch,
+    /// The synthetic finger of an on-screen marker of the "Bind buttons"
+    /// overlay. The id is the marker's own id, which stays stable while the
+    /// marker exists.
+    BoundButton(u8),
 }
 pub type Coords = (f32, f32);
 
@@ -1751,6 +1755,30 @@ impl Window {
             // Round to match touch precision of official devices.
             (out_x.round(), out_y.round())
         }
+        /// Turns a marker's normalized position into the window coordinates
+        /// `transform_input_coords` expects, using the same rounded viewport
+        /// that touch hit-testing uses. Deriving them from the viewport (not
+        /// from the marker's own rect) keeps the synthetic finger exactly on
+        /// the control the marker covers at any scale or letterboxing.
+        fn bind_marker_window_coords(window: &Window, (x, y): (f32, f32)) -> (f32, f32) {
+            let (vx, vy, vw, vh) = window.viewport();
+            (
+                vx as f32 + (x.clamp(0.0, 1.0) * vw as f32).round(),
+                vy as f32 + (y.clamp(0.0, 1.0) * vh as f32).round(),
+            )
+        }
+        /// The synthetic finger for one marker change, in guest coordinates.
+        fn bound_button_touch(
+            window: &Window,
+            change: crate::button_bind::MarkerTouch,
+        ) -> (FingerId, Coords) {
+            let coords = transform_input_coords(
+                window,
+                bind_marker_window_coords(window, change.position),
+                false,
+            );
+            (FingerId::BoundButton(change.marker), coords)
+        }
         fn transform_virt_accel_coords(window: &Window, (in_x, in_y): (i32, i32)) -> (f32, f32) {
             let coords = window.mouse_drawable_coords((in_x, in_y));
             let (x, y) = geometry::normalize_viewport_coords(coords, window.viewport());
@@ -1769,6 +1797,9 @@ impl Window {
                 sdl2::controller::Button::Y => Some(crate::options::Button::Y),
                 sdl2::controller::Button::LeftShoulder => {
                     Some(crate::options::Button::LeftShoulder)
+                }
+                sdl2::controller::Button::RightShoulder => {
+                    Some(crate::options::Button::RightShoulder)
                 }
                 _ => None,
             }
@@ -1862,6 +1893,9 @@ impl Window {
                     if crate::quick_menu::touch_down(abs_coords, self.viewport()) {
                         continue;
                     }
+                    if crate::button_bind::touch_down(abs_coords, self.viewport()) {
+                        continue;
+                    }
                     if crate::trainer_ui::touch_down(abs_coords, self.viewport()) {
                         continue;
                     }
@@ -1879,6 +1913,9 @@ impl Window {
                     if crate::quick_menu::touch_motion(abs_coords, self.viewport()) {
                         continue;
                     }
+                    if crate::button_bind::touch_motion(abs_coords, self.viewport()) {
+                        continue;
+                    }
                     if crate::trainer_ui::touch_motion(abs_coords, self.viewport()) {
                         continue;
                     }
@@ -1894,6 +1931,9 @@ impl Window {
                 } => {
                     let abs_coords = self.mouse_drawable_coords((x, y));
                     if crate::quick_menu::touch_up(abs_coords, self.viewport()) {
+                        continue;
+                    }
+                    if crate::button_bind::touch_up(abs_coords, self.viewport()) {
                         continue;
                     }
                     if crate::trainer_ui::touch_up(abs_coords, self.viewport()) {
@@ -1918,6 +1958,25 @@ impl Window {
                     let Some(button) = translate_button(button) else {
                         continue;
                     };
+                    // The "Bind buttons" overlay gets first dibs: while a
+                    // marker waits for a button, a press binds it instead of
+                    // reaching the normal controller mapping. A button bound
+                    // to a marker holds a synthetic finger down on it.
+                    let pressed = matches!(event, E::ControllerButtonDown { .. });
+                    if let Some(changes) = crate::button_bind::gamepad_button(button, pressed) {
+                        for change in changes {
+                            let touch = bound_button_touch(self, change);
+                            self.event_queue.push_back(
+                                match change.action {
+                                    crate::button_bind::MarkerAction::Down => {
+                                        Event::TouchesDown(HashMap::from([touch]))
+                                    }
+                                    _ => Event::TouchesUp(HashMap::from([touch])),
+                                },
+                            );
+                        }
+                        continue;
+                    }
                     // Called whenever a DPad direction is pressed or released
                     if (button == crate::options::Button::DPadLeft
                         || button == crate::options::Button::DPadUp
@@ -2133,7 +2192,18 @@ impl Window {
                         E::FingerUp { .. } => crate::quick_menu::touch_up(abs_coords, self.viewport()),
                         _ => crate::quick_menu::touch_motion(abs_coords, self.viewport()),
                     };
+                    let bind_consumed = !quick_menu_consumed
+                        && match event {
+                            E::FingerDown { .. } => {
+                                crate::button_bind::touch_down(abs_coords, self.viewport())
+                            }
+                            E::FingerUp { .. } => {
+                                crate::button_bind::touch_up(abs_coords, self.viewport())
+                            }
+                            _ => crate::button_bind::touch_motion(abs_coords, self.viewport()),
+                        };
                     let trainer_consumed = !quick_menu_consumed
+                        && !bind_consumed
                         && match event {
                             E::FingerDown { .. } => {
                                 crate::trainer_ui::touch_down(abs_coords, self.viewport())
@@ -2145,7 +2215,7 @@ impl Window {
                         };
                     let coords = transform_input_coords(self, abs_coords, false);
                     log_dbg!("Finger event x {}, y {}, coords {:?}", x, y, coords);
-                    let mut map = if quick_menu_consumed || trainer_consumed {
+                    let mut map = if quick_menu_consumed || bind_consumed || trainer_consumed {
                         HashMap::new()
                     } else {
                         HashMap::from([(FingerId::Touch(finger_id), coords)])
@@ -2185,7 +2255,18 @@ impl Window {
                                     E::FingerUp { .. } => crate::quick_menu::touch_up(abs_coords, self.viewport()),
                                     _ => crate::quick_menu::touch_motion(abs_coords, self.viewport()),
                                 };
+                                let bind_consumed = !quick_menu_consumed
+                                    && match next {
+                                        E::FingerDown { .. } => {
+                                            crate::button_bind::touch_down(abs_coords, self.viewport())
+                                        }
+                                        E::FingerUp { .. } => {
+                                            crate::button_bind::touch_up(abs_coords, self.viewport())
+                                        }
+                                        _ => crate::button_bind::touch_motion(abs_coords, self.viewport()),
+                                    };
                                 let trainer_consumed = !quick_menu_consumed
+                                    && !bind_consumed
                                     && match next {
                                         E::FingerDown { .. } => {
                                             crate::trainer_ui::touch_down(abs_coords, self.viewport())
@@ -2196,7 +2277,7 @@ impl Window {
                                         _ => crate::trainer_ui::touch_motion(abs_coords, self.viewport()),
                                     };
                                 let coords = transform_input_coords(self, abs_coords, false);
-                                if !quick_menu_consumed && !trainer_consumed {
+                                if !quick_menu_consumed && !bind_consumed && !trainer_consumed {
                                     map.insert(FingerId::Touch(finger_id), coords);
                                 }
                             }
@@ -2408,6 +2489,21 @@ impl Window {
             if !up.is_empty() {
                 self.event_queue.push_back(Event::TouchesUp(up));
             }
+        }
+        // Marker touches the overlay still owes the guest: the Up of a
+        // marker that went away while its button was held, and the Move of a
+        // marker dragged while held.
+        while let Some(change) = crate::button_bind::take_pending_change() {
+            let touch = bound_button_touch(self, change);
+            self.event_queue.push_back(match change.action {
+                crate::button_bind::MarkerAction::Down => {
+                    Event::TouchesDown(HashMap::from([touch]))
+                }
+                crate::button_bind::MarkerAction::Move => {
+                    Event::TouchesMove(HashMap::from([touch]))
+                }
+                crate::button_bind::MarkerAction::Up => Event::TouchesUp(HashMap::from([touch])),
+            });
         }
         if controller_updated {
             let (new_x, new_y, pressed, pressed_changed, moved) =

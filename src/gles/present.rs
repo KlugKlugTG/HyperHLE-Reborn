@@ -218,6 +218,8 @@ pub unsafe fn present_frame(
     crate::trainer_ui::draw(gles, viewport);
     // Quick menu button + panel (top-left corner).
     crate::quick_menu::draw(gles, viewport);
+    // "Bind buttons" overlay (gamepad-to-touch markers and their menu).
+    crate::button_bind::draw(gles, viewport);
 
     gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::TRUE);
 }

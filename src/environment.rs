@@ -1217,6 +1217,11 @@ impl Environment {
             env.options.memory_limit_mb,
             !env.options.trainer_disabled,
         );
+        // The "Bind buttons" overlay loads this app's saved gamepad bindings.
+        crate::button_bind::init(
+            env.options.bind_buttons,
+            Some(launched_bundle_id.as_str()),
+        );
 
         if env.options.dumping_options.any() {
             env.dump_file =
@@ -1436,9 +1441,11 @@ impl Environment {
 
         env.cpu.set_cpsr(cpu::Cpu::CPSR_USER_MODE);
 
-        // The quick menu belongs to games, not to the picker's own screen.
+        // The quick menu and the "Bind buttons" overlay belong to games, not
+        // to the picker's own screen.
         if !env.options.headless {
             crate::quick_menu::disable();
+            crate::button_bind::disable();
         }
 
         // GDB server setup would be done here, but there's no need for it.

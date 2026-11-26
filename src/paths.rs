@@ -121,6 +121,10 @@ pub const PICKER_SETTINGS_FILE: &str = "HyperHLE_picker_settings.txt";
 /// Name of the file recording the most recently launched app.
 pub const LAST_APP_FILE: &str = "HyperHLE_last_app.txt";
 
+/// Gamepad button bindings for the "Bind buttons" overlay: one line per app,
+/// `<bundle id>: x,y,Button;x,y,Button;...` with normalized co-ordinates.
+pub const BUTTON_BINDINGS_FILE: &str = "HyperHLE_button_bindings.txt";
+
 /// Names of files the user can put a wallpaper image (for the app picker) in.
 #[allow(unused)]
 pub const WALLPAPER_FILES: &[&str] = &[

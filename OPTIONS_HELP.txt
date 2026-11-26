@@ -449,6 +449,23 @@ Other options:
     --no-quick-menu
         Hide the quick menu button (the default).
 
+    --bind-buttons
+        Show a BlueStacks-style "Bind buttons" overlay ("Bind buttons" in the
+        graphical settings screen's Display section): a button at the top
+        centre of the screen opens a menu where on-screen buttons can be
+        added. Drag an added button to move it, then tap it and press a
+        gamepad button to bind the two: pressing that gamepad button while
+        the game runs holds a finger down on that spot of the simulated
+        screen. A button that is waiting for a gamepad button shows the pad
+        button's name once bound; tapping it again removes it. "Clear all"
+        removes every button of the app.
+
+        The bindings are saved per app in HyperHLE_button_bindings.txt, so
+        they survive a restart.
+
+    --no-bind-buttons
+        Hide the "Bind buttons" overlay (the default).
+
     --force-composition
         Forces presentation of renderbuffer as if no fullscreen EAGL layer is
         present, i.e. renderbuffer will go through the compositor.
