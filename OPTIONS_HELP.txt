@@ -171,9 +171,15 @@ Game controller options:
         screen of the device. Pressing the button will behave like touching that
         part of the screen.
 
-        This is three parts separated by commas: the name of a button (DPadLeft,
-        DPadUp, DPadRight, DPadDown, Start, LeftShoulder or Xbox-like
-        A, B, X or Y), the X co-ordinate and the Y co-ordinate.
+        This is three parts separated by commas: the name of a button, the X
+        co-ordinate and the Y co-ordinate. The button names are DPadLeft,
+        DPadUp, DPadRight, DPadDown, Start, A, B, X, Y, LeftShoulder,
+        RightShoulder, LeftTrigger, RightTrigger, and the four directions of
+        each stick: LeftStickLeft, LeftStickRight, LeftStickUp, LeftStickDown
+        and the same four with RightStick. A trigger counts as pressed once it
+        is pulled past half-travel, and a stick direction counts while the
+        stick is past its deadzone on that side (so down-left is both
+        LeftStickLeft and LeftStickDown).
         The co-ordinates are floating-point (decimal) numbers. 0,0 is the
         top-left corner. The bottom-right corner is 320,480 if the app is in
         portrait, and 480,320 if the app is in landscape.
@@ -462,6 +468,12 @@ Other options:
 
         The bindings are saved per app in HyperHLE_button_bindings.txt, so
         they survive a restart.
+
+        Every face button, D-pad direction, shoulder and trigger can be
+        bound, and so can each of the eight stick directions: pushing the
+        left stick left lights up a marker bound to LeftStickLeft, and
+        pushing it down-left presses both LeftStickLeft and LeftStickDown.
+        A trigger counts as pressed once it is pulled past half-travel.
 
     --no-bind-buttons
         Hide the "Bind buttons" overlay (the default).

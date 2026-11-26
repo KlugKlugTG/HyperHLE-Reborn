@@ -30,6 +30,20 @@ pub enum Button {
     Y,
     LeftShoulder,
     RightShoulder,
+    /// Left trigger, the analog `LeftTrigger` axis past its trigger point.
+    LeftTrigger,
+    /// Right trigger, the analog `RightTrigger` axis past its trigger point.
+    RightTrigger,
+    // The four directions of each analog stick are separate buttons, so they
+    // can be bound to spots on the touch screen like any other button.
+    LeftStickLeft,
+    LeftStickRight,
+    LeftStickUp,
+    LeftStickDown,
+    RightStickLeft,
+    RightStickRight,
+    RightStickUp,
+    RightStickDown,
 }
 
 impl Button {
@@ -48,6 +62,16 @@ impl Button {
             Button::Y => "Y",
             Button::LeftShoulder => "LeftShoulder",
             Button::RightShoulder => "RightShoulder",
+            Button::LeftTrigger => "LeftTrigger",
+            Button::RightTrigger => "RightTrigger",
+            Button::LeftStickLeft => "LeftStickLeft",
+            Button::LeftStickRight => "LeftStickRight",
+            Button::LeftStickUp => "LeftStickUp",
+            Button::LeftStickDown => "LeftStickDown",
+            Button::RightStickLeft => "RightStickLeft",
+            Button::RightStickRight => "RightStickRight",
+            Button::RightStickUp => "RightStickUp",
+            Button::RightStickDown => "RightStickDown",
         }
     }
 
@@ -65,6 +89,16 @@ impl Button {
             "Y" => Button::Y,
             "LeftShoulder" => Button::LeftShoulder,
             "RightShoulder" => Button::RightShoulder,
+            "LeftTrigger" => Button::LeftTrigger,
+            "RightTrigger" => Button::RightTrigger,
+            "LeftStickLeft" => Button::LeftStickLeft,
+            "LeftStickRight" => Button::LeftStickRight,
+            "LeftStickUp" => Button::LeftStickUp,
+            "LeftStickDown" => Button::LeftStickDown,
+            "RightStickLeft" => Button::RightStickLeft,
+            "RightStickRight" => Button::RightStickRight,
+            "RightStickUp" => Button::RightStickUp,
+            "RightStickDown" => Button::RightStickDown,
             _ => return None,
         })
     }
@@ -81,9 +115,25 @@ impl Button {
             Button::B => "B",
             Button::X => "X",
             Button::Y => "Y",
-            Button::LeftShoulder => "L1",
-            Button::RightShoulder => "R1",
+            Button::LeftShoulder => "LB",
+            Button::RightShoulder => "RB",
+            Button::LeftTrigger => "LT",
+            Button::RightTrigger => "RT",
+            Button::LeftStickLeft => "<LS",
+            Button::LeftStickRight => ">LS",
+            Button::LeftStickUp => "^LS",
+            Button::LeftStickDown => "vLS",
+            Button::RightStickLeft => "<RS",
+            Button::RightStickRight => ">RS",
+            Button::RightStickUp => "^RS",
+            Button::RightStickDown => "vRS",
         }
+    }
+
+    /// The name the overlay shows once the button is bound. The bindings
+    /// file always keeps the [Button::short_name] spelling instead.
+    pub fn display_name(self) -> &'static str {
+        self.marker_label()
     }
 }
 
@@ -1106,9 +1156,20 @@ mod option_parsing_tests {
             Button::Y,
             Button::LeftShoulder,
             Button::RightShoulder,
+            Button::LeftTrigger,
+            Button::RightTrigger,
+            Button::LeftStickLeft,
+            Button::LeftStickRight,
+            Button::LeftStickUp,
+            Button::LeftStickDown,
+            Button::RightStickLeft,
+            Button::RightStickRight,
+            Button::RightStickUp,
+            Button::RightStickDown,
         ] {
             assert_eq!(Button::from_short_name(button.short_name()), Some(button));
             assert!(!button.marker_label().is_empty());
+            assert!(!button.display_name().is_empty());
         }
         assert_eq!(Button::from_short_name("NoSuchButton"), None);
     }

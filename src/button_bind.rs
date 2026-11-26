@@ -47,6 +47,9 @@ const MAX_MARKERS: usize = 32;
 const DRAG_THRESHOLD: f32 = 10.0;
 /// Markers never get smaller than this on tiny windows.
 const MIN_MARKER_SIZE: f32 = 18.0;
+/// The marker size in unscaled pixels. It grows with the screen, so it stays
+/// big enough for a two-character label like "RT" or "<LS" at any scale.
+const MARKER_SIZE: f32 = 46.0;
 
 // Widget ids of the overlay chrome. Everything the overlay draws is also a
 // touch target; the id travels through `Ui::pending` between down and up.
@@ -91,7 +94,7 @@ impl Marker {
     /// The text on the marker. Unbound markers ask for a binding.
     fn label(self) -> String {
         match self.button {
-            Some(button) => button.marker_label().to_string(),
+            Some(button) => button.display_name().to_string(),
             None => "?".to_string(),
         }
     }
@@ -137,6 +140,102 @@ impl Ui {
 }
 
 static UI: Mutex<Ui> = Mutex::new(Ui::new());
+
+/// Which axis each stick direction comes from, and whether it is the
+/// positive end of the axis.
+const STICK_DIRECTIONS: [(Button, usize, bool); 8] = [
+    (Button::LeftStickLeft, 0, false),
+    (Button::LeftStickRight, 0, true),
+    (Button::LeftStickUp, 1, false),
+    (Button::LeftStickDown, 1, true),
+    (Button::RightStickLeft, 2, false),
+    (Button::RightStickRight, 2, true),
+    (Button::RightStickUp, 3, false),
+    (Button::RightStickDown, 3, true),
+];
+
+/// The analog state `crate::window` reads from the controllers. The stick
+/// values are already deadzone-corrected, so 0.0 means "centred" and any
+/// other sign means the stick is pushed that way.
+#[derive(Clone, Copy, Debug)]
+pub struct AxisInputs {
+    /// Left stick X, left stick Y, right stick X, right stick Y.
+    pub sticks: [f32; 4],
+    pub left_trigger: bool,
+    pub right_trigger: bool,
+    /// Raw trigger axis value at which the trigger counts as pressed. SDL
+    /// reports triggers as either 0..32767 or -32768..32767 depending on the
+    /// mapping, so half-travel works for both.
+    pub trigger_point: i16,
+}
+
+impl Default for AxisInputs {
+    fn default() -> Self {
+        Self {
+            sticks: [0.0; 4],
+            left_trigger: false,
+            right_trigger: false,
+            trigger_point: 16_384,
+        }
+    }
+}
+
+/// Turns a sequence of [AxisInputs] samples into button edges.
+///
+/// Each stick direction is a button that is pressed while the stick is past
+/// the deadzone on that side (45 degrees or more), so e.g. pushing
+/// down-left presses both `LeftStickLeft` and `LeftStickDown`, exactly like
+/// holding a gamepad button pair.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AxisTracker {
+    last: AxisInputs,
+    initialized: bool,
+}
+
+impl AxisTracker {
+    /// The edges between the previous sample and `inputs`: `(button, pressed)`.
+    /// The first sample never produces edges, so turning the overlay on with
+    /// a stick already pushed does not fire a phantom press.
+    pub fn edges(&mut self, inputs: AxisInputs) -> Vec<(Button, bool)> {
+        let mut edges = Vec::new();
+        if self.initialized {
+            for (button, axis, positive) in STICK_DIRECTIONS {
+                let now = direction_pressed(inputs.sticks[axis], positive);
+                let before = direction_pressed(self.last.sticks[axis], positive);
+                if now != before {
+                    edges.push((button, now));
+                }
+            }
+            for (button, now, before) in [
+                (Button::LeftTrigger, inputs.left_trigger, self.last.left_trigger),
+                (Button::RightTrigger, inputs.right_trigger, self.last.right_trigger),
+            ] {
+                if now != before {
+                    edges.push((button, now));
+                }
+            }
+        }
+        self.last = inputs;
+        self.initialized = true;
+        edges
+    }
+}
+
+/// Whether a stick is pushed towards the positive (or negative) end of its
+/// axis far enough to count as that direction.
+fn direction_pressed(value: f32, positive: bool) -> bool {
+    if positive {
+        value > 0.0
+    } else {
+        value < 0.0
+    }
+}
+
+/// `crate::window` keeps one tracker per window and calls
+/// [AxisTracker::edges] on every poll.
+pub fn axis_edges(tracker: &mut AxisTracker, inputs: AxisInputs) -> Vec<(Button, bool)> {
+    tracker.edges(inputs)
+}
 
 /// Changes the guest still has to be told about: a marker that went away or
 /// moved while its gamepad button was held, and whose Up/Move has not been
@@ -556,7 +655,7 @@ fn compute_layout(ui: &Ui, viewport: (u32, u32, u32, u32)) -> Layout {
     } else {
         None
     };
-    let marker_size = (44.0 * s).max(MIN_MARKER_SIZE);
+    let marker_size = (MARKER_SIZE * s).max(MIN_MARKER_SIZE);
     let markers = ui
         .markers
         .iter()
@@ -676,7 +775,12 @@ unsafe fn build_scene(
             marker.label()
         };
         // Centred by eye: the atlas has no side bearings to measure with.
-        let label_size = 11.0 * s;
+        // `s` shrinks when a long label would not fit the marker, so "L1" and
+        // "<LS" both stay inside it at any screen size.
+        let marker_scale = (rect.w / MARKER_SIZE).clamp(0.4, 3.0);
+        let label_size = (11.0 * marker_scale)
+            .min(rect.w / (label.chars().count() as f32 * 0.62).max(1.0));
+        let label_size = label_size.max(1.0);
         let label_width = (label.chars().count() as f32) * label_size * 0.6;
         scene.text(
             gles,
@@ -1112,6 +1216,132 @@ mod tests {
         assert!(touch_down_inner_abs(&mut ui, (240.0, 300.0), VIEWPORT));
         assert!(!ui.menu_open);
         assert!(touch_motion_inner_abs(&mut ui, (240.0, 301.0), VIEWPORT));
+    }
+
+    fn sticks(left_x: f32, left_y: f32, right_x: f32, right_y: f32) -> AxisInputs {
+        AxisInputs {
+            sticks: [left_x, left_y, right_x, right_y],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stick_directions_become_button_edges() {
+        let mut tracker = AxisTracker::default();
+        // The first sample only records the baseline.
+        assert!(tracker.edges(sticks(0.0, 0.0, 0.0, 0.0)).is_empty());
+        // Push the left stick left and up: two presses, one per direction.
+        let edges = tracker.edges(sticks(-1.0, -1.0, 0.0, 0.0));
+        assert_eq!(
+            edges,
+            vec![
+                (Button::LeftStickLeft, true),
+                (Button::LeftStickUp, true)
+            ]
+        );
+        // Holding it must not retrigger.
+        assert!(tracker.edges(sticks(-1.0, -1.0, 0.0, 0.0)).is_empty());
+        // Swinging to the right releases one direction and presses the other.
+        let edges = tracker.edges(sticks(0.8, -1.0, 0.0, 0.0));
+        assert_eq!(
+            edges,
+            vec![
+                (Button::LeftStickLeft, false),
+                (Button::LeftStickRight, true)
+            ]
+        );
+        // Centring releases everything that was held.
+        let edges = tracker.edges(sticks(0.0, 0.0, 0.0, 0.0));
+        assert_eq!(
+            edges,
+            vec![
+                (Button::LeftStickRight, false),
+                (Button::LeftStickUp, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn each_stick_has_its_own_four_directions() {
+        let mut tracker = AxisTracker::default();
+        tracker.edges(AxisInputs::default());
+        let edges = tracker.edges(sticks(0.0, 0.0, 1.0, 1.0));
+        assert_eq!(
+            edges,
+            vec![
+                (Button::RightStickRight, true),
+                (Button::RightStickDown, true)
+            ]
+        );
+        let mut tracker = AxisTracker::default();
+        tracker.edges(AxisInputs::default());
+        let edges = tracker.edges(sticks(0.0, 0.0, -1.0, -1.0));
+        assert_eq!(
+            edges,
+            vec![
+                (Button::RightStickLeft, true),
+                (Button::RightStickUp, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn triggers_are_edges_too() {
+        let mut tracker = AxisTracker::default();
+        tracker.edges(AxisInputs::default());
+        let mut inputs = AxisInputs::default();
+        inputs.left_trigger = true;
+        assert_eq!(tracker.edges(inputs), vec![(Button::LeftTrigger, true)]);
+        inputs.left_trigger = false;
+        inputs.right_trigger = true;
+        assert_eq!(
+            tracker.edges(inputs),
+            vec![(Button::LeftTrigger, false), (Button::RightTrigger, true)]
+        );
+        assert_eq!(
+            tracker.edges(AxisInputs::default()),
+            vec![(Button::RightTrigger, false)]
+        );
+    }
+
+    #[test]
+    fn turning_the_overlay_on_with_a_stick_pushed_does_not_press_anything() {
+        // The tracker keeps its baseline while the overlay is off, so the
+        // first sample after enabling it is a no-op.
+        let mut tracker = AxisTracker::default();
+        tracker.edges(sticks(-1.0, 0.0, 0.0, 0.0));
+        assert!(tracker.edges(sticks(-1.0, 0.0, 0.0, 0.0)).is_empty());
+    }
+
+    /// Every stick direction and trigger is a real button, so a marker can be
+    /// bound to it like to A or X.
+    #[test]
+    fn stick_and_trigger_buttons_can_be_bound_to_markers() {
+        for button in [
+            Button::LeftStickLeft,
+            Button::LeftStickRight,
+            Button::LeftStickUp,
+            Button::LeftStickDown,
+            Button::RightStickLeft,
+            Button::RightStickRight,
+            Button::RightStickUp,
+            Button::RightStickDown,
+            Button::LeftTrigger,
+            Button::RightTrigger,
+            Button::LeftShoulder,
+            Button::RightShoulder,
+        ] {
+            let mut ui = ui_with_marker(0.5, 0.5);
+            tap(&mut ui, (240.0, 160.0), VIEWPORT);
+            let changes = apply_gamepad(&mut ui, button, true).expect("the press is ours");
+            assert!(changes.is_empty(), "{button:?} only bound, did not press");
+            assert_eq!(ui.markers[0].button, Some(button));
+            let changes = apply_gamepad(&mut ui, button, true).expect("now it presses");
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].action, MarkerAction::Down);
+            let changes = apply_gamepad(&mut ui, button, false).expect("and releases");
+            assert_eq!(changes[0].action, MarkerAction::Up);
+        }
     }
 
     #[test]

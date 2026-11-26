@@ -1046,6 +1046,8 @@ pub struct Window {
     active_controller_touches: HashMap<i64, Coords>,
     dpad_state: DpadState,
     stick_active: bool,
+    /// Turns the sticks and triggers into button presses for "Bind buttons".
+    bind_axis_tracker: crate::button_bind::AxisTracker,
     _sensor_ctx: sdl2::SensorSubsystem,
     accelerometer: Option<sdl2::sensor::Sensor>,
     gyroscope: Option<sdl2::sensor::Sensor>,
@@ -1480,6 +1482,7 @@ impl Window {
                 active: false,
             },
             stick_active: false,
+            bind_axis_tracker: crate::button_bind::AxisTracker::default(),
             _sensor_ctx: sensor_ctx,
             accelerometer,
             gyroscope,
@@ -1809,6 +1812,11 @@ impl Window {
             (screen_width as f32 * x, screen_height as f32 * y)
         }
 
+        // The stick/trigger state is polled, not event-driven, so it is
+        // sampled on every poll and played through the overlay at the end.
+        let axis_inputs = self.bind_axis_inputs(options);
+        let mut bind_edges =
+            crate::button_bind::axis_edges(&mut self.bind_axis_tracker, axis_inputs);
         let mut controller_updated = false;
         // event_pump doesn't have a method to peek on events
         // so, we keep track of an unconsumed one from a previous loop iteration
@@ -2490,6 +2498,19 @@ impl Window {
                 self.event_queue.push_back(Event::TouchesUp(up));
             }
         }
+        // Stick and trigger directions are ordinary buttons to the overlay.
+        for (button, pressed) in bind_edges.drain(..) {
+            if let Some(changes) = crate::button_bind::gamepad_button(button, pressed) {
+                for change in changes {
+                    let touch = bound_button_touch(self, change);
+                    self.event_queue.push_back(if change.down {
+                        Event::TouchesDown(HashMap::from([touch]))
+                    } else {
+                        Event::TouchesUp(HashMap::from([touch]))
+                    });
+                }
+            }
+        }
         // Marker touches the overlay still owes the guest: the Up of a
         // marker that went away while its button was held, and the Move of a
         // marker dragged while held.
@@ -2838,6 +2859,31 @@ impl Window {
             pressed != old_pressed,
             x != old_x || y != old_y,
         )
+    }
+
+    /// The combined analog state of every controller, for the "Bind
+    /// buttons" overlay's stick and trigger directions.
+    fn bind_axis_inputs(&self, options: &Options) -> crate::button_bind::AxisInputs {
+        fn convert_axis(axis: i16, deadzone: f32) -> f32 {
+            let axis = ((axis as f32) / (i16::MAX as f32)).clamp(-1.0, 1.0);
+            let abs_axis = (axis.abs().max(deadzone) - deadzone) / (1.0 - deadzone);
+            abs_axis.copysign(axis)
+        }
+
+        let mut inputs = crate::button_bind::AxisInputs::default();
+        for controller in &self.controllers {
+            use sdl2::controller::Axis;
+            inputs.sticks[0] += convert_axis(controller.axis(Axis::LeftX), options.deadzone);
+            inputs.sticks[1] += convert_axis(controller.axis(Axis::LeftY), options.deadzone);
+            inputs.sticks[2] += convert_axis(controller.axis(Axis::RightX), options.deadzone);
+            inputs.sticks[3] += convert_axis(controller.axis(Axis::RightY), options.deadzone);
+            inputs.left_trigger |= controller.axis(Axis::TriggerLeft) > inputs.trigger_point;
+            inputs.right_trigger |= controller.axis(Axis::TriggerRight) > inputs.trigger_point;
+        }
+        for value in &mut inputs.sticks {
+            *value = value.clamp(-1.0, 1.0);
+        }
+        inputs
     }
 
     /// Get the summed X and Y positions and button state of the left or right
