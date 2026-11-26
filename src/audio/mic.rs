@@ -114,6 +114,9 @@ static BACKEND: Mutex<Backend> = Mutex::new(Backend::None);
 /// opening capture or checking recording permission. Other hosts probe
 /// OpenAL capture once and cache the answer.
 pub fn has_microphone() -> bool {
+    if fake_mic_enabled() {
+        return true;
+    }
     #[cfg(target_os = "android")]
     {
         return crate::android_media::jni_has_microphone();
@@ -141,6 +144,20 @@ pub fn has_microphone() -> bool {
                 yes
             }
         }
+    }
+}
+
+/// Whether the user forced microphone availability with
+/// `TOUCHHLE_FAKE_MIC=1`. With this set the guest always sees an "available"
+/// microphone; on hosts with no usable capture device the shared stream then
+/// simply advances with silence, like an unplugged headset mic.
+pub fn fake_mic_enabled() -> bool {
+    match std::env::var("TOUCHHLE_FAKE_MIC") {
+        Ok(value) => {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        }
+        Err(_) => false,
     }
 }
 
@@ -245,6 +262,11 @@ pub fn start() -> bool {
         }
     }
 
+    if fake_mic_enabled() && !available {
+        log_once!(
+            "Fake microphone active (TOUCHHLE_FAKE_MIC=1); feeding silence."
+        );
+    }
     if !available {
         log_once!("No host microphone available; microphone input will be silent.");
     }
