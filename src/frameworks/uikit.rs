@@ -15,6 +15,7 @@ use std::time::Instant;
 use crate::dyld::{export_c_func, FunctionExports, HostConstant};
 use crate::frameworks::core_graphics::cg_geometry::CGSize;
 use crate::mem::{ConstVoidPtr, MutPtr};
+use crate::objc::id;
 
 /// HyperHLE does not emulate an active iOS Guided Access session.
 /// `BOOL UIAccessibilityIsVoiceOverRunning(void)`
@@ -32,9 +33,26 @@ fn UIAccessibilityIsGuidedAccessEnabled(_env: &mut Environment) -> bool {
     false
 }
 
+/// `void UIAccessibilityPostNotification(
+///     UIAccessibilityPostNotification notification, id argument)`
+///
+/// HyperHLE does not model assistive technologies, so posting an
+/// accessibility notification has no observable effect. Exporting a real
+/// no-op (instead of the generic return-0 stub) silences the "call to
+/// unimplemented function _UIAccessibilityPostNotification" warning; as the
+/// real function returns `void`, there is no value to fake either.
+/// https://developer.apple.com/documentation/uikit/1615130-uiaccessibilitypostnotification
+fn UIAccessibilityPostNotification(
+    _env: &mut Environment,
+    _notification: id,
+    _argument: id,
+) {
+}
+
 const FUNCTIONS: FunctionExports = &[
     export_c_func!(UIAccessibilityIsGuidedAccessEnabled()),
     export_c_func!(UIAccessibilityIsVoiceOverRunning()),
+    export_c_func!(UIAccessibilityPostNotification(_, _)),
 ];
 
 pub mod ns_paragraph_style;
@@ -1202,6 +1220,15 @@ mod accessibility_export_tests {
         let exports: Vec<_> = super::DYLIB.function_exports.iter()
             .flat_map(|table| table.iter())
             .filter(|(name, _)| *name == "_UIAccessibilityIsGuidedAccessEnabled")
+            .collect();
+        assert_eq!(exports.len(), 1);
+    }
+
+    #[test]
+    fn accessibility_post_notification_is_exported_as_a_function() {
+        let exports: Vec<_> = super::DYLIB.function_exports.iter()
+            .flat_map(|table| table.iter())
+            .filter(|(name, _)| *name == "_UIAccessibilityPostNotification")
             .collect();
         assert_eq!(exports.len(), 1);
     }

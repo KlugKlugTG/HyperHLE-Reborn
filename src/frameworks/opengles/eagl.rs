@@ -163,6 +163,18 @@ fn effective_eagl_api(
         );
         return kEAGLRenderingAPIOpenGLES2;
     }
+    // Defensive cap, mirroring `clamp_forced_api_for_no_gles3`: normal
+    // context creation refuses ES 3.0 requests earlier (see
+    // `rejects_gles3_request`), but if this function is ever reached with
+    // `no_gles3` set and an ES 3.0 request it must not hand out an ES 3.0
+    // driver either.
+    if no_gles3 && requested == kEAGLRenderingAPIOpenGLES3 {
+        log!(
+            "EAGL: --no-gles3 active, capping requested \
+             kEAGLRenderingAPIOpenGLES3 at kEAGLRenderingAPIOpenGLES2"
+        );
+        return kEAGLRenderingAPIOpenGLES2;
+    }
     requested
 }
 
