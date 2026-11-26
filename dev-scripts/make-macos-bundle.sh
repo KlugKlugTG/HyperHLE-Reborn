@@ -39,6 +39,9 @@ if [[ $# == 3 ]]; then
     plutil -insert CFBundleExecutable -string touchHLE "$APP_NAME.app"/Contents/Info.plist
     plutil -insert CFBundleIconFile -string "$ICON_NAME" "$APP_NAME.app"/Contents/Info.plist
     plutil -insert NSHighResolutionCapable -bool YES "$APP_NAME.app"/Contents/Info.plist
+    plutil -insert NSMicrophoneUsageDescription -string \
+        "HyperHLE needs microphone access for games that record sound." \
+        "$APP_NAME.app"/Contents/Info.plist
 else
     echo "Incorrect usage."
     exit 1

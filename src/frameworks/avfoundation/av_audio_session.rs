@@ -606,8 +606,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (bool)isInputAvailable {
     // Real answer from the host microphone (Android: AudioManager /
-    // AudioRecord probe; desktop: no mic bridge, so false).
+    // AudioRecord probe; desktop: CoreAudio probe via mic_macos.c).
     crate::android_media::has_microphone()
+}
+
+- (NSInteger)inputIsAvailableNumberOfChannels {
+    // Legacy mic-detection pair (iOS 2.0-5.x, deprecated in iOS 6): games of
+    // that era often call the channel-count method and treat 0 as "no
+    // microphone", so it must answer the same question as isInputAvailable.
+    if crate::android_media::has_microphone() {
+        1
+    } else {
+        0
+    }
 }
 
 // MARK: - Record permission (iOS 8+)

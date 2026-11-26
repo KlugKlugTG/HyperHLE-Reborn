@@ -1642,22 +1642,33 @@ fn fill_mic_input(
         host_rate
     };
     let want = ((frames as f64) * host_rate / dst_rate).ceil() as usize;
+    // Consume from this unit's own cursor into the shared microphone ring
+    // (see `crate::audio::mic`). The process-wide `read_mic_chunk()` cursor
+    // would make neighbouring render callbacks steal samples from each
+    // other, so every input unit keeps its own position instead. Missing
+    // history (unit enabled long after capture started) jumps to the newest
+    // samples; unfilled tails are zeroed, like the AudioQueue input path.
     let src: Vec<i16> = if crate::android_media::has_microphone() {
-        let chunk = crate::android_media::read_mic_chunk();
-        if chunk.is_empty() {
-            vec![0i16; want]
-        } else if want <= chunk.len() {
-            chunk[..want].to_vec()
-        } else {
-            // Repeat the tail of the chunk (host delivers in ~20-40ms bursts;
-            // stretching by repetition keeps the pitch right).
-            let mut v = Vec::with_capacity(want);
-            while v.len() < want {
-                let take = want - v.len();
-                v.extend_from_slice(&chunk[..take.min(chunk.len())]);
-            }
-            v
-        }
+        let start = {
+            let at = &mut env.framework_state.audio_toolbox;
+            let obj = at
+                .audio_components
+                .audio_component_instances
+                .get_mut(&audio_unit)
+                .expect("mic-enabled RemoteIO unit must exist");
+            let ring_total = crate::audio::mic::total_samples();
+            let cursor = obj.mic_cursor.min(ring_total);
+            // The ring keeps roughly two seconds of history.
+            let start =
+                if ring_total - cursor > 2 * (crate::android_media::MIC_SAMPLE_RATE as u64) {
+                    ring_total.saturating_sub(want as u64)
+                } else {
+                    cursor
+                };
+            obj.mic_cursor = ring_total;
+            start
+        };
+        crate::audio::mic::take_samples(start, want)
     } else {
         vec![0i16; want]
     };

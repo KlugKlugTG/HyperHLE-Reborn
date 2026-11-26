@@ -149,6 +149,13 @@ pub struct AudioComponentInstanceHostObject {
     /// `AudioUnitRender` with real host-mic samples when available.
     pub mic_input_enabled: bool,
 
+    /// Absolute host-sample cursor into the shared microphone ring (see
+    /// `crate::audio::mic`), consumed by this unit's `AudioUnitRender` calls.
+    /// Unlike `read_mic_chunk()`'s process-wide cursor, every input unit
+    /// consumes its own timeline so neighbouring render callbacks cannot
+    /// steal each other's samples.
+    pub mic_cursor: u64,
+
     /// Описание компонента (type, subtype, manufacturer), с которым был
     /// создан инстанс (из `AudioComponentFindNext` или узла AUGraph).
     /// Нужно для `kAudioUnitProperty_ClassInfo` — гость идентифицирует юнит
@@ -204,6 +211,7 @@ impl Default for AudioComponentInstanceHostObject {
             is_3d_mixer: false,
             mixer_buses: HashMap::new(),
             mic_input_enabled: false,
+            mic_cursor: 0,
             component_desc: None,
             audio_channel_layouts: HashMap::new(),
             should_allocate_buffers: HashMap::new(),
