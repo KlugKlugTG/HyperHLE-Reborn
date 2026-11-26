@@ -51,7 +51,7 @@ const MAX_MARKERS: usize = 32;
 /// difference between a drag that starts at the rim and one that starts in
 /// the middle is invisible in a screenshot but decides whether walking works,
 /// so "is this the build with the fix" has to be answerable without guessing.
-const OVERLAY_REVISION: &str = "PADS R4";
+const OVERLAY_REVISION: &str = "PADS R5 DPAD";
 /// Distance, in unscaled pixels, a press has to travel before it counts as a
 /// drag rather than a tap.
 const DRAG_THRESHOLD: f32 = 10.0;
@@ -106,6 +106,10 @@ const LOOK_DEADZONE: f32 = 0.15;
 /// How visible markers and pads are while "hide buttons" is on: faint enough
 /// to stop covering the game, strong enough to see where they are.
 const HIDDEN_ALPHA: f32 = 0.18;
+/// How much a pad fades when something else has taken its stick. It stays on
+/// screen so an enabled pad is always visible and still movable; fading it says
+/// "not sending" without hiding it, which would look like the pad had gone.
+const TAKEN_ALPHA: f32 = 0.32;
 const PAD_COUNT: usize = 2;
 
 // Widget ids of the overlay chrome. Everything the overlay draws is also a
@@ -1598,25 +1602,17 @@ unsafe fn build_scene(
         }
     }
 
-    // The pads: a ring for the circle, a cross for the cross, with the
-    // knob under the thumb and the four arrows lit as the stick pushes.
+    // The pads: a ring for the circle, a cross for the cross, with the knob
+    // under the thumb and the arrows lit as the stick pushes. An enabled pad is
+    // always drawn; [pad_alpha] only decides how strongly.
     for (index, (px, py, radius)) in layout.pads.iter().enumerate() {
+        let Some(alpha) = pad_alpha(&ui, index) else {
+            continue;
+        };
         if *radius <= 0.0 {
             continue;
         }
-        // A pad the camera has taken over is not drawn, so it is not tap-able.
-        if index == 1 && ui.look {
-            continue;
-        }
         let pad = &ui.pads[index];
-        if !pad.enabled {
-            continue;
-        }
-        // The camera owns the right stick, so the cross is not in use.
-        if index == 1 && ui.look {
-            continue;
-        }
-        let alpha = if ui.hidden { HIDDEN_ALPHA } else { 1.0 };
         draw_pad(gles, &mut scene, pad, *px, *py, *radius, alpha);
     }
 
@@ -1773,6 +1769,28 @@ unsafe fn draw_pad(
     }
 }
 
+/// How strongly to draw the pad at `index`, or `None` when it is switched off.
+///
+/// A pad stays visible and grabbable whenever it is enabled. When its stick has
+/// been taken -- by a marker, or by camera mode -- it fades to [TAKEN_ALPHA]
+/// instead of disappearing: a pad the menu says is ON must be on screen, and a
+/// vanished pad is indistinguishable from a broken one.
+fn pad_alpha(ui: &Ui, index: usize) -> Option<f32> {
+    let pad = &ui.pads[index];
+    if !pad.enabled {
+        return None;
+    }
+    let taken = index == 1 && ui.look;
+    let alpha = if ui.hidden {
+        HIDDEN_ALPHA
+    } else if taken {
+        TAKEN_ALPHA
+    } else {
+        1.0
+    };
+    Some(alpha)
+}
+
 /// The dots that make up a pad's outline, in viewport pixels.
 ///
 /// A circle is a ring; a cross is its two arms, which stop short of the middle
@@ -1802,9 +1820,22 @@ fn pad_outline(kind: PadKind, px: f32, py: f32, radius: f32) -> Vec<(f32, f32)> 
     dots
 }
 
-/// The knob's centre in viewport pixels: the stick's push, limited to the
-/// pad's travel.
+/// The knob's centre in viewport pixels.
+///
+/// The circle's knob is the stick's push, limited to the pad's travel. The
+/// cross is a D-pad, so its knob sits on the held direction's arrow or in the
+/// middle: it never drifts through the space between two directions, because
+/// the touch it stands for never does either.
 fn knob_position(pad: &Pad, px: f32, py: f32, radius: f32) -> (f32, f32) {
+    if pad.kind == PadKind::Cross {
+        return match pad.held {
+            Some(direction) => {
+                let (x, y) = PAD_DIRECTIONS_8[direction];
+                (px + x * KNOB_TRAVEL * radius, py + y * KNOB_TRAVEL * radius)
+            }
+            None => (px, py),
+        };
+    }
     let (x, y) = normalize_push(pad.axis.0, pad.axis.1);
     let travel = pad.push.clamp(0.0, 1.0) * KNOB_TRAVEL;
     (px + x * travel * radius, py + y * travel * radius)
@@ -2565,6 +2596,79 @@ mod tests {
         ui.pads[0].enabled = true;
         ui.pads[1].enabled = true;
         ui
+    }
+
+    /// Both symptoms the player reported after build `PADS R4` came from the
+    /// same mistake: an enabled pad was hidden when camera mode was on, and the
+    /// build tag never moved. A pad the menu calls `ON` must always draw.
+    #[test]
+    fn an_enabled_pad_is_always_drawn_even_when_the_camera_has_its_stick() {
+        let mut ui = pads_ui();
+        for cross_on in [false, true] {
+            ui.pads[1].enabled = cross_on;
+            for look in [false, true] {
+                ui.look = look;
+                let alpha = pad_alpha(&ui, 1);
+                assert_eq!(
+                    alpha.is_some(),
+                    cross_on,
+                    "cross {} with camera {} drew as {:?}",
+                    if cross_on { "ON" } else { "OFF" },
+                    if look { "ON" } else { "OFF" },
+                    alpha
+                );
+                if let (Some(alpha), true) = (alpha, look) {
+                    // Taken over: still visible, but clearly faded.
+                    assert!(
+                        alpha > 0.0 && alpha < 1.0,
+                        "a taken pad should be faded, not {:?}",
+                        alpha
+                    );
+                }
+            }
+        }
+    }
+
+    /// The circle keeps its analogue look while the camera is on; only the
+    /// cross, whose stick the camera has, is faded.
+    #[test]
+    fn the_camera_only_fades_the_cross() {
+        let mut ui = pads_ui();
+        ui.look = true;
+        assert_eq!(pad_alpha(&ui, 0), Some(1.0));
+        assert!(pad_alpha(&ui, 1).unwrap() < 1.0);
+        // "Hide buttons" is still the stronger of the two.
+        ui.hidden = true;
+        assert_eq!(pad_alpha(&ui, 0), Some(HIDDEN_ALPHA));
+        assert_eq!(pad_alpha(&ui, 1), Some(HIDDEN_ALPHA));
+    }
+
+    /// `PADS R4` shipped with the round-4 code but the old tag, so the player
+    /// could not tell builds apart. The tag has to move with the behaviour.
+    #[test]
+    fn the_revision_tag_names_this_build() {
+        assert!(
+            OVERLAY_REVISION.starts_with("PADS R5"),
+            "got {:?}",
+            OVERLAY_REVISION
+        );
+        assert_ne!(OVERLAY_REVISION, "PADS R4");
+    }
+
+    /// The cross has to stay grabbable while the camera is on: it is drawn
+    /// faded, and a player who wants it out of the way must be able to move it.
+    #[test]
+    fn a_faded_cross_can_still_be_dragged() {
+        let mut ui = pads_ui();
+        ui.look = true;
+        let (px, py, radius) = compute_layout(&ui, VIEWPORT).pads[1];
+        assert!(radius > 0.0, "a faded pad still has a box");
+        // The hit test does not consult the camera, so a press on the pad lands
+        // on it, not on the game behind.
+        let inside = (px, py);
+        let mut hit = ui;
+        assert!(touch_down_inner_abs(&mut hit, inside, VIEWPORT));
+        assert_eq!(hit.pending, W_PAD_BASE + 1);
     }
 
     fn pad_of(ui: &Ui, kind: PadKind) -> Pad {

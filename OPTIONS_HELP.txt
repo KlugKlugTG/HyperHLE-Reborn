@@ -514,8 +514,9 @@ Other options:
         stays fully visible, so the setting can be undone.
 
         The "Camera" row turns on camera mode: the right stick then drags a
-        finger for the game's look-around control, and the cross is not used at
-        all (and not drawn). Pushing the stick further drags faster. The drag
+        finger for the game's look-around control, and the cross sends nothing.
+        It stays on screen, faded, so it can still be moved; a pad the menu
+        calls ON is always drawn. Pushing the stick further drags faster. The drag
         stays inside a small box on the right-hand third of the screen, well
         clear of the left-hand area where phone shooters put their own movement
         joystick, so turning the camera cannot move the character. When the
