@@ -106,7 +106,7 @@ const W_CLOSE: u16 = 12;
 const W_LOOK: u16 = 13;
 const W_HIDE: u16 = 14;
 const W_ADD_CIRCLE: u16 = 15;
-const W_ADD_TRIANGLE: u16 = 16;
+const W_ADD_CROSS: u16 = 16;
 /// Marker ids start here, so `W_MARKER_BASE + index` identifies a marker.
 const W_MARKER_BASE: u16 = 100;
 /// Pad ids start here: `W_PAD_BASE + index` is a pad's knob, plus `PAD_COUNT`
@@ -150,7 +150,7 @@ impl Marker {
     }
 }
 
-/// One of the two movement pads: a circle or a triangle whose four
+/// One of the two movement pads: a circle or a cross whose four
 /// directions are driven by a stick, and which sends a touch to the game.
 ///
 /// A pad is not a marker: markers inject a finger at a fixed spot, while a
@@ -213,29 +213,29 @@ impl Pad {
 enum PadKind {
     /// Left stick, drawn as a ring.
     Circle,
-    /// Right stick, drawn as a triangle.
-    Triangle,
+    /// Right stick, drawn as a cross.
+    Cross,
 }
 
 impl PadKind {
     fn pad(self) -> usize {
         match self {
             PadKind::Circle => 0,
-            PadKind::Triangle => 1,
+            PadKind::Cross => 1,
         }
     }
 
     fn stick(self) -> usize {
         match self {
             PadKind::Circle => 0,
-            PadKind::Triangle => 1,
+            PadKind::Cross => 1,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
             PadKind::Circle => "CIRCLE",
-            PadKind::Triangle => "TRIANGLE",
+            PadKind::Cross => "CROSS",
         }
     }
 }
@@ -265,13 +265,13 @@ struct Ui {
     enabled: bool,
     menu_open: bool,
     markers: Vec<Marker>,
-    /// The circle (left stick) and triangle (right stick) movement pads.
+    /// The circle (left stick) and cross (right stick) movement pads.
     pads: [Pad; PAD_COUNT],
     /// Where the press that is resizing a pad, or dragging it, started.
     pad_press: (f32, f32),
     pad_press_moved: bool,
     /// Camera mode: the right stick drags a finger across the middle of the
-    /// screen instead of driving the triangle pad. This is the look-around
+    /// screen instead of driving the cross pad. This is the look-around
     /// gesture mobile games use, and it needs a finger that keeps travelling,
     /// which a pad's short swipe cannot do.
     look: bool,
@@ -310,7 +310,7 @@ impl Ui {
             pads: [
                 Pad::new(PadKind::Circle, PAD_DEFAULT_CENTERS[0].0, PAD_DEFAULT_CENTERS[0].1),
                 Pad::new(
-                    PadKind::Triangle,
+                    PadKind::Cross,
                     PAD_DEFAULT_CENTERS[1].0,
                     PAD_DEFAULT_CENTERS[1].1,
                 ),
@@ -470,15 +470,15 @@ pub fn pads_move(sticks: [f32; 4], dt: f32) -> Vec<MarkerTouch> {
 /// the game runs.
 fn pads_move_inner(ui: &mut Ui, sticks: [f32; 4], dt: f32) -> Vec<MarkerTouch> {
     let mut changes = Vec::new();
-    for kind in [PadKind::Circle, PadKind::Triangle] {
+    for kind in [PadKind::Circle, PadKind::Cross] {
         let index = kind.pad();
         if !ui.pads[index].enabled {
             continue;
         }
         // The right stick drives the camera when look mode is on, so the
-        // triangle below it would be fighting the camera for the same stick.
+        // cross below it would be fighting the camera for the same stick.
         if index == 1 && ui.look {
-            // The triangle still shows where the stick is, but sends nothing.
+            // The cross still shows where the stick is, but sends nothing.
             ui.pads[index].dir = stick_directions(sticks, kind.stick());
             continue;
         }
@@ -721,7 +721,7 @@ pub fn init(enabled: bool, app_id: Option<&str>) {
     ui.pads = [
         Pad::new(PadKind::Circle, PAD_DEFAULT_CENTERS[0].0, PAD_DEFAULT_CENTERS[0].1),
         Pad::new(
-            PadKind::Triangle,
+            PadKind::Cross,
             PAD_DEFAULT_CENTERS[1].0,
             PAD_DEFAULT_CENTERS[1].1,
         ),
@@ -822,7 +822,7 @@ fn parse_markers(text: &str) -> Vec<Marker> {
     markers
 }
 
-/// `circle,x,y,radius;triangle,...`, the pads half of an app's line.
+/// `circle,x,y,radius;cross,...`, the pads half of an app's line.
 fn format_pads(pads: &[Pad; PAD_COUNT], look: bool, hidden: bool) -> String {
     let mut text = pads
         .iter()
@@ -831,7 +831,7 @@ fn format_pads(pads: &[Pad; PAD_COUNT], look: bool, hidden: bool) -> String {
                 "{},{:.3},{:.3},{:.3},{}",
                 match pad.kind {
                     PadKind::Circle => "circle",
-                    PadKind::Triangle => "triangle",
+                    PadKind::Cross => "cross",
                 },
                 pad.cx,
                 pad.cy,
@@ -856,7 +856,7 @@ fn parse_pads(text: &str) -> Option<([Pad; PAD_COUNT], bool, bool)> {
     let mut pads = [
         Pad::new(PadKind::Circle, PAD_DEFAULT_CENTERS[0].0, PAD_DEFAULT_CENTERS[0].1),
         Pad::new(
-            PadKind::Triangle,
+            PadKind::Cross,
             PAD_DEFAULT_CENTERS[1].0,
             PAD_DEFAULT_CENTERS[1].1,
         ),
@@ -887,7 +887,9 @@ fn parse_pads(text: &str) -> Option<([Pad; PAD_COUNT], bool, bool)> {
         let state = fields.next().map(str::trim);
         let kind = match name.trim() {
             "circle" => PadKind::Circle,
-            "triangle" => PadKind::Triangle,
+            // "triangle" is what the cross pad was called before it was
+            // renamed, and files written then still name it that way.
+            "cross" | "triangle" => PadKind::Cross,
             _ => continue,
         };
         let (Ok(x), Ok(y), Ok(radius)) = (
@@ -1185,7 +1187,7 @@ fn compute_layout(ui: &Ui, viewport: (u32, u32, u32, u32)) -> Layout {
     const MENU_ROWS: [u16; 7] = [
         W_ADD,
         W_ADD_CIRCLE,
-        W_ADD_TRIANGLE,
+        W_ADD_CROSS,
         W_LOOK,
         W_HIDE,
         W_CLEAR,
@@ -1343,7 +1345,7 @@ unsafe fn build_scene(
         }
     }
 
-    // The pads: a ring for the circle, a triangle for the triangle, with the
+    // The pads: a ring for the circle, a cross for the cross, with the
     // knob under the thumb and the four arrows lit as the stick pushes.
     for (index, (px, py, radius)) in layout.pads.iter().enumerate() {
         if *radius <= 0.0 {
@@ -1417,9 +1419,9 @@ unsafe fn build_scene(
 /// Draws one pad: its outline, the four direction labels and the knob.
 ///
 /// The scene only has axis-aligned rectangles and text, so the outline is a
-/// dotted one: a ring of small squares for the circle, and squares along the
-/// three sides for the triangle. That reads the same as the faint outlines
-/// other on-screen-pad overlays draw, without needing a mesh.
+/// dotted one: a ring of small squares for the circle, and the two arms of a
+/// cross for the cross pad. That reads the same as the faint outlines other
+/// on-screen-pad overlays draw, without needing a mesh.
 unsafe fn draw_pad(
     gles: &mut dyn GLES,
     scene: &mut crate::trainer_ui::OverlayScene,
@@ -1433,34 +1435,8 @@ unsafe fn draw_pad(
     let knob_col = fade(COL_PAD_KNOB, alpha);
     let knob_border = fade(COL_PAD_KNOB_BORDER, alpha);
     let dot = (radius * 0.055).max(1.5);
-    let mut dot_at = |x: f32, y: f32| {
+    for (x, y) in pad_outline(pad.kind, px, py, radius) {
         scene.rect(x - dot / 2.0, y - dot / 2.0, dot, dot, pad_col);
-    };
-
-    match pad.kind {
-        PadKind::Circle => {
-            const DOTS: usize = 44;
-            for index in 0..DOTS {
-                let angle = index as f32 * std::f32::consts::TAU / DOTS as f32;
-                let (sin, cos) = angle.sin_cos();
-                dot_at(px + cos * radius, py + sin * radius);
-            }
-        }
-        PadKind::Triangle => {
-            // Every side is split into the same number of dots, so the
-            // spacing stays even around the whole outline.
-            const PER_SIDE: usize = 15;
-            for side in 0..3 {
-                let a0 = -std::f32::consts::FRAC_PI_2 + side as f32 * std::f32::consts::TAU / 3.0;
-                let a1 = a0 + std::f32::consts::TAU / 3.0;
-                let p0 = (px + a0.cos() * radius, py + a0.sin() * radius);
-                let p1 = (px + a1.cos() * radius, py + a1.sin() * radius);
-                for step in 0..PER_SIDE {
-                    let t = step as f32 / PER_SIDE as f32;
-                    dot_at(p0.0 + (p1.0 - p0.0) * t, p0.1 + (p1.1 - p0.1) * t);
-                }
-            }
-        }
     }
 
     // The four directions, on the rim, lit while the stick pushes them.
@@ -1514,6 +1490,35 @@ unsafe fn draw_pad(
         let at = dot + step * i as f32;
         scene.rect(handle.x + at, handle.y + at, dot, dot, knob_col);
     }
+}
+
+/// The dots that make up a pad's outline, in viewport pixels.
+///
+/// A circle is a ring; a cross is its two arms, which stop short of the middle
+/// so the knob there stays readable.
+fn pad_outline(kind: PadKind, px: f32, py: f32, radius: f32) -> Vec<(f32, f32)> {
+    let mut dots = Vec::new();
+    match kind {
+        PadKind::Circle => {
+            const DOTS: usize = 44;
+            for index in 0..DOTS {
+                let angle = index as f32 * std::f32::consts::TAU / DOTS as f32;
+                let (sin, cos) = angle.sin_cos();
+                dots.push((px + cos * radius, py + sin * radius));
+            }
+        }
+        PadKind::Cross => {
+            const PER_ARM: usize = 9;
+            const INNER: f32 = 0.30;
+            for (dx, dy) in PAD_DIRECTIONS {
+                for step in 0..PER_ARM {
+                    let t = INNER + (1.0 - INNER) * step as f32 / (PER_ARM - 1) as f32;
+                    dots.push((px + dx * radius * t, py + dy * radius * t));
+                }
+            }
+        }
+    }
+    dots
 }
 
 /// The knob's centre in viewport pixels: the stick's push, limited to the
@@ -1826,7 +1831,7 @@ fn touch_up_inner_abs(ui: &mut Ui, abs: (f32, f32), viewport: (u32, u32, u32, u3
                 toggle_pad(ui, 0);
             }
         }
-        W_ADD_TRIANGLE => {
+        W_ADD_CROSS => {
             if hit {
                 toggle_pad(ui, 1);
             }
@@ -2290,11 +2295,40 @@ mod tests {
     fn the_pads_start_bottom_left_and_bottom_right() {
         let ui = Ui::new();
         let circle = pad_of(&ui, PadKind::Circle);
-        let triangle = pad_of(&ui, PadKind::Triangle);
+        let cross = pad_of(&ui, PadKind::Cross);
         assert!(circle.cx < 0.5 && circle.cy > 0.5);
-        assert!(triangle.cx > 0.5 && triangle.cy > 0.5);
+        assert!(cross.cx > 0.5 && cross.cy > 0.5);
         assert_eq!(circle.kind, PadKind::Circle);
-        assert_eq!(triangle.kind, PadKind::Triangle);
+        assert_eq!(cross.kind, PadKind::Cross);
+    }
+
+    #[test]
+    fn the_circle_is_a_ring_and_the_cross_is_two_arms() {
+        let (px, py, radius) = (100.0, 100.0, 50.0);
+        let ring = pad_outline(PadKind::Circle, px, py, radius);
+        // A ring keeps every dot at the radius, all the way round.
+        assert!(ring.len() > 20);
+        for (x, y) in &ring {
+            let distance = (x - px).hypot(y - py);
+            assert!((distance - radius).abs() < 0.5, "ring dot off the radius");
+        }
+        // A cross is four arms: dots on the axes, none off them, and a hole
+        // in the middle for the knob.
+        let cross = pad_outline(PadKind::Cross, px, py, radius);
+        assert_eq!(cross.len(), 4 * 9);
+        for (x, y) in &cross {
+            let (dx, dy) = (x - px, y - py);
+            assert!(
+                dx.abs() < 0.5 || dy.abs() < 0.5,
+                "a cross dot is on an axis"
+            );
+            let distance = dx.abs().max(dy.abs());
+            assert!(distance >= radius * 0.29, "the middle is left clear");
+            assert!(distance <= radius + 0.5);
+        }
+        // The two shapes really are different, so the drawing cannot silently
+        // fall back to a circle.
+        assert_ne!(ring.len(), cross.len());
     }
 
     #[test]
@@ -2307,8 +2341,8 @@ mod tests {
         assert_eq!(changes[0].action, MarkerAction::Down);
         assert_eq!(changes[1].action, MarkerAction::Move);
         assert!(changes[1].position.0 > changes[0].position.0);
-        // The triangle's right arrow, not the circle's.
-        let pad = pad_of(&ui, PadKind::Triangle);
+        // The cross's right arrow, not the circle's.
+        let pad = pad_of(&ui, PadKind::Cross);
         assert!(pad.dir[3] > 0.0);
         assert_eq!(pad_of(&ui, PadKind::Circle).dir, [0.0; 4]);
         for change in &changes {
@@ -2478,13 +2512,13 @@ mod tests {
         assert!(touch_down_inner_abs(&mut ui, (px, py), VIEWPORT));
         assert_eq!(ui.pending, W_PAD_BASE + 1);
         touch_motion_inner_abs(&mut ui, (px - 60.0, py - 40.0), VIEWPORT);
-        let moved = pad_of(&ui, PadKind::Triangle);
+        let moved = pad_of(&ui, PadKind::Cross);
         assert!(moved.cx * 480.0 < px);
         assert!(moved.cy * 320.0 < py);
         // A press that does not move is just a tap: the pad stays put.
-        let before = pad_of(&ui, PadKind::Triangle);
+        let before = pad_of(&ui, PadKind::Cross);
         assert!(touch_up_inner_abs(&mut ui, (px - 60.0, py - 40.0), VIEWPORT));
-        assert_eq!(pad_of(&ui, PadKind::Triangle).cx, before.cx);
+        assert_eq!(pad_of(&ui, PadKind::Cross).cx, before.cx);
     }
 
     #[test]
@@ -2495,12 +2529,23 @@ mod tests {
         marker.button = Some(Button::LeftStickUp);
         ui.markers.push(marker);
         let changes = push_sticks(&mut ui, [0.0, -1.0, 1.0, 0.0]);
-        // Only the triangle answered.
+        // Only the cross answered.
         assert!(changes.iter().all(|change| change.marker >= PAD_FINGER_BASE + 4));
         // The circle still shows the stick, but has no finger down.
         let circle = pad_of(&ui, PadKind::Circle);
         assert!(circle.dir[0] > 0.0);
         assert!(circle.down.iter().all(|down| !down));
+    }
+
+    #[test]
+    fn a_saved_triangle_entry_loads_as_the_cross_pad() {
+        // Files written before the pad was renamed still have their cross
+        // pad's position and size.
+        let parsed = parse_pads("triangle,0.700,0.600,0.200,on");
+        let (pads, _, _) = parsed.expect("the entry parses");
+        assert!(pads[1].enabled);
+        assert!((pads[1].cx - 0.700).abs() < 0.001);
+        assert!((pads[1].radius - 0.200).abs() < 0.001);
     }
 
     #[test]
@@ -2574,13 +2619,13 @@ mod tests {
     }
 
     #[test]
-    fn camera_mode_takes_the_right_stick_from_the_triangle() {
+    fn camera_mode_takes_the_right_stick_from_the_cross() {
         let mut ui = pads_ui();
         ui.look = true;
         let changes = push_sticks_dt(&mut ui, [0.0, 0.0, 0.0, 1.0], 0.0);
         assert!(changes.iter().all(|change| change.marker == LOOK_FINGER));
-        let triangle = pad_of(&ui, PadKind::Triangle);
-        assert!(triangle.down.iter().all(|down| !down));
+        let cross = pad_of(&ui, PadKind::Cross);
+        assert!(cross.down.iter().all(|down| !down));
         // The circle is unaffected: walking while looking around works.
         assert!(!pad_of(&ui, PadKind::Circle).down[0]);
         let mut ui = pads_ui();

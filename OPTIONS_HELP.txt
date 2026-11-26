@@ -477,9 +477,8 @@ Other options:
 
         Two movement pads can be added from the same menu, and are off until
         they are: "Circle: on/off" is a ring at the bottom left driven by the
-        left stick, and "Triangle: on/off" is a triangle at the bottom right
-        driven by the right stick. Removing a pad releases any finger it was
-        holding.
+        left stick, and "Cross: on/off" is a cross at the bottom right driven
+        by the right stick. Removing a pad releases any finger it was holding.
 
         Each of a pad's four directions sends its own touch. The finger goes
         down in the middle of the pad and is dragged outwards towards that
@@ -501,7 +500,7 @@ Other options:
 
         Camera buttons in the menu turn on camera mode: the right stick then
         drags a finger across the middle of the screen instead of driving the
-        triangle pad, which is the look-around gesture most mobile games use.
+        cross pad, which is the look-around gesture most mobile games use.
         Pushing the stick further drags faster. A long turn re-grabs from the
         middle of the screen when the finger reaches the edge, so holding the
         stick keeps the camera turning. The setting is saved with the app, and
