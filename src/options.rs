@@ -275,10 +275,6 @@ pub struct Options {
     /// Drive Audio Unit rendering on a guest worker thread, independently of
     /// the main run loop. Opt in for apps that block that loop during startup.
     pub audio_unit_render_thread: bool,
-    /// Always report a microphone as available to the guest and feed silence
-    /// when no real host capture device exists (or access was denied). For
-    /// apps that gate their voice features on microphone detection.
-    pub fake_mic: bool,
     /// Break an otherwise-infinite `semaphore_wait()` by returning
     /// KERN_SUCCESS spuriously after this many milliseconds.
     ///
@@ -474,7 +470,6 @@ impl Default for Options {
                 .unwrap_or(true),
             prefer_gles2_context: false,
             audio_unit_render_thread: false,
-            fake_mic: false,
             mach_semaphore_spurious_wake_ms: None,
             present_rotate: None,
             rotation_fix: false,
@@ -838,14 +833,6 @@ impl Options {
             // GLES-native backend selection and EAGL both read this env var
             // (the GLES backend layer has no `Options` access).
             std::env::set_var("TOUCHHLE_FORCE_GLES1_CONTEXT", "1");
-        } else if arg == "--fake-mic" {
-            self.fake_mic = true;
-            // The microphone backends read this env var directly (they have
-            // no `Options` access), like the GLES flags do.
-            std::env::set_var("TOUCHHLE_FAKE_MIC", "1");
-        } else if arg == "--no-fake-mic" {
-            self.fake_mic = false;
-            std::env::remove_var("TOUCHHLE_FAKE_MIC");
         } else if arg == "--no-gles3" {
             self.no_gles3 = true;
         } else if arg == "--gles3" {
@@ -1076,20 +1063,6 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--no-rotation-fix").unwrap());
         assert!(!options.rotation_fix);
-    }
-
-    #[test]
-    fn fake_mic_is_opt_in() {
-        let mut options = Options::default();
-        assert!(!options.fake_mic);
-
-        assert!(options.parse_argument("--fake-mic").unwrap());
-        assert!(options.fake_mic);
-        assert_eq!(std::env::var("TOUCHHLE_FAKE_MIC"), Ok("1".to_string()));
-
-        assert!(options.parse_argument("--no-fake-mic").unwrap());
-        assert!(!options.fake_mic);
-        assert!(std::env::var("TOUCHHLE_FAKE_MIC").is_err());
     }
 
     #[test]

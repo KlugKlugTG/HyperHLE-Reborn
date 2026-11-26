@@ -570,15 +570,6 @@ Other options:
         Apps that are ES 3.0-only keep failing to create a context, exactly
         as they would on the real hardware this option emulates.
 
-    --fake-mic / --no-fake-mic
-        Always tell the app that a microphone is available, even when the
-        host has no usable capture device or recording permission was
-        denied. With no real host microphone the guest still receives a
-        live but silent input stream, so apps that gate their voice
-        features on microphone detection (Talking Tom-style apps, voice
-        changers) show and run them instead of hiding them. OFF (the
-        default) reports the honest host answer.
-
     --allow-network-access
     --no-network-access
         Allow apps running in HyperHLE to access the Internet and the local network,
