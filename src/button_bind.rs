@@ -51,7 +51,7 @@ const MAX_MARKERS: usize = 32;
 /// difference between a drag that starts at the rim and one that starts in
 /// the middle is invisible in a screenshot but decides whether walking works,
 /// so "is this the build with the fix" has to be answerable without guessing.
-const OVERLAY_REVISION: &str = "PADS R5 DPAD";
+const OVERLAY_REVISION: &str = "PADS R6 DPAD";
 /// Distance, in unscaled pixels, a press has to travel before it counts as a
 /// drag rather than a tap.
 const DRAG_THRESHOLD: f32 = 10.0;
@@ -106,10 +106,6 @@ const LOOK_DEADZONE: f32 = 0.15;
 /// How visible markers and pads are while "hide buttons" is on: faint enough
 /// to stop covering the game, strong enough to see where they are.
 const HIDDEN_ALPHA: f32 = 0.18;
-/// How much a pad fades when something else has taken its stick. It stays on
-/// screen so an enabled pad is always visible and still movable; fading it says
-/// "not sending" without hiding it, which would look like the pad had gone.
-const TAKEN_ALPHA: f32 = 0.32;
 const PAD_COUNT: usize = 2;
 
 // Widget ids of the overlay chrome. Everything the overlay draws is also a
@@ -272,25 +268,20 @@ impl Pad {
     }
 }
 
-/// The two pads. A pad is driven by one stick only, so the left pad (circle)
-/// cannot be moved by the right stick.
+/// The two pads. They are driven by different things on purpose: the circle is
+/// the left stick, and the cross is the D-pad. Nothing has to be shared between
+/// them that way, so neither can take the other's input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PadKind {
-    /// Left stick, drawn as a ring.
+    /// Left stick, drawn as a ring. Analogue: the finger travels with the push.
     Circle,
-    /// Right stick, drawn as a cross.
+    /// D-pad, drawn as a cross. Four buttons, one fixed touch each, for games
+    /// with a weapon wheel or any other four-way on-screen choice.
     Cross,
 }
 
 impl PadKind {
     fn pad(self) -> usize {
-        match self {
-            PadKind::Circle => 0,
-            PadKind::Cross => 1,
-        }
-    }
-
-    fn stick(self) -> usize {
         match self {
             PadKind::Circle => 0,
             PadKind::Cross => 1,
@@ -308,20 +299,25 @@ impl PadKind {
 /// Up, down, left, right: the order of [Pad::dir], [Pad::down] and
 /// [Pad::point], and of the button each direction maps to.
 const PAD_DIRECTIONS: [(f32, f32); 4] = [(0.0, -1.0), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)];
-/// Direction buttons, in the same order: they are what the stick edges feed.
-const PAD_DIRECTION_BUTTONS: [[Button; 4]; 2] = [
-    [
-        Button::LeftStickUp,
-        Button::LeftStickDown,
-        Button::LeftStickLeft,
-        Button::LeftStickRight,
-    ],
-    [
-        Button::RightStickUp,
-        Button::RightStickDown,
-        Button::RightStickLeft,
-        Button::RightStickRight,
-    ],
+/// The circle's own direction buttons, in the order of [PAD_DIRECTIONS]. A
+/// marker bound to one of these takes the left stick from the circle; the
+/// cross does not use them, because it reads the D-pad instead.
+const CIRCLE_DIRECTION_BUTTONS: [Button; 4] = [
+    Button::LeftStickUp,
+    Button::LeftStickDown,
+    Button::LeftStickLeft,
+    Button::LeftStickRight,
+];
+/// The four D-pad buttons and the bit each one sets on the cross pad.
+///
+/// The cross reads these and nothing else. That is the whole reason it can
+/// exist next to camera mode: the camera owns the right stick, the cross owns
+/// the D-pad, and neither can disturb the other.
+const DPAD_BUTTONS: [(Button, u8); 4] = [
+    (Button::DPadUp, 1),
+    (Button::DPadRight, 2),
+    (Button::DPadDown, 4),
+    (Button::DPadLeft, 8),
 ];
 /// How far out the direction arrows sit, as a fraction of the pad radius.
 const PAD_RIM: f32 = 0.78;
@@ -356,6 +352,86 @@ fn dir8(x: f32, y: f32) -> Option<usize> {
     Some(((sector / std::f32::consts::FRAC_PI_4).floor() as usize).min(7))
 }
 
+/// The direction a D-pad bitmask means, as a [PAD_DIRECTIONS_8] index.
+///
+/// Two buttons at once is a diagonal, which is what a weapon wheel wants when
+/// the player rolls the D-pad round. Opposite buttons cancel: holding left and
+/// right is not a direction, and saying so keeps the finger from sitting on a
+/// diagonal nobody asked for.
+fn dpad_dir(mask: u8) -> Option<usize> {
+    let up = mask & 1 != 0;
+    let right = mask & 2 != 0;
+    let down = mask & 4 != 0;
+    let left = mask & 8 != 0;
+    let y = down as i8 - up as i8;
+    let x = right as i8 - left as i8;
+    match (x, y) {
+        (0, 0) => None,
+        (0, -1) => Some(0),
+        (1, -1) => Some(1),
+        (1, 0) => Some(2),
+        (1, 1) => Some(3),
+        (0, 1) => Some(4),
+        (-1, 1) => Some(5),
+        (-1, 0) => Some(6),
+        (-1, -1) => Some(7),
+        _ => None,
+    }
+}
+
+/// The D-pad bits a marker has claimed, so the cross leaves those buttons to it.
+fn dpad_claimed(ui: &Ui) -> u8 {
+    let mut mask = 0;
+    for marker in &ui.markers {
+        let Some(button) = marker.button else {
+            continue;
+        };
+        for (dpad_button, bit) in DPAD_BUTTONS {
+            if dpad_button == button {
+                mask |= bit;
+            }
+        }
+    }
+    mask
+}
+
+/// Applies one D-pad button edge to the cross pad and returns the touches it
+/// owes, or `None` when the button is not the cross's to handle.
+///
+/// Called straight from [apply_gamepad], on the edge itself. The alternative --
+/// setting a bit and letting the next pad poll notice -- loses a tap that goes
+/// down and up inside one event poll, which is exactly how a weapon wheel is
+/// tapped. `None` means "carry on and treat this as an ordinary button", which
+/// is what lets a marker bind the button and take it over.
+fn dpad_edge(ui: &mut Ui, bit: u8, pressed: bool) -> Option<Vec<MarkerTouch>> {
+    // Keep the held state accurate either way: it is what the menu and the pad
+    // draw from, and a stale bit would show a direction nobody is pressing.
+    if pressed {
+        ui.dpad |= bit;
+    } else {
+        ui.dpad &= !bit;
+    }
+    let cross = PadKind::Cross.pad();
+    if !ui.pads[cross].enabled {
+        // The cross is off, so nothing here is the cross's business: leave the
+        // button to the markers and the rest of the controller.
+        return None;
+    }
+    // A marker that has this button gets it instead: it was bound on purpose.
+    let claimed = dpad_claimed(ui) & bit != 0;
+    if claimed {
+        return None;
+    }
+    let direction = dpad_dir(ui.dpad & !dpad_claimed(ui));
+    let mut changes = Vec::new();
+    // The press lands on the edge, so a tap is never missed. The release is
+    // left to the pad's own grace period, which the next polls run out: a
+    // finger that goes down and up between two polls still stays down long
+    // enough for the game to read it as a tap.
+    apply_pad_direction(&mut ui.pads[cross], direction, 0.0, &mut changes);
+    Some(changes)
+}
+
 struct Ui {
     enabled: bool,
     menu_open: bool,
@@ -365,6 +441,9 @@ struct Ui {
     /// Where the press that is resizing a pad, or dragging it, started.
     pad_press: (f32, f32),
     pad_press_moved: bool,
+    /// Which D-pad buttons are down right now, as the bitmask [DPAD_BUTTONS]
+    /// sets. The cross pad follows this and ignores the sticks entirely.
+    dpad: u8,
     /// Camera mode: the right stick drags a finger across the middle of the
     /// screen instead of driving the cross pad. This is the look-around
     /// gesture mobile games use, and it needs a finger that keeps travelling,
@@ -412,6 +491,7 @@ impl Ui {
             ],
             pad_press: (0.0, 0.0),
             pad_press_moved: false,
+            dpad: 0,
             look: false,
             look_at: LOOK_CENTRE,
             look_touching: false,
@@ -570,52 +650,54 @@ pub fn pads_move(sticks: [f32; 4], dt: f32) -> Vec<MarkerTouch> {
 /// the game runs.
 fn pads_move_inner(ui: &mut Ui, sticks: [f32; 4], dt: f32) -> Vec<MarkerTouch> {
     let mut changes = Vec::new();
-    for kind in [PadKind::Circle, PadKind::Cross] {
-        let index = kind.pad();
-        if !ui.pads[index].enabled {
-            continue;
-        }
-        // A stick either walks or presses markers, not both: if the player
-        // bound one of this stick's directions to a marker, the stick is
-        // theirs and the pad leaves it alone.
+
+    // The circle is the left stick: an analogue drag that follows the push. A
+    // stick either walks or presses markers, not both, so if the player bound
+    // one of the left stick's directions to a marker the pad leaves it alone --
+    // and must let go of a finger it still holds rather than leaving it down.
+    let index = PadKind::Circle.pad();
+    if ui.pads[index].enabled {
         let taken = ui.markers.iter().any(|marker| {
             marker
                 .button
-                .is_some_and(|button| PAD_DIRECTION_BUTTONS[index].contains(&button))
+                .is_some_and(|button| CIRCLE_DIRECTION_BUTTONS.contains(&button))
         });
-        // The left pad is a stick: it sends an analogue drag that follows the
-        // stick. The right pad is a D-pad: it sends one fixed touch per
-        // direction, and only while the camera is not using the right stick.
-        // Either way, a pad that has no stick of its own (because a marker took
-        // it, or because the camera did) must let go of any finger it still
-        // holds rather than leaving it down.
-        let owned = !taken && !(kind == PadKind::Cross && ui.look);
-        if !owned {
-            let direction = dir8(sticks[kind.stick() * 2], sticks[kind.stick() * 2 + 1]);
-            // Keep the knob and arrows showing where the stick is, except for a
-            // cross the camera has taken over: that one is not in use, so it
-            // must not look as if it is.
-            if kind == PadKind::Cross {
-                ui.pads[index].held = if ui.look { None } else { direction };
-            } else {
-                let (axis, push) = stick_axis(sticks, kind.stick());
-                ui.pads[index].axis = axis;
-                ui.pads[index].push = push;
-            }
+        let (axis, push) = stick_axis(sticks, 0);
+        if taken {
+            ui.pads[index].axis = axis;
+            ui.pads[index].push = push;
             if std::mem::replace(&mut ui.pads[index].touching, false) {
                 changes.push(pad_release(&mut ui.pads[index]));
             }
             ui.pads[index].rest = 0.0;
-            continue;
-        }
-        if kind == PadKind::Cross {
-            let direction = dir8(sticks[kind.stick() * 2], sticks[kind.stick() * 2 + 1]);
-            apply_pad_direction(&mut ui.pads[index], direction, dt, &mut changes);
         } else {
-            let (axis, push) = stick_axis(sticks, kind.stick());
             apply_pad_push(&mut ui.pads[index], axis, push, dt, &mut changes);
         }
     }
+
+    // The cross is the D-pad, and it reads the D-pad buttons -- never the right
+    // stick. That is what lets camera mode and the cross be on at the same
+    // time: the camera drags the right stick, this looks at four buttons
+    // nobody else wants, and turning the camera cannot move the finger that is
+    // choosing a weapon.
+    let index = PadKind::Cross.pad();
+    if ui.pads[index].enabled {
+        // A button a marker has claimed belongs to that marker, but only that
+        // button: binding D-pad up must not take away left and right.
+        let held = ui.dpad & !dpad_claimed(ui);
+        if held != ui.dpad && std::mem::replace(&mut ui.pads[index].touching, false) {
+            // The directions that are left do not make one: let go rather than
+            // leave a finger on a spot the player did not choose.
+            changes.push(pad_release(&mut ui.pads[index]));
+            ui.pads[index].rest = 0.0;
+        }
+        // The D-pad edges press and move the cross; this poll is what runs the
+        // release grace period out afterwards, and what lets go when the button
+        // is already up (a tap plays out even with no further edges).
+        let direction = dpad_dir(held);
+        apply_pad_direction(&mut ui.pads[index], direction, dt, &mut changes);
+    }
+
     look_move(ui, sticks, dt, &mut changes);
     changes
 }
@@ -931,6 +1013,7 @@ pub fn init(enabled: bool, app_id: Option<&str>) {
         ),
     ];
     ui.pad_press_moved = false;
+    ui.dpad = 0;
     ui.look = false;
     ui.hidden = false;
     ui.look_touching = false;
@@ -1240,6 +1323,11 @@ fn cycle_reach(pad: &mut Pad) {
 fn toggle_pad(ui: &mut Ui, index: usize) {
     let pad = &mut ui.pads[index];
     pad.enabled = !pad.enabled;
+    if !pad.enabled && pad.kind == PadKind::Cross {
+        // The cross is the D-pad's reader; with it off nothing would clear the
+        // bits, and switching it back on would resurrect a direction.
+        ui.dpad = 0;
+    }
     if !pad.enabled {
         if std::mem::replace(&mut pad.touching, false) {
             queue_change(pad_release(pad));
@@ -1297,6 +1385,17 @@ fn apply_gamepad(ui: &mut Ui, button: Button, pressed: bool) -> Option<Vec<Marke
             return Some(Vec::new());
         }
     }
+    // The D-pad drives the cross pad. This is done here, on the edge, rather
+    // than left for the next pad poll: a weapon-wheel tap can go down and up
+    // inside one event poll, and a poll that only reads the held buttons would
+    // never see it at all.
+    if let Some((_, bit)) = DPAD_BUTTONS.iter().find(|(b, _)| *b == button) {
+        let changes = dpad_edge(ui, *bit, pressed);
+        if changes.is_some() {
+            return changes;
+        }
+    }
+
     let mut changes = Vec::new();
     let mut matched = false;
     for marker in &mut ui.markers {
@@ -1780,14 +1879,10 @@ fn pad_alpha(ui: &Ui, index: usize) -> Option<f32> {
     if !pad.enabled {
         return None;
     }
-    let taken = index == 1 && ui.look;
-    let alpha = if ui.hidden {
-        HIDDEN_ALPHA
-    } else if taken {
-        TAKEN_ALPHA
-    } else {
-        1.0
-    };
+    // The camera no longer has anything to do with the cross: they read
+    // different inputs, so an enabled pad is drawn at full strength whatever
+    // the camera is doing.
+    let alpha = if ui.hidden { HIDDEN_ALPHA } else { 1.0 };
     Some(alpha)
 }
 
@@ -2602,7 +2697,10 @@ mod tests {
     /// same mistake: an enabled pad was hidden when camera mode was on, and the
     /// build tag never moved. A pad the menu calls `ON` must always draw.
     #[test]
-    fn an_enabled_pad_is_always_drawn_even_when_the_camera_has_its_stick() {
+    fn an_enabled_pad_is_always_drawn_at_full_strength() {
+        // A pad the menu calls ON has to be on screen. The camera used to hide
+        // it outright, which is the bug the player reported; now the camera is
+        // not consulted at all.
         let mut ui = pads_ui();
         for cross_on in [false, true] {
             ui.pads[1].enabled = cross_on;
@@ -2610,21 +2708,12 @@ mod tests {
                 ui.look = look;
                 let alpha = pad_alpha(&ui, 1);
                 assert_eq!(
-                    alpha.is_some(),
-                    cross_on,
-                    "cross {} with camera {} drew as {:?}",
+                    alpha,
+                    if cross_on { Some(1.0) } else { None },
+                    "cross {} with camera {}",
                     if cross_on { "ON" } else { "OFF" },
-                    if look { "ON" } else { "OFF" },
-                    alpha
+                    if look { "ON" } else { "OFF" }
                 );
-                if let (Some(alpha), true) = (alpha, look) {
-                    // Taken over: still visible, but clearly faded.
-                    assert!(
-                        alpha > 0.0 && alpha < 1.0,
-                        "a taken pad should be faded, not {:?}",
-                        alpha
-                    );
-                }
             }
         }
     }
@@ -2632,12 +2721,12 @@ mod tests {
     /// The circle keeps its analogue look while the camera is on; only the
     /// cross, whose stick the camera has, is faded.
     #[test]
-    fn the_camera_only_fades_the_cross() {
+    fn the_camera_does_not_dim_either_pad() {
         let mut ui = pads_ui();
         ui.look = true;
         assert_eq!(pad_alpha(&ui, 0), Some(1.0));
-        assert!(pad_alpha(&ui, 1).unwrap() < 1.0);
-        // "Hide buttons" is still the stronger of the two.
+        assert_eq!(pad_alpha(&ui, 1), Some(1.0), "the cross is not faded");
+        // "Hide buttons" is the only thing that dims them.
         ui.hidden = true;
         assert_eq!(pad_alpha(&ui, 0), Some(HIDDEN_ALPHA));
         assert_eq!(pad_alpha(&ui, 1), Some(HIDDEN_ALPHA));
@@ -2647,22 +2736,25 @@ mod tests {
     /// could not tell builds apart. The tag has to move with the behaviour.
     #[test]
     fn the_revision_tag_names_this_build() {
-        assert!(
-            OVERLAY_REVISION.starts_with("PADS R5"),
-            "got {:?}",
-            OVERLAY_REVISION
-        );
-        assert_ne!(OVERLAY_REVISION, "PADS R4");
+        // The tag has to be a pad revision and must not be one of the two that
+        // shipped with the wrong behaviour: R4 was round-4 code under the
+        // round-3 tag, and R5 hid the cross whenever camera mode was on.
+        let revision = OVERLAY_REVISION
+            .strip_prefix("PADS R")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|number| number.parse::<u32>().ok())
+            .expect("the tag names a pad revision");
+        assert!(revision >= 6, "got {:?}", OVERLAY_REVISION);
     }
 
-    /// The cross has to stay grabbable while the camera is on: it is drawn
-    /// faded, and a player who wants it out of the way must be able to move it.
+    /// The cross has to stay grabbable: a player who wants it out of the way
+    /// must be able to move it, camera on or off.
     #[test]
-    fn a_faded_cross_can_still_be_dragged() {
+    fn the_cross_can_still_be_dragged_with_the_camera_on() {
         let mut ui = pads_ui();
         ui.look = true;
         let (px, py, radius) = compute_layout(&ui, VIEWPORT).pads[1];
-        assert!(radius > 0.0, "a faded pad still has a box");
+        assert!(radius > 0.0, "an enabled pad has a box");
         // The hit test does not consult the camera, so a press on the pad lands
         // on it, not on the game behind.
         let inside = (px, py);
@@ -2671,8 +2763,198 @@ mod tests {
         assert_eq!(hit.pending, W_PAD_BASE + 1);
     }
 
+    /// The point of the whole change: the camera and the cross are on the same
+    /// controller but different inputs, so both work at once. The player turns
+    /// the camera with the right stick while choosing a weapon with the D-pad.
+    #[test]
+    fn the_camera_and_the_cross_work_at_the_same_time() {
+        let mut ui = pads_ui();
+        ui.look = true;
+        // Turn the camera with the right stick.
+        let turning = push_sticks_dt(&mut ui, [0.0, 0.0, 1.0, 0.0], 0.016);
+        assert!(
+            turning.iter().any(|change| change.marker == LOOK_FINGER),
+            "the camera drags"
+        );
+        // A second camera sample keeps its finger down (the first one only
+        // took it up, and one poll is not a release).
+        push_sticks_dt(&mut ui, [0.0, 0.0, 1.0, 0.0], 0.016);
+        assert!(ui.look_touching, "the camera has a finger down");
+        // ...while the D-pad picks a weapon.
+        let changes = press_dpad(&mut ui, &[Button::DPadUp]);
+        let cross_changes: Vec<_> = changes
+            .iter()
+            .filter(|change| change.marker == PAD_FINGER_BASE + 1)
+            .collect();
+        assert_eq!(cross_changes.len(), 1, "{changes:?}");
+        assert_eq!(cross_changes[0].action, MarkerAction::Down);
+        // Both are live: the camera's finger and the cross's.
+        assert!(pad_of(&ui, PadKind::Cross).touching);
+        assert_eq!(pad_of(&ui, PadKind::Cross).held, Some(0));
+        // Walking still works on the left stick, so all three at once.
+        let walking = push_sticks_dt(&mut ui, [0.0, -1.0, 1.0, 0.0], 0.016);
+        assert!(
+            walking.iter().any(|change| change.marker == PAD_FINGER_BASE),
+            "the left stick still walks: {walking:?}"
+        );
+        // The cross kept its direction through all of that.
+        assert_eq!(pad_of(&ui, PadKind::Cross).held, Some(0));
+        assert!(pad_of(&ui, PadKind::Cross).touching);
+        // Nothing the right stick did touched the cross's finger.
+        assert!(
+            !walking
+                .iter()
+                .any(|change| change.marker == PAD_FINGER_BASE + 1),
+            "the camera must not move the cross: {walking:?}"
+        );
+    }
+
+    /// Camera mode used to take the right stick away from the cross, which is
+    /// why the cross vanished. It must not affect the cross at all now.
+    #[test]
+    fn the_camera_never_stops_the_cross() {
+        for look in [false, true] {
+            let mut ui = pads_ui();
+            ui.look = look;
+            let changes = press_dpad(&mut ui, &[Button::DPadLeft]);
+            assert_eq!(
+                changes.len(),
+                1,
+                "camera {}: the cross must still press",
+                if look { "ON" } else { "OFF" }
+            );
+            assert_eq!(pad_of(&ui, PadKind::Cross).held, Some(6));
+            assert!(!changes.is_empty());
+        }
+    }
+
+    /// A D-pad button can still be bound to a marker; that takes the cross
+    /// out of the way rather than fighting for it.
+    #[test]
+    fn binding_a_dpad_button_takes_the_cross_out_of_the_way() {
+        let mut ui = pads_ui();
+        let mut marker = Marker::new(0, 0.5, 0.5);
+        marker.button = Some(Button::DPadUp);
+        ui.markers.push(marker);
+        let changes = press_dpad(&mut ui, &[Button::DPadUp]);
+        // The marker presses its own spot; the cross must not press anything.
+        assert!(
+            !changes.iter().any(|change| change.marker == PAD_FINGER_BASE + 1),
+            "the marker owns that button: {changes:?}"
+        );
+        assert!(changes.iter().any(|change| change.marker == 0), "the marker fires");
+        assert!(!pad_of(&ui, PadKind::Cross).touching);
+        // The untouched directions still work through the pad.
+        let changes = press_dpad(&mut ui, &[Button::DPadDown]);
+        assert!(
+            changes.iter().any(|change| change.marker == PAD_FINGER_BASE + 1),
+            "the rest of the D-pad still works: {changes:?}"
+        );
+    }
+
+    /// Nothing may leave a D-pad bit stuck down: turning the pad off, or
+    /// releasing a button, has to clear the state the cross reads.
+    #[test]
+    fn a_dpad_button_never_sticks_down() {
+        let mut ui = pads_ui();
+        press_dpad(&mut ui, &[Button::DPadUp]);
+        assert_eq!(ui.dpad, 1);
+        release_dpad(&mut ui, &[Button::DPadUp]);
+        assert_eq!(ui.dpad, 0, "the bit is cleared");
+        assert_eq!(pad_of(&ui, PadKind::Cross).held, None);
+        // Switching the pad off and on again must not resurrect the direction.
+        let mut ui = pads_ui();
+        press_dpad(&mut ui, &[Button::DPadRight]);
+        toggle_pad(&mut ui, 1);
+        assert_eq!(ui.dpad, 0);
+        toggle_pad(&mut ui, 1);
+        assert_eq!(pads_move_inner(&mut ui, [0.0; 4], 0.0).len(), 0);
+    }
+
+    /// A weapon-wheel tap can go down and up inside one event poll. The press
+    /// lands on the edge, so it is not missed, and the release still comes
+    /// after the pad's grace period rather than in the same frame -- the game
+    /// gets one clean tap.
+    #[test]
+    fn a_tap_inside_one_poll_still_reaches_the_game() {
+        let mut ui = pads_ui();
+        // Down and up with no poll in between, the way a quick tap arrives.
+        let down = apply_gamepad(&mut ui, Button::DPadUp, true).unwrap();
+        let up = apply_gamepad(&mut ui, Button::DPadUp, false).unwrap();
+        assert!(
+            down.iter().any(|change| change.action == MarkerAction::Down),
+            "the press is not missed: {down:?}"
+        );
+        assert!(
+            up.iter().all(|change| change.action != MarkerAction::Down),
+            "the release does not press again: {up:?}"
+        );
+        // The finger is still down -- the grace period holds it -- and the
+        // polls that follow lift it.
+        assert!(pad_of(&ui, PadKind::Cross).touching);
+        let mut lifted = Vec::new();
+        for _ in 0..12 {
+            lifted.extend(pads_move_inner(&mut ui, [0.0; 4], PAD_RELEASE_DELAY * 0.5));
+        }
+        assert!(
+            lifted.iter().any(|change| change.action == MarkerAction::Up),
+            "the tap is released: {lifted:?}"
+        );
+        assert!(!pad_of(&ui, PadKind::Cross).touching);
+    }
+
+    /// Two D-pad buttons at once is a diagonal, and letting go of one must
+    /// leave the other still held -- a finger rolling round a wheel.
+    #[test]
+    fn rolling_round_the_dpad_is_one_finger() {
+        let mut ui = pads_ui();
+        apply_gamepad(&mut ui, Button::DPadUp, true);
+        let changes = apply_gamepad(&mut ui, Button::DPadRight, true).unwrap();
+        assert_eq!(pad_of(&ui, PadKind::Cross).held, Some(1), "up-right");
+        assert!(
+            changes
+                .iter()
+                .all(|change| change.action == MarkerAction::Move),
+            "a direction change is a Move, never a fresh Down: {changes:?}"
+        );
+        // Let go of up: still pressing, now on right alone.
+        let changes = apply_gamepad(&mut ui, Button::DPadUp, false).unwrap();
+        assert_eq!(pad_of(&ui, PadKind::Cross).held, Some(2), "right");
+        assert!(changes
+            .iter()
+            .all(|change| change.action == MarkerAction::Move));
+        assert!(pad_of(&ui, PadKind::Cross).touching);
+    }
+
     fn pad_of(ui: &Ui, kind: PadKind) -> Pad {
         ui.pads[kind.pad()]
+    }
+
+    /// Presses D-pad buttons on the cross pad and returns what it sent.
+    ///
+    /// The cross reads the D-pad, so a test drives it the way a controller
+    /// does: through [Ui::dpad], then one poll.
+    fn press_dpad(ui: &mut Ui, buttons: &[Button]) -> Vec<MarkerTouch> {
+        let mut changes = Vec::new();
+        for &button in buttons {
+            if let Some(more) = apply_gamepad(ui, button, true) {
+                changes.extend(more);
+            }
+        }
+        changes.extend(pads_move_inner(ui, [0.0; 4], 0.0));
+        changes
+    }
+
+    /// Releases D-pad buttons and runs the poll that notices.
+    fn release_dpad(ui: &mut Ui, buttons: &[Button]) -> Vec<MarkerTouch> {
+        let mut changes = Vec::new();
+        for &button in buttons {
+            if let Some(more) = apply_gamepad(ui, button, false) {
+                changes.extend(more);
+            }
+        }
+        changes.extend(pads_move_inner(ui, [0.0; 4], 0.0));
+        changes
     }
 
     /// Runs a stick sample through the pads and keeps the changes.
@@ -2737,23 +3019,35 @@ mod tests {
     }
 
     #[test]
-    fn each_pad_only_answers_its_own_stick() {
+    fn each_pad_only_answers_its_own_input() {
+        // The right stick belongs to nobody: not to the circle, and not to the
+        // cross either, which reads the D-pad buttons instead. Moving it is the
+        // camera's business and must not touch either pad.
         let mut ui = pads_ui();
-        // Push only the right stick.
         let changes = push_sticks(&mut ui, [0.0, 0.0, 1.0, 0.0]);
-        // The cross is a D-pad: one Down, on the right arrow, and nothing else.
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].action, MarkerAction::Down);
-        // The cross, not the circle.
-        let pad = pad_of(&ui, PadKind::Cross);
-        assert_eq!(pad.held, Some(2), "right is direction 2");
-        assert!(pad.touching);
+        assert!(changes.is_empty(), "the right stick drives no pad: {:?}", changes);
+        assert_eq!(pad_of(&ui, PadKind::Cross).held, None);
+        assert!(!pad_of(&ui, PadKind::Cross).touching);
         let circle = pad_of(&ui, PadKind::Circle);
         assert_eq!(circle.axis, (0.0, 0.0));
         assert!(!circle.touching);
-        for change in &changes {
-            assert_eq!(change.marker, PAD_FINGER_BASE + 1);
-        }
+
+        // The D-pad drives the cross, and only the cross.
+        let changes = press_dpad(&mut ui, &[Button::DPadRight]);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].action, MarkerAction::Down);
+        assert_eq!(changes[0].marker, PAD_FINGER_BASE + 1);
+        let cross = pad_of(&ui, PadKind::Cross);
+        assert_eq!(cross.held, Some(2), "right is direction 2");
+        assert!(cross.touching);
+        assert_eq!(pad_of(&ui, PadKind::Circle).axis, (0.0, 0.0));
+
+        // The left stick drives the circle, and only the circle.
+        let changes = push_sticks(&mut ui, [0.0, -1.0, 0.0, 0.0]);
+        assert!(changes
+            .iter()
+            .all(|change| change.marker == PAD_FINGER_BASE));
+        assert!(!changes.is_empty());
     }
 
     /// The bug that made walking feel broken: each direction used to be its
@@ -2869,19 +3163,20 @@ mod tests {
     #[test]
     fn the_cross_touch_never_slides() {
         let mut ui = pads_ui();
-        let changes = push_sticks(&mut ui, [0.0, 0.0, 1.0, 0.0]);
+        let changes = press_dpad(&mut ui, &[Button::DPadRight]);
         let down = changes
             .iter()
             .find(|change| change.action == MarkerAction::Down)
             .expect("the cross pressed");
         let spot = down.position;
-        // Wiggle the stick around the same direction: no event at all, because
-        // the direction has not changed and a D-pad's touch does not slide.
-        for (x, y) in [(0.9, 0.05), (1.0, -0.1), (0.75, 0.1), (1.0, 0.0)] {
+        // Wiggle the right stick while the button stays down: no event at all.
+        // This is the bug the player hit -- turning the camera used to move a
+        // finger that was choosing a weapon.
+        for (x, y) in [(0.9, 0.05), (1.0, -0.1), (0.75, 0.1), (0.0, -1.0)] {
             let changes = push_sticks(&mut ui, [0.0, 0.0, x, y]);
             assert!(
                 changes.is_empty(),
-                "a D-pad sends nothing while the direction is unchanged: {changes:?}"
+                "the right stick must not touch the cross: {changes:?}"
             );
         }
         assert!(pad_of(&ui, PadKind::Cross).touching);
@@ -2902,35 +3197,51 @@ mod tests {
 
     #[test]
     fn the_cross_picks_eight_directions() {
-        let mut ui = pads_ui();
-        // Up, up-right, right, down-right, down, down-left, left, up-left.
-        for (index, (x, y)) in [
-            (0.0, -1.0),
-            (0.7, -0.7),
-            (1.0, 0.0),
-            (0.7, 0.7),
-            (0.0, 1.0),
-            (-0.7, 0.7),
-            (-1.0, 0.0),
-            (-0.7, -0.7),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            ui.pads[1].held = None;
-            ui.pads[1].touching = false;
-            push_sticks(&mut ui, [0.0, 0.0, x, y]);
+        // Every direction a weapon wheel can want, from the buttons alone: one
+        // button for a cardinal, two together for a diagonal. No stick, no
+        // threshold, no analogue travel to miss.
+        use Button::{DPadDown, DPadLeft, DPadRight, DPadUp};
+        let cases: [(&[Button], usize); 8] = [
+            (&[DPadUp], 0),
+            (&[DPadUp, DPadRight], 1),
+            (&[DPadRight], 2),
+            (&[DPadRight, DPadDown], 3),
+            (&[DPadDown], 4),
+            (&[DPadDown, DPadLeft], 5),
+            (&[DPadLeft], 6),
+            (&[DPadLeft, DPadUp], 7),
+        ];
+        for (buttons, index) in cases {
+            let mut ui = pads_ui();
+            press_dpad(&mut ui, buttons);
             assert_eq!(
-                ui.pads[1].held,
+                pad_of(&ui, PadKind::Cross).held,
                 Some(index),
-                "{x},{y} should be direction {index}"
+                "{:?} should be direction {}",
+                buttons,
+                index
             );
         }
-        // Inside the threshold nothing is held at all.
-        ui.pads[1].held = None;
-        ui.pads[1].touching = false;
-        push_sticks(&mut ui, [0.0, 0.0, 0.05, 0.05]);
-        assert_eq!(ui.pads[1].held, None);
+
+        // Nothing held is nothing at all.
+        let mut ui = pads_ui();
+        assert_eq!(pads_move_inner(&mut ui, [0.0; 4], 0.0).len(), 0);
+        assert_eq!(pad_of(&ui, PadKind::Cross).held, None);
+
+        // Opposite buttons cancel rather than picking a diagonal.
+        for pair in [
+            [DPadUp, DPadDown],
+            [DPadLeft, DPadRight],
+        ] {
+            let mut ui = pads_ui();
+            press_dpad(&mut ui, &pair);
+            assert_eq!(
+                pad_of(&ui, PadKind::Cross).held,
+                None,
+                "{:?} is not a direction",
+                pair
+            );
+        }
     }
 
     /// The camera must not be able to touch the game's own joystick: it drags a
@@ -2964,7 +3275,7 @@ mod tests {
     /// With camera mode on, the right stick belongs to the camera alone: the
     /// cross sends nothing, so the character cannot be nudged by turning.
     #[test]
-    fn camera_mode_makes_the_cross_completely_inert() {
+    fn the_right_stick_is_inert_for_the_cross_in_camera_mode() {
         let mut ui = pads_ui();
         ui.look = true;
         for (x, y) in [(1.0, 0.0), (0.0, -1.0), (-1.0, 1.0)] {
@@ -2973,8 +3284,14 @@ mod tests {
             assert!(changes.iter().all(|change| change.marker == LOOK_FINGER));
         }
         let cross = pad_of(&ui, PadKind::Cross);
-        assert!(!cross.touching, "the cross never pressed anything");
+        assert!(
+            !cross.touching,
+            "the right stick never presses the cross"
+        );
         assert_eq!(cross.held, None);
+        // But the D-pad does press it, camera on or not.
+        let changes = press_dpad(&mut ui, &[Button::DPadUp]);
+        assert!(changes.iter().any(|change| change.marker == PAD_FINGER_BASE + 1));
         // The left stick still walks while the camera turns.
         let changes = push_sticks_dt(&mut ui, [0.0, -1.0, 0.0, 0.0], 0.016);
         assert!(changes.iter().any(|change| change.marker == PAD_FINGER_BASE));
@@ -3181,22 +3498,37 @@ mod tests {
     }
 
     #[test]
-    fn a_stick_with_a_bound_direction_leaves_its_pad_alone() {
+    fn a_bound_direction_leaves_its_own_pad_alone() {
+        // A marker on the left stick takes the circle, and the cross is
+        // untouched because it is not on that stick any more.
         let mut ui = pads_ui();
-        // Bind LeftStickUp to a marker, as the button-binding flow would.
         let mut marker = Marker::new(0, 0.5, 0.5);
         marker.button = Some(Button::LeftStickUp);
         ui.markers.push(marker);
-        let changes = push_sticks(&mut ui, [0.0, -1.0, 1.0, 0.0]);
-        // The circle is bound to markers, so it sends nothing; the cross does.
-        assert!(changes
-            .iter()
-            .all(|change| change.marker == PAD_FINGER_BASE + 1));
-        // The circle still shows the stick, but has no finger down.
-        let circle = pad_of(&ui, PadKind::Circle);
-        assert!(!circle.touching, "it sends nothing: the stick is the markers'");
-        let cross = pad_of(&ui, PadKind::Cross);
-        assert_eq!(cross.held, Some(2), "the cross still answers its own stick");
+        let changes = push_sticks(&mut ui, [0.0, -1.0, 0.0, 0.0]);
+        assert!(
+            changes.is_empty(),
+            "the circle's stick belongs to the marker: {:?}",
+            changes
+        );
+        assert!(!pad_of(&ui, PadKind::Circle).touching);
+        assert_eq!(pad_of(&ui, PadKind::Cross).held, None);
+
+        // A marker on a D-pad button takes the cross instead, and the circle
+        // keeps working.
+        let mut ui = pads_ui();
+        let mut marker = Marker::new(0, 0.5, 0.5);
+        marker.button = Some(Button::DPadRight);
+        ui.markers.push(marker);
+        let changes = press_dpad(&mut ui, &[Button::DPadRight]);
+        assert!(
+            !changes.iter().any(|change| change.marker == PAD_FINGER_BASE + 1),
+            "the D-pad belongs to the marker: {:?}",
+            changes
+        );
+        assert!(!pad_of(&ui, PadKind::Cross).touching);
+        let changes = push_sticks(&mut ui, [0.0, -1.0, 0.0, 0.0]);
+        assert!(!changes.is_empty(), "the circle still walks");
     }
 
     #[test]
@@ -3281,19 +3613,23 @@ mod tests {
     }
 
     #[test]
-    fn camera_mode_takes_the_right_stick_from_the_cross() {
+    fn the_right_stick_never_reaches_the_cross() {
+        // With the camera on, the right stick belongs to the camera and the
+        // cross is not listening to it in the first place, which is the fix.
         let mut ui = pads_ui();
         ui.look = true;
         let changes = push_sticks_dt(&mut ui, [0.0, 0.0, 0.0, 1.0], 0.0);
         assert!(changes.iter().all(|change| change.marker == LOOK_FINGER));
-        let cross = pad_of(&ui, PadKind::Cross);
-        assert!(!cross.touching);
+        assert!(!pad_of(&ui, PadKind::Cross).touching);
         // The circle is unaffected: walking while looking around works.
         assert!(!pad_of(&ui, PadKind::Circle).touching);
+
+        // Even with the camera off, the right stick is nobody's. It used to
+        // drive the cross, and that is what made the camera fight it.
         let mut ui = pads_ui();
-        ui.look = true;
-        let changes = push_sticks_dt(&mut ui, [0.0, -1.0, 0.0, 0.0], 0.0);
-        assert!(changes.iter().all(|change| change.marker < PAD_FINGER_BASE + 4));
+        let changes = push_sticks_dt(&mut ui, [0.0, 0.0, 0.0, 1.0], 0.0);
+        assert!(changes.is_empty(), "the right stick drives no pad: {changes:?}");
+        assert!(!pad_of(&ui, PadKind::Cross).touching);
     }
 
     #[test]

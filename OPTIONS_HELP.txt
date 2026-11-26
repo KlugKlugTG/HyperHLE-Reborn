@@ -475,27 +475,39 @@ Other options:
         pushing it down-left presses both LeftStickLeft and LeftStickDown.
         A trigger counts as pressed once it is pulled past half-travel.
 
-        Two movement pads can be added from the same menu, and are off until
-        they are: "Circle: on/off" is a ring at the bottom left driven by the
-        left stick, and "Cross: on/off" is a cross at the bottom right driven
-        by the right stick. Removing a pad releases any finger it was holding.
+        Two pads can be added from the same menu, and are off until they are.
+        "Circle: on/off" is a ring at the bottom left, driven by the left
+        stick. "Cross: on/off" is a cross at the bottom right, driven by the
+        console's D-pad buttons. Removing a pad releases any finger it was
+        holding.
 
-        A pad sends one finger, like a real analogue stick, not one finger per
-        direction. The finger goes down in the middle of the pad and is dragged
-        in whatever direction the stick points, as far as it is pushed: a light
-        push is a short drag, a full push reaches the rim. Because it is one
-        finger, the direction can change freely while it is held, so walking
+        The circle sends one finger, like a real analogue stick, not one finger
+        per direction. The finger goes down in the middle of the pad and is
+        dragged in whatever direction the stick points, as far as it is pushed:
+        a light push is a short drag, a full push reaches the rim. Because it is
+        one finger, the direction can change freely while it is held, so walking
         forward and then turning to walk right, or reversing to walk back, is a
         single uninterrupted drag that the game reads as a stick being moved --
         no releasing and re-touching, which is what made walking feel like it
         needed the stick let go before a direction was noticed.
 
-        A short moment at rest keeps the finger down, so sweeping the stick
-        through the middle to reverse direction is not mistaken for letting go.
-        When the stick really is released, the finger lifts where it got to.
-        The two pads are independent. A pad ignores its stick while any marker
-        is bound to one of that stick's directions, so a stick either walks or
-        taps, never both.
+        The cross sends one fixed touch per direction, on that direction's
+        arrow, where it stays until the direction changes. A D-pad is how games
+        with a weapon wheel are meant to be driven: press up and the wheel
+        picks whatever is up, press up and right together for a diagonal, roll
+        from one button to the next and the finger moves without ever lifting.
+        A tap that goes down and up within a single frame is still held for a
+        moment, so the game reads it as a tap rather than missing it.
+
+        The right stick drives neither pad. It belongs to camera mode, so
+        turning the camera cannot move a finger that is choosing a weapon, and
+        the wheel and the camera can be used at the same time.
+
+        A short moment at rest keeps a finger down, so sweeping through the
+        middle to reverse direction is not mistaken for letting go. When the
+        stick or button really is released, the finger lifts where it got to.
+        A pad steps aside while any marker is bound to one of its own controls,
+        so a stick or D-pad direction either walks or taps, never both.
 
         Drag a pad to move it. Drag the small grip on its rim to change its
         size. Pads and markers are saved together for the app in
@@ -514,9 +526,9 @@ Other options:
         stays fully visible, so the setting can be undone.
 
         The "Camera" row turns on camera mode: the right stick then drags a
-        finger for the game's look-around control, and the cross sends nothing.
-        It stays on screen, faded, so it can still be moved; a pad the menu
-        calls ON is always drawn. Pushing the stick further drags faster. The drag
+        finger for the game's look-around control. Neither pad is affected,
+        because neither reads the right stick, so a weapon wheel stays usable
+        while the camera turns. Pushing the stick further drags faster. The drag
         stays inside a small box on the right-hand third of the screen, well
         clear of the left-hand area where phone shooters put their own movement
         joystick, so turning the camera cannot move the character. When the
