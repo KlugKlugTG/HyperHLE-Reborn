@@ -80,7 +80,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends xvfb xdotool x11-utils imagemagick mesa-utils libsndio-dev sysstat
+          sudo apt-get install -y --no-install-recommends xvfb xdotool x11-utils imagemagick mesa-utils libsndio-dev sysstat gdb
           if ! xdpyinfo >/dev/null 2>&1; then
             export DISPLAY=:99
             Xvfb "$DISPLAY" -screen 0 1280x960x24 -ac > results/xvfb.log 2>&1 &
@@ -108,11 +108,12 @@ jobs:
             sed -E '/Serial Number|Hardware UUID|Provisioning UDID/d' > results/hardware.txt
           swift -e 'import Metal; print("Default Metal device:", MTLCreateSystemDefaultDevice()?.name ?? "none"); for device in MTLCopyAllDevices() { print("Metal device:", device.name) }' | tee results/metal.txt
           if [[ "$RENDERER" == angle-metal ]]; then
-            chrome="/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework"
-            libraries="$chrome/Versions/Current/Libraries"
-            test -f "$libraries/libEGL.dylib" && test -f "$libraries/libGLESv2.dylib"
-            # The release binary must request an ES-profile SDL window on Cocoa.
-            # Bootstrap the ES1-on-ES2 backend with ANGLE's ES2 entry points.
+            # Electron ships a matching ARM64 EGL/GLES pair in its Mac framework.
+            curl -fsSL --retry 3 https://github.com/electron/electron/releases/download/v33.4.11/electron-v33.4.11-darwin-arm64.zip -o "$RUNNER_TEMP/egl.zip"
+            unzip -j "$RUNNER_TEMP/egl.zip" '*/Versions/A/Libraries/libEGL.dylib' '*/Versions/A/Libraries/libGLESv2.dylib' -d "$RUNNER_TEMP/angle"
+            libraries="$RUNNER_TEMP/angle"
+            test -s "$libraries/libEGL.dylib"
+            test -s "$libraries/libGLESv2.dylib"
             echo "SDL_VIDEO_EGL_DRIVER=$libraries/libEGL.dylib" >> "$GITHUB_ENV"
             echo "SDL_VIDEO_GL_DRIVER=$libraries/libGLESv2.dylib" >> "$GITHUB_ENV"
             echo "ANGLE_DEFAULT_PLATFORM=metal" >> "$GITHUB_ENV"
