@@ -1947,20 +1947,145 @@ fn glResolveMultisampleFramebufferAPPLE(env: &mut Environment) {
         gles.ResolveMultisampleFramebufferAPPLE()
     })
 }
-fn glDiscardFramebufferEXT(
-    _env: &mut Environment,
-    _target: GLenum,
-    _num_attachments: GLsizei,
-    _attachments: ConstPtr<GLenum>,
+enum FramebufferHint {
+    Discard,
+    Invalidate,
+    Region(GLint, GLint, GLsizei, GLsizei),
+}
+
+/// EXT_discard_framebuffer and ES3 invalidation share the default framebuffer
+/// enums (COLOR, DEPTH, STENCIL) and named attachment enums. EXT accepts only
+/// FRAMEBUFFER and COLOR_ATTACHMENT0, DEPTH_ATTACHMENT or STENCIL_ATTACHMENT
+/// for a named framebuffer.
+fn framebuffer_hint(
+    env: &mut Environment,
+    hint: FramebufferHint,
+    target: GLenum,
+    count: GLsizei,
+    attachments: ConstPtr<GLenum>,
 ) {
-    // GL_EXT_discard_framebuffer is only a bandwidth hint, but forwarding it
-    // to the host is a net loss in practice: on tile-based drivers the guest
-    // declares attachments it is still going to sample later in the frame
-    // (the emulator's FBO mapping is not identical to the device's), and the
-    // resulting discard throws away finished tiles. Minecraft: Pocket Edition
-    // turns into a black screen as soon as the hint is forwarded. The
-    // extension is therefore accepted and ignored, which is what a host
-    // without GL_EXT_discard_framebuffer does too.
+    use crate::gles::gles30_raw as gl;
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let ext = matches!(hint, FramebufferHint::Discard);
+        if target != gl::FRAMEBUFFER
+            && (ext || !matches!(target, gl::READ_FRAMEBUFFER | gl::DRAW_FRAMEBUFFER))
+        {
+            shadow.record_error(gl::INVALID_ENUM);
+            return;
+        }
+        let Some(len) = u32::try_from(count).ok().and_then(|n| n.checked_mul(4)) else {
+            shadow.record_error(gl::INVALID_VALUE);
+            return;
+        };
+        if (len != 0 && attachments.is_null())
+            || matches!(hint, FramebufferHint::Region(_, _, w, h) if w < 0 || h < 0)
+        {
+            shadow.record_error(gl::INVALID_VALUE);
+            return;
+        }
+        if count == 0 {
+            return;
+        }
+        let bytes = mem.bytes_at(attachments.cast(), len);
+        let pointer = bytes.as_ptr().cast();
+
+        // GL_EXT_discard_framebuffer is only a bandwidth hint, and honouring it
+        // costs correctness rather than saving work: the guest's attachments
+        // don't map one-to-one onto the host's, so the host throws away tiles
+        // the guest still samples later in the frame. Minecraft: Pocket Edition
+        // goes black as soon as the hint is forwarded. Accept the call (the
+        // validation above still reports the same errors) and drop the hint,
+        // exactly like a host without the extension.
+        if ext {
+            return;
+        }
+        let extension_attachment = |a| {
+            matches!(
+                a,
+                gl::COLOR
+                    | gl::DEPTH
+                    | gl::STENCIL
+                    | gl::COLOR_ATTACHMENT0
+                    | gl::DEPTH_ATTACHMENT
+                    | gl::STENCIL_ATTACHMENT
+            )
+        };
+        let enums = || {
+            bytes
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        };
+        if ext && !enums().all(extension_attachment) {
+            shadow.record_error(gl::INVALID_ENUM);
+            return;
+        }
+        if gles.supports_framebuffer_invalidation() {
+            match hint {
+                FramebufferHint::Region(x, y, w, h) => {
+                    gles.InvalidateSubFramebuffer(target, count, pointer, x, y, w, h)
+                }
+                _ => gles.InvalidateFramebuffer(target, count, pointer),
+            }
+            return;
+        }
+
+        // Validate even on drivers where the hint itself can be ignored.
+        let mut framebuffer = 0;
+        let binding = if target == gl::READ_FRAMEBUFFER && gles.is_es3() {
+            gl::READ_FRAMEBUFFER_BINDING
+        } else {
+            gl::FRAMEBUFFER_BINDING
+        };
+        gles.GetIntegerv(binding, &mut framebuffer);
+        let mut ext_compatible = true;
+        for attachment in enums() {
+            let default_buffer = matches!(attachment, gl::COLOR | gl::DEPTH | gl::STENCIL);
+            if default_buffer != (framebuffer == 0) {
+                shadow.record_error(gl::INVALID_ENUM);
+                return;
+            }
+            if extension_attachment(attachment) {
+                continue;
+            }
+            ext_compatible = false;
+            if attachment == gl::DEPTH_STENCIL_ATTACHMENT {
+                continue;
+            }
+            if (gl::COLOR_ATTACHMENT0..=gl::COLOR_ATTACHMENT31).contains(&attachment) {
+                let mut max_colors = 1;
+                if gles.is_es3() {
+                    gles.GetIntegerv(gl::MAX_COLOR_ATTACHMENTS, &mut max_colors);
+                }
+                if attachment - gl::COLOR_ATTACHMENT0 >= max_colors as u32 {
+                    shadow.record_error(gl::INVALID_OPERATION);
+                    return;
+                }
+            } else {
+                shadow.record_error(gl::INVALID_ENUM);
+                return;
+            }
+        }
+        // A whole-framebuffer discard cannot implement a subrectangle or a
+        // separately bound read framebuffer. The EXT call itself is not
+        // forwarded (see the `ext` early return above), so there is nothing
+        // to do here for a compatible ES3 invalidation either.
+        let _ = ext_compatible;
+    });
+}
+
+fn glDiscardFramebufferEXT(
+    env: &mut Environment,
+    target: GLenum,
+    num_attachments: GLsizei,
+    attachments: ConstPtr<GLenum>,
+) {
+    framebuffer_hint(
+        env,
+        FramebufferHint::Discard,
+        target,
+        num_attachments,
+        attachments,
+    );
 }
 
 /// `glPushGroupMarkerEXT` — debug marker from `GL_EXT_debug_marker`.
@@ -3800,29 +3925,6 @@ fn glCompressedTexImage2D(
         if let Some(texture) = bound_texture {
             shadow.forget_pvrtc_texture_level(target, texture, level);
         }
-        // Pre-flight: drain any sticky GL error left by the previous call
-        // (e.g. an oversized RGBA8 glTexImage2D on a strict Mali driver),
-        // so when we check post-upload below we can attribute a fresh error
-        // to *this* compressed upload only. Without this, every PVRTC /
-        // paletted upload that follows a failed glTexImage2D would report
-        // a misleading "compressed upload failed" on the very first call —
-        // that's exactly what was happening on Mali-G57 with Temple Run
-        // (HyperHLE log: 1024x1024 RGBA8 upload immediately followed by
-        // 256x256 PVRTC upload, both blamed on the PVRTC path).
-        let mut drained = 0u32;
-        loop {
-            let e = gles.GetError();
-            if e == 0 {
-                break;
-            }
-            drained += 1;
-            if drained > 16 {
-                // Pathological driver that won't clear; bail out instead of
-                // looping forever.
-                break;
-            }
-        }
-
         let image_size_usize = match usize::try_from(image_size) {
             Ok(size) => size,
             Err(_) => return,
@@ -3844,20 +3946,15 @@ fn glCompressedTexImage2D(
             mem.ptr_at(data.cast::<u8>(), image_size_usize as GuestUSize)
                 .cast()
         };
-        let is_pvrtc = matches!(
-            internalformat,
-            gles11::COMPRESSED_RGBA_PVRTC_2BPPV1_IMG
-                | gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG
-                | gles11::COMPRESSED_RGB_PVRTC_2BPPV1_IMG
-                | gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG
-        );
+        let emulate_pvrtc = crate::gles::util::pvrtc_format_properties(internalformat).is_some()
+            && !gles.pvrtc_native();
         // PVRTC storage allocated with no data: desktop GL can't honour the
         // PVRTC internalformat, so our decode path uploads RGBA instead.
         // Mirror that for the allocate-only case by reserving RGBA storage of
         // the same dimensions (uninitialised), so the texture object is
         // complete and later CompressedTexSubImage2D updates have somewhere to
         // land. Without this the texture would be left in its default state.
-        if is_pvrtc && data_was_null && width > 0 && height > 0 {
+        if emulate_pvrtc && data_was_null && width > 0 && height > 0 {
             gles.TexImage2D(
                 target,
                 level,
@@ -3906,7 +4003,7 @@ fn glCompressedTexImage2D(
             }
             return;
         }
-        if is_pvrtc && !data.is_null() && image_size > 0 {
+        if emulate_pvrtc && !data.is_null() && image_size > 0 {
             let payload = std::slice::from_raw_parts(data.cast::<u8>(), image_size_usize);
             if crate::gles::try_decode_pvrtc(
                 gles,
@@ -3952,6 +4049,30 @@ fn glCompressedTexImage2D(
                 return;
             }
         }
+        // Pre-flight: drain any sticky GL error left by the previous call
+        // (e.g. an oversized RGBA8 glTexImage2D on a strict Mali driver),
+        // so when we check post-upload below we can attribute a fresh error
+        // to *this* compressed upload only. Without this, every PVRTC /
+        // paletted upload that follows a failed glTexImage2D would report
+        // a misleading "compressed upload failed" on the very first call —
+        // that's exactly what was happening on Mali-G57 with Temple Run
+        // (HyperHLE log: 1024x1024 RGBA8 upload immediately followed by
+        // 256x256 PVRTC upload, both blamed on the PVRTC path).
+        let mut drained = 0u32;
+        loop {
+            let e = gles.GetError();
+            if e == 0 {
+                break;
+            }
+            shadow.record_error(e);
+            drained += 1;
+            if drained > 16 {
+                // Pathological driver that won't clear; bail out instead of
+                // looping forever.
+                break;
+            }
+        }
+
         gles.CompressedTexImage2D(
             target,
             level,
@@ -3982,6 +4103,7 @@ fn glCompressedTexImage2D(
             }
         }
         if post_err != 0 {
+            shadow.record_error(post_err);
             use std::sync::atomic::{AtomicU64, Ordering};
             // Pack (internalformat << 32) | post_err into a single 64-bit
             // slot per "ever seen" entry; cap at 8 distinct entries.
@@ -7841,10 +7963,13 @@ fn glInvalidateFramebuffer(
     num_attachments: GLsizei,
     attachments: ConstPtr<GLenum>,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let slice = mem.bytes_at(attachments.cast(), (num_attachments as GuestUSize) * 4);
-        gles.InvalidateFramebuffer(target, num_attachments, slice.as_ptr().cast())
-    });
+    framebuffer_hint(
+        env,
+        FramebufferHint::Invalidate,
+        target,
+        num_attachments,
+        attachments,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7858,18 +7983,13 @@ fn glInvalidateSubFramebuffer(
     width: GLsizei,
     height: GLsizei,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let slice = mem.bytes_at(attachments.cast(), (num_attachments as GuestUSize) * 4);
-        gles.InvalidateSubFramebuffer(
-            target,
-            num_attachments,
-            slice.as_ptr().cast(),
-            x,
-            y,
-            width,
-            height,
-        )
-    });
+    framebuffer_hint(
+        env,
+        FramebufferHint::Region(x, y, width, height),
+        target,
+        num_attachments,
+        attachments,
+    );
 }
 
 // -- 3D textures and immutable storage --

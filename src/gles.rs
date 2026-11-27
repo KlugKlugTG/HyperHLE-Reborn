@@ -229,6 +229,9 @@ impl<'a> GLES for LoggingGLES<'a> {
     fn discard_ext_supported(&self) -> bool {
         self.inner.discard_ext_supported()
     }
+    fn supports_framebuffer_invalidation(&self) -> bool {
+        self.inner.supports_framebuffer_invalidation()
+    }
     unsafe fn DiscardFramebufferEXT(
         &mut self,
         target: GLenum,

@@ -5,6 +5,7 @@
  */
 
 #include "system_headers.h"
+#include <dlfcn.h>
 #include <stdio.h>
 
 // The common-3.0 SDK predates GLKit. These declarations follow Apple's SDK:
@@ -301,6 +302,32 @@ static int glk_graphics_error;
 }
 @end
 
+// https://registry.khronos.org/OpenGL/extensions/EXT/EXT_discard_framebuffer.txt
+static int test_framebuffer_hints(void) {
+  void (*discard)(unsigned, int, const unsigned *) =
+      dlsym(RTLD_DEFAULT, "glDiscardFramebufferEXT");
+  void (*invalidate)(unsigned, int, const unsigned *) =
+      dlsym(RTLD_DEFAULT, "glInvalidateFramebuffer");
+  void (*invalidate_region)(unsigned, int, const unsigned *, int, int, int,
+                            int) =
+      dlsym(RTLD_DEFAULT, "glInvalidateSubFramebuffer");
+  if (!discard || !invalidate || !invalidate_region)
+    return -1;
+  unsigned depth_attachment = 0x8d00;
+  discard(0x8d40, 1, &depth_attachment);
+  invalidate(0x8d40, 1, &depth_attachment);
+  if (glGetError() != 0)
+    return -2;
+  discard(0x8ca8, 0, NULL); // EXT accepts only GL_FRAMEBUFFER.
+  if (glGetError() != 0x0500)
+    return -3;
+  invalidate(0x8d40, -1, NULL);
+  if (glGetError() != 0x0501)
+    return -4;
+  invalidate_region(0x8d40, 0, NULL, 0, 0, -1, 1);
+  return glGetError() == 0x0501 ? 0 : -5;
+}
+
 // Run this probe graphically in CI with Xvfb, using the same TestApp binary
 // produced by the full headless suite. No game assets are needed.
 int test_GLKView_drawable_graphics(void) {
@@ -315,6 +342,8 @@ int test_GLKView_drawable_graphics(void) {
   int result = test_vertex_attribute_vectors() ? -9 : 0;
   if (test_shader_reflection_without_names())
     result = -10;
+  if (test_framebuffer_hints())
+    result = -11;
   const int configurations[][4] = {
       {0, 0, 0, 0}, {0, 1, 0, 0}, {0, 2, 1, 0},
       {0, 2, 1, 1}, {1, 0, 0, 1}, {2, 0, 0, 1},

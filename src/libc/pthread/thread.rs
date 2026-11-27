@@ -665,7 +665,10 @@ fn pthread_mach_thread_np(env: &mut Environment, thread: pthread_t) -> mach_port
     }
 }
 
-fn thread_id_from_mach_thread_port(port: mach_port_t, thread_count: usize) -> Option<ThreadId> {
+pub(crate) fn thread_id_from_mach_thread_port(
+    port: mach_port_t,
+    thread_count: usize,
+) -> Option<ThreadId> {
     let thread_id = port.checked_sub(1)? as ThreadId;
     (thread_id < thread_count).then_some(thread_id)
 }

@@ -44,6 +44,7 @@ pub struct GLES3OnGL3Context {
     /// Mesa never advertises PVRTC on desktop, so on most Linux x86 hosts
     /// this is always `false`.
     pvrtc_native: bool,
+    invalidate_supported: bool,
     /// Whether `pvrtc_native` has been populated yet. The check is deferred
     /// to the first `make_current` because we need a current GL context to
     /// query `GL_EXTENSIONS`.
@@ -73,6 +74,7 @@ impl GLESContext for GLES3OnGL3Context {
             return crate::gles::CurrentGLES::ES3OnGL3(GLES3OnGL3 {
                 _gl_lifetime: PhantomData,
                 pvrtc_native: self.pvrtc_native,
+                invalidate_supported: self.invalidate_supported,
                 advertise_es3: self.advertise_es3,
             });
         }
@@ -91,13 +93,15 @@ impl GLESContext for GLES3OnGL3Context {
         gles11::load_with(|s| window.gl_get_proc_address(s));
         self.is_loaded = true;
         if !self.pvrtc_native_checked {
-            self.pvrtc_native = unsafe { detect_pvrtc_support() };
+            self.pvrtc_native = unsafe { has_extension(b"GL_IMG_texture_compression_pvrtc") };
+            self.invalidate_supported = unsafe { detect_invalidation_support() };
             self.pvrtc_native_checked = true;
         }
         unsafe { self.init_default_vao() };
         crate::gles::CurrentGLES::ES3OnGL3(GLES3OnGL3 {
             _gl_lifetime: PhantomData,
             pvrtc_native: self.pvrtc_native,
+            invalidate_supported: self.invalidate_supported,
             advertise_es3: self.advertise_es3,
         })
     }
@@ -111,6 +115,7 @@ impl GLESContext for GLES3OnGL3Context {
             return crate::gles::CurrentGLES::ES3OnGL3(GLES3OnGL3 {
                 _gl_lifetime: PhantomData,
                 pvrtc_native: self.pvrtc_native,
+                invalidate_supported: self.invalidate_supported,
                 advertise_es3: self.advertise_es3,
             });
         }
@@ -120,13 +125,15 @@ impl GLESContext for GLES3OnGL3Context {
         gles11::load_with(&mut *loader_fn);
         self.is_loaded = true;
         if !self.pvrtc_native_checked {
-            self.pvrtc_native = detect_pvrtc_support();
+            self.pvrtc_native = has_extension(b"GL_IMG_texture_compression_pvrtc");
+            self.invalidate_supported = detect_invalidation_support();
             self.pvrtc_native_checked = true;
         }
         self.init_default_vao();
         crate::gles::CurrentGLES::ES3OnGL3(GLES3OnGL3 {
             _gl_lifetime: PhantomData,
             pvrtc_native: self.pvrtc_native,
+            invalidate_supported: self.invalidate_supported,
             advertise_es3: self.advertise_es3,
         })
     }
@@ -147,6 +154,7 @@ impl GLES3OnGL3Context {
             is_loaded: false,
             advertise_es3,
             pvrtc_native: false,
+            invalidate_supported: false,
             pvrtc_native_checked: false,
             default_vao: 0,
         })
@@ -171,34 +179,8 @@ impl GLES3OnGL3Context {
     }
 }
 
-/// Query `GL_EXTENSIONS` and return whether the current OpenGL ES 3.0 driver
-/// advertises `GL_IMG_texture_compression_pvrtc`. Must be called with a
-/// current GL context.
-///
-/// On strict OpenGL ES 3.0+ contexts `glGetString(GL_EXTENSIONS)` is
-/// deprecated and may return an empty string — we fall back to
-/// `glGetStringi(GL_EXTENSIONS, i)` in that case, iterating over
-/// `GL_NUM_EXTENSIONS`. If neither path produces a useful list we
-/// conservatively return `false` and software-decode PVRTC. That's the safe
-/// choice: it produces correct output everywhere, at the cost of one extra
-/// in-memory pass per texture upload on hosts where PVRTC could otherwise
-/// be uploaded directly.
-unsafe fn detect_pvrtc_support() -> bool {
-    // First try the legacy `glGetString(GL_EXTENSIONS)` path.
-    let legacy = gl33::GetString(gles11::EXTENSIONS);
-    if legacy.is_null() {
-        return false;
-    }
-    let Ok(s) = CStr::from_ptr(legacy as *const _).to_str() else {
-        return false;
-    };
-    if !s.is_empty()
-        && s.split(' ')
-            .any(|ext| ext == "GL_IMG_texture_compression_pvrtc")
-    {
-        return true;
-    }
-    // Fallback: ES 3.0 indexed extension query.
+/// A desktop core profile exposes extensions through the indexed query only.
+unsafe fn has_extension(name: &[u8]) -> bool {
     let mut count: GLint = 0;
     gl33::GetIntegerv(gl33::NUM_EXTENSIONS, &mut count);
     for i in 0..count.max(0) {
@@ -206,19 +188,27 @@ unsafe fn detect_pvrtc_support() -> bool {
         if p.is_null() {
             continue;
         }
-        let Ok(ext) = CStr::from_ptr(p as *const _).to_str() else {
-            continue;
-        };
-        if ext == "GL_IMG_texture_compression_pvrtc" {
+        if CStr::from_ptr(p.cast()).to_bytes() == name {
             return true;
         }
     }
     false
 }
 
+unsafe fn detect_invalidation_support() -> bool {
+    let mut major = 0;
+    let mut minor = 0;
+    gl33::GetIntegerv(gl33::MAJOR_VERSION, &mut major);
+    gl33::GetIntegerv(gl33::MINOR_VERSION, &mut minor);
+    gl33::InvalidateFramebuffer::is_loaded()
+        && gl33::InvalidateSubFramebuffer::is_loaded()
+        && ((major, minor) >= (4, 3) || has_extension(b"GL_ARB_invalidate_subdata"))
+}
+
 pub struct GLES3OnGL3<'gl_ctx> {
     _gl_lifetime: PhantomData<&'gl_ctx ()>,
     pvrtc_native: bool,
+    invalidate_supported: bool,
     /// Whether this backend instance should advertise itself as OpenGL ES 3.0
     /// via [`GLES::is_es3`]. The same desktop GL 3.3 Core code path serves
     /// both OpenGL ES 2.0 and OpenGL ES 3.0 EAGL APIs — the [crate::gles::gles2_on_gl3::GLES2OnGL3Context]
@@ -293,6 +283,9 @@ impl GLES for GLES3OnGL3<'_> {
         self.advertise_es3
     }
 
+    fn supports_framebuffer_invalidation(&self) -> bool {
+        self.invalidate_supported
+    }
     unsafe fn driver_description(&self) -> String {
         let version = CStr::from_ptr(gl33::GetString(gl33::VERSION) as *const _);
         let vendor = CStr::from_ptr(gl33::GetString(gl33::VENDOR) as *const _);
@@ -965,17 +958,7 @@ impl GLES for GLES3OnGL3<'_> {
         string: *const *const GLchar,
         length: *const GLint,
     ) {
-        // The guest app ships GLSL ES (either 1.00 or 3.00) source; the
-        // host driver is a desktop GL 3.3 Core context that only accepts
-        // GLSL 1.20–3.30. Translate before forwarding.
-        //
-        // We pick the version per-source-string by sniffing the leading
-        // `#version` directive: `#version 300 es` triggers the GLSL 3.30
-        // Core translator, anything else (including no directive) uses the
-        // GLSL 1.20 translator that the ES 2.0 path established.
-        use super::gles2_glsl::{
-            patch_shadow_samplers_extension, translate_glsl_es_300_to_330, translate_glsl_es_to_120,
-        };
+        use super::gles2_glsl::translate_glsl_es_to_330;
         use std::ffi::CString;
 
         let n = count.max(0) as usize;
@@ -1001,22 +984,8 @@ impl GLES for GLES3OnGL3<'_> {
 
         let mut shader_type = 0;
         gl33::GetShaderiv(shader, gl33::SHADER_TYPE, &mut shader_type);
-        let joined = patch_shadow_samplers_extension(
-            &joined,
-            shader_type as GLenum == gl33::VERTEX_SHADER,
-            self.advertise_es3,
-        );
-
-        let is_es3 = joined
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .map(|l| l.contains("300 es"))
-            .unwrap_or(false);
-        let translated = if is_es3 {
-            translate_glsl_es_300_to_330(&joined)
-        } else {
-            translate_glsl_es_to_120(&joined)
-        };
+        let translated =
+            translate_glsl_es_to_330(&joined, shader_type as GLenum == gl33::VERTEX_SHADER);
         let c = match CString::new(translated) {
             Ok(c) => c,
             Err(_) => {

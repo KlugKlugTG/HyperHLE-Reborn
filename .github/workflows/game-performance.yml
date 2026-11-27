@@ -1,0 +1,141 @@
+name: Game performance capture
+
+on:
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: "JSON array of cases with label, run, artifact and runner, optionally before_run + before_artifact for A/B/B/A or renderer=angle-metal on macOS"
+        required: true
+        type: string
+      draft:
+        description: Draft release with game.ipa
+        required: true
+        type: string
+      sha256:
+        description: Expected SHA-256 of game.ipa
+        required: true
+        type: string
+      steps:
+        description: Space-separated WAIT:X,Y steps for ai-tap-sequence.py
+        type: string
+
+jobs:
+  measure:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    permissions:
+      actions: read
+      contents: write # Reading an unpublished draft release requires write access.
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.cases) }}
+    env:
+      BUILD_RUN: ${{ matrix.run }}
+      BEFORE_RUN: ${{ matrix.before_run }}
+      BEFORE_ARTIFACT: ${{ matrix.before_artifact }}
+      DRAFT: ${{ inputs.draft }}
+      FIXTURE_HASH: ${{ inputs.sha256 }}
+      STEPS: ${{ inputs.steps || '1:- 20:-' }}
+      RENDERER: ${{ matrix.renderer }}
+      EMULATOR_GL_OPTION: ''
+      ALSOFT_DRIVERS: 'null'
+      TOUCHHLE_FRAME_TIMES: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Identify build and verify private fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p results "$RUNNER_TEMP/fixture"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN" --jq '{id,head_sha,html_url}' > results/build.json
+          if [[ -n "$BEFORE_RUN" || -n "$BEFORE_ARTIFACT" ]]; then
+            test -n "$BEFORE_RUN" && test -n "$BEFORE_ARTIFACT"
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BEFORE_RUN" --jq '{id,head_sha,html_url}' > results/before-build.json
+          fi
+          test "$(gh release view "$DRAFT" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          gh release download "$DRAFT" --repo "$GITHUB_REPOSITORY" --pattern game.ipa --dir "$RUNNER_TEMP/fixture"
+          cd "$RUNNER_TEMP/fixture"
+          actual=$(shasum -a 256 game.ipa)
+          test "${actual%% *}" = "$FIXTURE_HASH"
+          echo "$actual" > "$GITHUB_WORKSPACE/results/source.sha256"
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ env.BUILD_RUN }}
+          name: ${{ matrix.artifact }}
+          path: emulator
+      - uses: actions/download-artifact@v4
+        if: matrix.before_run
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ matrix.before_run }}
+          name: ${{ matrix.before_artifact }}
+          path: baseline
+      - name: Install Linux runtime tools and identify renderer
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends xvfb xdotool x11-utils imagemagick mesa-utils libsndio-dev sysstat
+          if ! xdpyinfo >/dev/null 2>&1; then
+            export DISPLAY=:99
+            Xvfb "$DISPLAY" -screen 0 1280x960x24 -ac > results/xvfb.log 2>&1 &
+            for _ in {1..30}; do xdpyinfo >/dev/null 2>&1 && break; sleep 0.2; done
+          fi
+          echo "DISPLAY=$DISPLAY" >> "$GITHUB_ENV"
+          glxinfo -B | tee results/glxinfo.txt
+          ls -l /dev/dri > results/gpu-devices.txt 2>&1 || true
+          lscpu > results/cpu.txt
+          chmod +x emulator/touchHLE
+          if [[ -d baseline ]]; then chmod +x baseline/touchHLE; fi
+      - name: Prepare Apple Silicon emulator and record Metal hardware
+        if: runner.os == 'macOS'
+        run: |
+          mountpoint="$RUNNER_TEMP/emulator-disk"
+          for bundle in emulator baseline; do
+            if [[ ! -d "$bundle" ]]; then continue; fi
+            hdiutil attach -readonly -nobrowse -mountpoint "$mountpoint" "$bundle"/*.dmg
+            # Unbundled binaries use the per-launch working directory for user data.
+            cp "$mountpoint"/*.app/Contents/MacOS/touchHLE "$bundle/"
+            cp -R "$mountpoint"/*.app/Contents/Resources/touchHLE_* "$bundle/"
+            hdiutil detach "$mountpoint"
+          done
+          system_profiler SPDisplaysDataType SPHardwareDataType |
+            sed -E '/Serial Number|Hardware UUID|Provisioning UDID/d' > results/hardware.txt
+          swift -e 'import Metal; print("Default Metal device:", MTLCreateSystemDefaultDevice()?.name ?? "none"); for device in MTLCopyAllDevices() { print("Metal device:", device.name) }' | tee results/metal.txt
+          if [[ "$RENDERER" == angle-metal ]]; then
+            chrome="/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework"
+            libraries="$chrome/Versions/Current/Libraries"
+            test -f "$libraries/libEGL.dylib" && test -f "$libraries/libGLESv2.dylib"
+            # The release binary must request an ES-profile SDL window on Cocoa.
+            # Bootstrap the ES1-on-ES2 backend with ANGLE's ES2 entry points.
+            echo "SDL_VIDEO_EGL_DRIVER=$libraries/libEGL.dylib" >> "$GITHUB_ENV"
+            echo "SDL_VIDEO_GL_DRIVER=$libraries/libGLESv2.dylib" >> "$GITHUB_ENV"
+            echo "ANGLE_DEFAULT_PLATFORM=metal" >> "$GITHUB_ENV"
+            echo "TOUCHHLE_FORCE_GLES1=gles1_on_gles2" >> "$GITHUB_ENV"
+            echo "EMULATOR_GL_OPTION=--gles1=gles1_native" >> "$GITHUB_ENV"
+          fi
+          python3 -m venv "$RUNNER_TEMP/game-python"
+          "$RUNNER_TEMP/game-python/bin/pip" install --disable-pip-version-check pillow pyobjc-framework-Quartz
+          echo "$RUNNER_TEMP/game-python/bin" >> "$GITHUB_PATH"
+      - name: Capture comparable game launches
+        run: |
+          read -r -a steps <<< "$STEPS"
+          args=()
+          for step in "${steps[@]}"; do args+=(--step "$step"); done
+          if [[ -d baseline ]]; then args+=(--before baseline); fi
+          if [[ -n "$EMULATOR_GL_OPTION" ]]; then args+=("--emulator-arg=$EMULATOR_GL_OPTION"); fi
+          if [[ "$RENDERER" == angle-metal ]]; then args+=(--require-metal); fi
+          if command -v pidstat >/dev/null; then
+            pidstat -h -u -w -r -t -C touchHLE 1 > results/pidstat.txt &
+          fi
+          python3 dev-scripts/game-performance.py --app "$RUNNER_TEMP/fixture/game.ipa" \
+            --candidate emulator --out results "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: game-performance-${{ matrix.label }}
+          path: results/

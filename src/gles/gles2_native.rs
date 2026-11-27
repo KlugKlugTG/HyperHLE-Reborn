@@ -88,6 +88,7 @@ pub struct GLES2NativeContext {
     shadow_samplers_ext_supported: bool,
     /// Whether the host driver advertises `GL_OES_texture_3D`.
     texture_3d_ext_supported: bool,
+    discard_ext: bool,
     map_buffer_range_supported: bool,
     native_es3: bool,
     multisample_api: MultisampleApi,
@@ -108,6 +109,7 @@ impl GLESContext for GLES2NativeContext {
             texture_lod_ext_supported: false,
             shadow_samplers_ext_supported: false,
             texture_3d_ext_supported: false,
+            discard_ext: false,
             map_buffer_range_supported: false,
             native_es3: false,
             multisample_api: MultisampleApi::Unsupported,
@@ -126,6 +128,7 @@ impl GLESContext for GLES2NativeContext {
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
                 shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
                 texture_3d_ext_supported: self.texture_3d_ext_supported,
+                discard_ext: self.discard_ext,
                 map_buffer_range_supported: self.map_buffer_range_supported,
                 native_es3: self.native_es3,
                 multisample_api: self.multisample_api,
@@ -139,6 +142,8 @@ impl GLESContext for GLES2NativeContext {
         gles2::load_with(|s| window.gl_get_proc_address(s));
         gles30::RenderbufferStorageMultisample::load_with(|s| window.gl_get_proc_address(s));
         gles30::BlitFramebuffer::load_with(|s| window.gl_get_proc_address(s));
+        gles30::InvalidateFramebuffer::load_with(|s| window.gl_get_proc_address(s));
+        gles30::InvalidateSubFramebuffer::load_with(|s| window.gl_get_proc_address(s));
         // Some symbols (e.g. glGetString) are technically also part of ES 1.1
         // and are referenced via gles11:: in the surrounding code; load those
         // too so the existing helpers continue to work.
@@ -148,7 +153,9 @@ impl GLESContext for GLES2NativeContext {
             self.pvrtc_native = unsafe { detect_pvrtc_support() };
             self.texture_lod_ext_supported = unsafe { detect_texture_lod_ext_support() };
             self.shadow_samplers_ext_supported = unsafe { detect_shadow_samplers_ext_support() };
-            self.texture_3d_ext_supported = unsafe { detect_texture_3d_ext_support() };
+            self.texture_3d_ext_supported = unsafe { has_extension("GL_OES_texture_3D") };
+            self.discard_ext = gles2::DiscardFramebufferEXT::is_loaded()
+                && unsafe { has_extension("GL_EXT_discard_framebuffer") };
             self.map_buffer_range_supported = unsafe { detect_map_buffer_range_support() };
             self.native_es3 = unsafe { detect_native_es3() };
             self.multisample_api = unsafe { detect_multisample_api(self.native_es3) };
@@ -160,6 +167,7 @@ impl GLESContext for GLES2NativeContext {
             texture_lod_ext_supported: self.texture_lod_ext_supported,
             shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
             texture_3d_ext_supported: self.texture_3d_ext_supported,
+            discard_ext: self.discard_ext,
             map_buffer_range_supported: self.map_buffer_range_supported,
             native_es3: self.native_es3,
             multisample_api: self.multisample_api,
@@ -180,6 +188,7 @@ impl GLESContext for GLES2NativeContext {
                 texture_lod_ext_supported: self.texture_lod_ext_supported,
                 shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
                 texture_3d_ext_supported: self.texture_3d_ext_supported,
+                discard_ext: self.discard_ext,
                 map_buffer_range_supported: self.map_buffer_range_supported,
                 native_es3: self.native_es3,
                 multisample_api: self.multisample_api,
@@ -191,13 +200,17 @@ impl GLESContext for GLES2NativeContext {
         gles2::load_with(&mut *loader_fn);
         gles30::RenderbufferStorageMultisample::load_with(&mut *loader_fn);
         gles30::BlitFramebuffer::load_with(&mut *loader_fn);
+        gles30::InvalidateFramebuffer::load_with(&mut *loader_fn);
+        gles30::InvalidateSubFramebuffer::load_with(&mut *loader_fn);
         gles11::load_with(&mut *loader_fn);
         self.is_loaded = true;
         if !self.pvrtc_native_checked {
             self.pvrtc_native = detect_pvrtc_support();
             self.texture_lod_ext_supported = detect_texture_lod_ext_support();
             self.shadow_samplers_ext_supported = detect_shadow_samplers_ext_support();
-            self.texture_3d_ext_supported = detect_texture_3d_ext_support();
+            self.texture_3d_ext_supported = has_extension("GL_OES_texture_3D");
+            self.discard_ext = gles2::DiscardFramebufferEXT::is_loaded()
+                && has_extension("GL_EXT_discard_framebuffer");
             self.map_buffer_range_supported = detect_map_buffer_range_support();
             self.native_es3 = detect_native_es3();
             self.multisample_api = detect_multisample_api(self.native_es3);
@@ -209,6 +222,7 @@ impl GLESContext for GLES2NativeContext {
             texture_lod_ext_supported: self.texture_lod_ext_supported,
             shadow_samplers_ext_supported: self.shadow_samplers_ext_supported,
             texture_3d_ext_supported: self.texture_3d_ext_supported,
+            discard_ext: self.discard_ext,
             map_buffer_range_supported: self.map_buffer_range_supported,
             native_es3: self.native_es3,
             multisample_api: self.multisample_api,
@@ -279,9 +293,7 @@ unsafe fn detect_shadow_samplers_ext_support() -> bool {
         .any(|extension| extension == "GL_EXT_shadow_samplers")
 }
 
-/// Query `GL_EXTENSIONS` and return whether the current driver supports 3D
-/// textures for OpenGL ES 2.0 shaders.
-unsafe fn detect_texture_3d_ext_support() -> bool {
+unsafe fn has_extension(name: &str) -> bool {
     let legacy = gles2::GetString(gles11::EXTENSIONS);
     if legacy.is_null() {
         return false;
@@ -291,7 +303,7 @@ unsafe fn detect_texture_3d_ext_support() -> bool {
     };
     extensions
         .split_whitespace()
-        .any(|extension| extension == "GL_OES_texture_3D")
+        .any(|extension| extension == name)
 }
 
 /// Returns `true` if the shader source contains a top-level default float
@@ -614,6 +626,7 @@ pub struct GLES2Native<'gl_ctx> {
     texture_lod_ext_supported: bool,
     shadow_samplers_ext_supported: bool,
     texture_3d_ext_supported: bool,
+    discard_ext: bool,
     map_buffer_range_supported: bool,
     native_es3: bool,
     multisample_api: MultisampleApi,
@@ -684,6 +697,43 @@ impl GLES for GLES2Native<'_> {
         self.pvrtc_native
     }
 
+    fn supports_framebuffer_invalidation(&self) -> bool {
+        self.native_es3
+            && gles30::InvalidateFramebuffer::is_loaded()
+            && gles30::InvalidateSubFramebuffer::is_loaded()
+    }
+    fn discard_ext_supported(&self) -> bool {
+        self.discard_ext
+    }
+    unsafe fn DiscardFramebufferEXT(
+        &mut self,
+        target: GLenum,
+        count: GLsizei,
+        attachments: *const GLenum,
+    ) -> bool {
+        gles2::DiscardFramebufferEXT(target, count, attachments);
+        true
+    }
+    unsafe fn InvalidateFramebuffer(
+        &mut self,
+        target: GLenum,
+        count: GLsizei,
+        attachments: *const GLenum,
+    ) {
+        gles30::InvalidateFramebuffer(target, count, attachments)
+    }
+    unsafe fn InvalidateSubFramebuffer(
+        &mut self,
+        target: GLenum,
+        count: GLsizei,
+        attachments: *const GLenum,
+        x: GLint,
+        y: GLint,
+        width: GLsizei,
+        height: GLsizei,
+    ) {
+        gles30::InvalidateSubFramebuffer(target, count, attachments, x, y, width, height)
+    }
     unsafe fn driver_description(&self) -> String {
         let version = CStr::from_ptr(gles2::GetString(gles2::VERSION) as *const _);
         let vendor = CStr::from_ptr(gles2::GetString(gles2::VENDOR) as *const _);

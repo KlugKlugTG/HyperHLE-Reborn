@@ -520,6 +520,10 @@ pub trait GLES {
     fn discard_ext_supported(&self) -> bool {
         false
     }
+    /// The current host context can invalidate whole or partial framebuffers.
+    fn supports_framebuffer_invalidation(&self) -> bool {
+        self.is_es3()
+    }
     // Generic state manipulation
     unsafe fn GetError(&mut self) -> GLenum {
         gles_unimplemented!(self, "GetError not implemented by this backend")

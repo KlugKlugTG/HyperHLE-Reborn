@@ -36,6 +36,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::UNIX_EPOCH;
 
 /// The actual location of a file outside the virtual filesystem, e.g. a host
@@ -1622,10 +1623,19 @@ impl Fs {
 
     /// Like [std::fs::read] but for the guest filesystem.
     pub fn read<P: AsRef<GuestPath>>(&self, path: P) -> Result<Vec<u8>, ()> {
+        self.read_shared(path).map(Rc::unwrap_or_clone)
+    }
+
+    /// Borrow the IPA cache's verified bytes for whole-file consumers such as
+    /// the Mach-O loader. Other files get a snapshot for this read.
+    pub fn read_shared<P: AsRef<GuestPath>>(&self, path: P) -> Result<Rc<Vec<u8>>, ()> {
         let mut file = self.open(path.as_ref())?;
+        if let GuestFile::IpaBundleFile(file) = file {
+            return Ok(file.into_bytes());
+        }
         let mut result = Vec::new();
         file.read_to_end(&mut result).map_err(|_| ())?;
-        Ok(result)
+        Ok(Rc::new(result))
     }
 
     /// Like [std::fs::write] but for the guest filesystem.

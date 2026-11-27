@@ -7,13 +7,12 @@
 //! filesystem.
 use crate::fs::{FsNode, GuestPath};
 use crate::libc::time::{calendar_date_to_timestamp, time_t, tm};
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::cell::{OnceCell, RefCell};
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use zip::result::ZipError;
 use zip::ZipArchive;
 
 /// A helper struct to build an FsNode with files and directories coming in
@@ -194,8 +193,6 @@ impl BundleData {
             BundleData::HostDirectory(path) => FsNode::from_host_dir(&path, false),
             BundleData::Zip { zip, bundle_path } => {
                 let archive = Rc::new(RefCell::new(zip));
-                let archive_cache = Rc::new(RefCell::new(HashMap::new()));
-                let metadata_map = Rc::new(RefCell::new(HashMap::new()));
 
                 let mut archive_guard = (*archive).borrow_mut();
 
@@ -230,8 +227,7 @@ impl BundleData {
                                 path,
                                 FsNode::bundle_zip_file(IpaFileRef {
                                     archive: archive.clone(),
-                                    archive_files_cache: archive_cache.clone(),
-                                    metadata_map: metadata_map.clone(),
+                                    cached: OnceCell::new(),
                                     index: i,
                                 }),
                             );
@@ -259,10 +255,14 @@ impl BundleData {
                 })
             }
             BundleData::Zip { zip, bundle_path } => {
-                // Look the entry up by our own decoding of the names (see
-                // zip_entry_name()) rather than with ZipArchive::by_name(),
-                // which only knows the CP437-decoded names.
                 let plist_path = format!("{bundle_path}/Info.plist");
+                // Use the central directory's name index for ordinary archives.
+                // An unflagged UTF-8 name may only match our own decoding.
+                if let Ok(file) = zip.by_name(&plist_path) {
+                    if zip_entry_name(&file) == plist_path {
+                        return read_ipa_plist(file);
+                    }
+                }
                 let index = (0..zip.len())
                     .find(|&i| {
                         zip.by_index_raw(i)
@@ -271,194 +271,101 @@ impl BundleData {
                     .ok_or_else(|| {
                         "Could not open Info.plist from the IPA archive: file not found".to_string()
                     })?;
-                let mut file = zip
+                let file = zip
                     .by_index(index)
                     .map_err(|e| format!("Could not open Info.plist from the IPA archive: {e}"))?;
-                let mut buf = Vec::new();
-                file.read_to_end(&mut buf)
-                    .map_err(|e| format!("Could not read Info.plist from the IPA archive: {e}"))?;
-                Ok(buf)
+                read_ipa_plist(file)
             }
         }
     }
 }
 
-#[derive(Debug)]
-struct ArchivedFileMetadata {
-    /// Unix timestamp of file modification
-    last_modified: i64,
-    /// Uncompressed file size
-    size: u64,
+fn read_ipa_plist(mut file: zip::read::ZipFile<'_>) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .map_err(|e| format!("Could not read Info.plist from the IPA archive: {e}"))?;
+    Ok(buf)
 }
 
-/// Shared (refcounted) copy of the decompressed version of a file in an IPA.
-///
-/// Seeking in compressed files is hard, so the simple solution is to read the
-/// whole file into memory. This is shared so having multiple copies of the same
-/// file open won't waste memory.
-type DecompressedFile = Rc<[u8]>;
+/// Keep the decompression buffer when adding it to the cache. Converting a
+/// Vec directly to Rc<[u8]> would allocate and copy the complete member.
+#[derive(Clone, Debug, Default)]
+struct DecompressedFile(Rc<Vec<u8>>);
+
+impl AsRef<[u8]> for DecompressedFile {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[derive(Debug, Default)]
+struct ArchivedFile {
+    contents: DecompressedFile,
+    last_modified: time_t,
+    size: u64,
+}
 
 /// Represents a file inside an IPA bundle that can be opened.
 #[derive(Debug)]
 pub struct IpaFileRef {
     archive: Rc<RefCell<ZipArchive<std::fs::File>>>,
-    archive_files_cache: Rc<RefCell<HashMap<usize, DecompressedFile>>>,
-    metadata_map: Rc<RefCell<HashMap<usize, ArchivedFileMetadata>>>,
     index: usize,
+    cached: OnceCell<ArchivedFile>,
 }
 
 impl IpaFileRef {
-    pub fn open(&self) -> IpaFile {
-        // Some games, like THPS2, use a single resource bundle file which is
-        // opened each time a new game resource is being read.
-        // As IPA is basically an archive, this pattern requires unzipping to be
-        // done each time, which is extremely slow.
-        // The solution here is to cache unzipped data in memory, which should
-        // be OK as early iOS IPA files are relatively small in size.
-        let mut archive_cache = (*self.archive_files_cache).borrow_mut();
-        archive_cache.entry(self.index).or_insert_with(|| {
-            // Read the zip entry into an owned buffer inside its own block so
-            // the `archive` RefMut is released before we touch the caches.
-            let mut archive = (*self.archive).borrow_mut();
-            let decoded: Option<(Vec<u8>, ArchivedFileMetadata)> = match archive
-                .by_index(self.index)
-            {
-                Ok(mut file) => {
-                    let modified = file.last_modified();
-                    // This is not the cleanest way!
-                    // TODO: just use `time` or `chrono` crates for time conversions
-                    // (this also entails a lot of refactoring in [crate::libc:time])
-                    let tm = tm::from(
-                        modified.year(),
-                        modified.month(),
-                        modified.day(),
-                        modified.hour(),
-                        modified.minute(),
-                        modified.second(),
-                    );
-                    let timestamp = calendar_date_to_timestamp(tm);
-                    let size = file.size();
-                    let mut buf = Vec::new();
-                    if let Err(e) = file.read_to_end(&mut buf) {
-                        // The central directory can be readable even when the
-                        // compressed payload is truncated or has a bad CRC.
-                        // Discarding a partial archive is safer than letting a
-                        // guest parse corrupted Unity/player data and continue
-                        // in a damaged state.
-                        log!(
-                            "Warning: IpaFileRef::open(): IO error decompressing IPA entry {}: {}; rejecting partial buffer ({} bytes).",
-                            self.index,
-                            e,
-                            buf.len()
-                        );
-                        None
-                    } else {
-                        Some((
-                            buf,
-                            ArchivedFileMetadata {
-                                last_modified: timestamp.into(),
-                                size,
-                            },
-                        ))
-                    }
-                }
-                Err(ZipError::Io(e)) => {
+    fn cached_file(&self) -> &ArchivedFile {
+        self.cached.get_or_init(|| {
+            let mut archive = self.archive.borrow_mut();
+            let mut file = match archive.by_index(self.index) {
+                Ok(file) => file,
+                Err(error) => {
                     log!(
-                        "Warning: IpaFileRef::open(): IO error reading IPA entry {}: {}; returning empty file to guest.",
-                        self.index,
-                        e
+                        "Warning: could not open IPA entry {}: {}; returning empty file to guest.",
+                        self.index, error
                     );
-                    None
-                }
-                Err(e) => {
-                    log!(
-                        "Warning: IpaFileRef::open(): could not open IPA entry {}: {}; returning empty file to guest.",
-                        self.index,
-                        e
-                    );
-                    None
+                    return ArchivedFile::default();
                 }
             };
-            drop(archive);
-
-            match decoded {
-                Some((buf, meta)) => {
-                    (*self.metadata_map)
-                        .borrow_mut()
-                        .entry(self.index)
-                        .or_insert(meta);
-                    Rc::from(buf)
-                }
-                None => {
-                    // Cache an explicit zero-size metadata record as well as
-                    // the empty data. This prevents repeated stat() probes of
-                    // the same bad ZIP entry from retrying decompression or
-                    // panicking on absent metadata.
-                    (*self.metadata_map)
-                        .borrow_mut()
-                        .entry(self.index)
-                        .or_insert(ArchivedFileMetadata {
-                            last_modified: 0,
-                            size: 0,
-                        });
-                    Rc::from(Vec::new())
-                }
+            let mut buf = Vec::new();
+            if let Err(error) = file.read_to_end(&mut buf) {
+                // Validate the complete stream/CRC before publishing bytes or
+                // metadata. Cache the failure so later probes see the same file.
+                log!(
+                    "Warning: IO error decompressing IPA entry {}: {}; rejecting partial buffer ({} bytes).",
+                    self.index, error, buf.len()
+                );
+                return ArchivedFile::default();
             }
-        });
-        let cached_file = Rc::clone(archive_cache.get(&self.index).unwrap());
+            buf.shrink_to_fit();
+            let modified = file.last_modified();
+            ArchivedFile {
+                contents: DecompressedFile(Rc::new(buf)),
+                last_modified: calendar_date_to_timestamp(tm::from(
+                    modified.year(),
+                    modified.month(),
+                    modified.day(),
+                    modified.hour(),
+                    modified.minute(),
+                    modified.second(),
+                )),
+                size: file.size(),
+            }
+        })
+    }
+
+    pub fn open(&self) -> IpaFile {
         IpaFile {
-            file: Cursor::new(cached_file),
+            file: Cursor::new(self.cached_file().contents.clone()),
         }
     }
 
     pub fn get_last_modified(&self) -> time_t {
-        if !self.metadata_map.borrow().contains_key(&self.index) {
-            // This will force metadata loading. Broken ZIP entries cache
-            // explicit zero metadata, so a guest stat() remains safe.
-            _ = self.open();
-        }
-        let last_modified = {
-            self.metadata_map
-                .borrow()
-                .get(&self.index)
-                .map(|metadata| metadata.last_modified)
-        };
-        match last_modified {
-            Some(last_modified) => last_modified.try_into().unwrap_or(0),
-            None => {
-                log!(
-                    "Warning: IpaFileRef::get_last_modified(): IPA entry {} has \
-                     no readable metadata; reporting timestamp zero.",
-                    self.index
-                );
-                0
-            }
-        }
+        self.cached_file().last_modified
     }
+
     pub fn get_size(&self) -> u64 {
-        if !self.metadata_map.borrow().contains_key(&self.index) {
-            // See get_last_modified(): unreadable archive entries must remain
-            // visible as an empty/unusable guest file rather than panicking the
-            // emulator while probing their size.
-            _ = self.open();
-        }
-        let size = {
-            self.metadata_map
-                .borrow()
-                .get(&self.index)
-                .map(|metadata| metadata.size)
-        };
-        match size {
-            Some(size) => size,
-            None => {
-                log!(
-                    "Warning: IpaFileRef::get_size(): IPA entry {} has no readable \
-                     metadata; reporting size zero.",
-                    self.index
-                );
-                0
-            }
-        }
+        self.cached_file().size
     }
 }
 
@@ -468,10 +375,16 @@ pub struct IpaFile {
     file: Cursor<DecompressedFile>,
 }
 
+impl IpaFile {
+    pub(super) fn into_bytes(self) -> Rc<Vec<u8>> {
+        self.file.into_inner().0
+    }
+}
+
 impl Debug for IpaFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IpaFile")
-            .field("size", &self.file.get_ref().len())
+            .field("size", &self.file.get_ref().as_ref().len())
             .finish()
     }
 }
@@ -593,7 +506,21 @@ mod tests {
             panic!("expected directory");
         };
         assert!(children.contains_key("Info.plist"));
-        assert!(children.contains_key(app));
+        let FsNode::File {
+            location: FileLocation::IpaFileRef(executable),
+            ..
+        } = &children[app]
+        else {
+            panic!("expected IPA executable");
+        };
+        let mut first = executable.open();
+        let mut second = executable.open();
+        let mut prefix = [0; 2];
+        first.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"ex");
+        second.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"ex");
+        assert!(Rc::ptr_eq(&first.into_bytes(), &second.into_bytes()));
     }
 
     /// A central-directory entry can be listed successfully but fail its CRC

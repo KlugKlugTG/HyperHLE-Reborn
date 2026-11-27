@@ -17,9 +17,9 @@ use crate::mem::{MutPtr, MutVoidPtr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, Class, ClassExports,
 };
+use crate::property_list;
 use crate::Environment;
 use plist::Value;
-use std::io::Cursor;
 use std::ops::Add;
 use std::time::SystemTime;
 
@@ -66,7 +66,7 @@ pub const CLASSES: ClassExports = objc_classes! {
           errorDescription:(MutPtr<id>)error_string { // NSString **
     let slice = ns_data::to_rust_slice(env, data);
 
-    if let Ok(root) = Value::from_reader_xml(Cursor::new(slice)) {
+    if let Ok(root) = property_list::read_xml(slice) {
         assert!(root.as_array().is_some() || root.as_dictionary().is_some());
         if !format.is_null() {
             env.mem.write(format, NSPropertyListXMLFormat_v1_0);
@@ -75,7 +75,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         return autorelease(env, property_list)
     }
 
-    if let Ok(root) = Value::from_reader(Cursor::new(slice)) {
+    if let Ok(root) = property_list::read(slice) {
         assert!(root.as_array().is_some() || root.as_dictionary().is_some());
         if !format.is_null() {
             env.mem.write(format, NSPropertyListBinaryFormat_v1_0);
@@ -123,10 +123,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // Apple's parser auto-detects the format. Try XML first, then binary,
     // matching the legacy code path above.
-    let parsed = Value::from_reader_xml(Cursor::new(slice))
+    let parsed = property_list::read_xml(slice)
         .map(|root| (root, NSPropertyListXMLFormat_v1_0))
         .or_else(|_| {
-            Value::from_reader(Cursor::new(slice))
+            property_list::read(slice)
                 .map(|root| (root, NSPropertyListBinaryFormat_v1_0))
         });
 
@@ -191,7 +191,7 @@ pub(super) fn deserialize_plist_from_file(
         return nil;
     };
 
-    let root = match Value::from_reader(Cursor::new(bytes)) {
+    let root = match property_list::read(&bytes) {
         Ok(root) => root,
         Err(err) => {
             log_dbg!("Couldn't parse plist, returning nil: {}", err);
@@ -224,7 +224,7 @@ pub(crate) fn deserialize_plist_from_xml_data(
     options: NSPropertyListMutabilityOptions,
 ) -> id {
     let slice = ns_data::to_rust_slice(env, data);
-    let Ok(root) = Value::from_reader_xml(Cursor::new(slice)) else {
+    let Ok(root) = property_list::read_xml(slice) else {
         return nil;
     };
     if root.as_array().is_none() && root.as_dictionary().is_none() {
@@ -531,7 +531,7 @@ pub(crate) fn cf_property_list_create_from_xml_data(
         return nil;
     }
     let slice = ns_data::to_rust_slice(env, xml_data);
-    match Value::from_reader_xml(Cursor::new(slice)) {
+    match property_list::read_xml(slice) {
         Ok(root) => deserialize_plist(env, &root, options),
         Err(err) => {
             log_dbg!("CFPropertyListCreateFromXMLData: parse failed: {}", err);
