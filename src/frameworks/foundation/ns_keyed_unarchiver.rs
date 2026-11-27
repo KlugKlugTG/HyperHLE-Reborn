@@ -25,9 +25,9 @@ use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr,
 };
+use crate::property_list;
 use crate::Environment;
 use plist::{Dictionary, Uid, Value};
-use std::io::Cursor;
 
 pub const NSKeyedArchiveRootObjectKey: &str = "root";
 
@@ -153,7 +153,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let slice = env.mem.bytes_at(bytes.cast(), length);
 
     // 2. Безопасный парсинг plist вместо жесткого .unwrap()
-    let plist = match Value::from_reader(Cursor::new(slice)) {
+    let plist = match property_list::read(slice) {
         Ok(p) => p,
         Err(e) => {
             log!("Warning: [NSKeyedUnarchiver initForReadingWithData:] failed to parse plist: {:?}", e);
