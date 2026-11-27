@@ -1948,31 +1948,19 @@ fn glResolveMultisampleFramebufferAPPLE(env: &mut Environment) {
     })
 }
 fn glDiscardFramebufferEXT(
-    env: &mut Environment,
-    target: GLenum,
-    numAttachments: GLsizei,
-    attachments: ConstPtr<GLenum>,
+    _env: &mut Environment,
+    _target: GLenum,
+    _num_attachments: GLsizei,
+    _attachments: ConstPtr<GLenum>,
 ) {
-    // GL_EXT_discard_framebuffer is a bandwidth hint. On tile-based GPUs
-    // (ARM Mali, Qualcomm Adreno, PowerVR) honouring it lets the driver skip
-    // writing tile memory back to system RAM at the end of the frame. The
-    // guest attachment enums (GL_COLOR_EXT / GL_DEPTH_EXT / GL_STENCIL_EXT)
-    // share their values with the host extension, so forward them unchanged.
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        // Discarding is only a bandwidth hint; on backends without
-        // GL_EXT_discard_framebuffer there is nothing to forward, and asking
-        // anyway would log an "unimplemented GLES API" warning per frame.
-        if !gles.discard_ext_supported() {
-            return;
-        }
-        let n = numAttachments.max(0) as GuestUSize;
-        let ptr = if n == 0 || attachments.is_null() {
-            std::ptr::null()
-        } else {
-            mem.bytes_at(attachments.cast(), n * 4).as_ptr().cast()
-        };
-        gles.DiscardFramebufferEXT(target, numAttachments, ptr);
-    });
+    // GL_EXT_discard_framebuffer is only a bandwidth hint, but forwarding it
+    // to the host is a net loss in practice: on tile-based drivers the guest
+    // declares attachments it is still going to sample later in the frame
+    // (the emulator's FBO mapping is not identical to the device's), and the
+    // resulting discard throws away finished tiles. Minecraft: Pocket Edition
+    // turns into a black screen as soon as the hint is forwarded. The
+    // extension is therefore accepted and ignored, which is what a host
+    // without GL_EXT_discard_framebuffer does too.
 }
 
 /// `glPushGroupMarkerEXT` — debug marker from `GL_EXT_debug_marker`.
@@ -1984,6 +1972,12 @@ fn glPushGroupMarkerEXT(_env: &mut Environment, _length: GLsizei, _marker: Const
 /// `glPopGroupMarkerEXT` — debug marker from `GL_EXT_debug_marker`.
 /// No-op on hosts that don't expose the extension.
 fn glPopGroupMarkerEXT(_env: &mut Environment) {
+    // Debug markers are hints; safe to ignore.
+}
+
+/// `glInsertEventMarkerEXT` — event marker from `GL_EXT_debug_marker`.
+/// No-op: it only labels the frame for GPU debuggers.
+fn glInsertEventMarkerEXT(_env: &mut Environment, _length: GLsizei, _marker: ConstPtr<u8>) {
     // Debug markers are hints; safe to ignore.
 }
 
@@ -9526,6 +9520,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glDiscardFramebufferEXT(_, _, _)),
     export_c_func!(glPushGroupMarkerEXT(_, _)),
     export_c_func!(glPopGroupMarkerEXT()),
+    export_c_func!(glInsertEventMarkerEXT(_, _)),
     export_c_func!(glBindVertexArrayOES(_)),
     export_c_func!(glDeleteVertexArraysOES(_, _)),
     export_c_func!(glGenVertexArraysOES(_, _)),

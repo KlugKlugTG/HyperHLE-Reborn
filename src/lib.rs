@@ -276,6 +276,14 @@ Special options:
 pub fn main<T: Iterator<Item = String>>(args: T) -> Result<Option<GuestTermination>, String> {
     crash_handler::install();
     crash_handler::install_panic_hook();
+    // Diagnostics: `TOUCHHLE_TRACE_HOST_CALLS=N` logs the next N guest→host
+    // calls with their guest return addresses, which is what makes "the app
+    // quit on its own during launch" diagnosable without a guest debugger.
+    if let Ok(value) = std::env::var("TOUCHHLE_TRACE_HOST_CALLS") {
+        if let Ok(count) = value.trim().parse::<u32>() {
+            dyld::TRACE_HOST_CALLS.store(count, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     let original_args: Vec<String> = args.collect();
     let program = original_args.first().cloned().unwrap_or_default();
     let mut next_args = original_args;

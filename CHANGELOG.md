@@ -15,6 +15,16 @@ Changes are categorised as follows:
 
 ## NEXT
 
+Compatibility:
+
+- Zombie Catchers 1.05 (Two Men and a Dog) no longer quits during launch on devices where its bundled PlayHaven/Upsight ad SDK cannot reach the (dead) marketing backend. The SDK stops the main run loop from its request-completion path; the run loop stops, `UIApplicationMain` returns, and the process exits cleanly within seconds of the first frame, which looks exactly like a crash. The new `--ignore-main-runloop-stop` option ignores that stop (the request then just times out) and is enabled for this app in the default options. The app also needs a Retina profile: its cocos2d bitmap fonts ship only as `-hd`/`-ipadhd`, so on the default iPhone 3GS profile every FNT parse fails, which is why its default options now select `--device-family=iphone-4`.
+- Guest writes to a file the emulator's sandbox lists but the host has not materialized yet (SQLite journal files such as Vungle's `__vungle.db-journal`, lazily created caches) used to panic with “Unexpected I/O failure when trying to access real path”. A write-mode open now creates the missing parent directories and the file, matching what the guest expects from `open(O_CREAT)`.
+- `glDiscardFramebufferEXT` no longer forwards to the host driver. It is only a bandwidth hint, but the guest declares attachments in a different FBO mapping than the device's, so honouring it throws away tiles that are still needed later in the frame — Minecraft: Pocket Edition drops to a black screen immediately. The extension is now accepted and ignored, like on a host without `GL_EXT_discard_framebuffer`.
+- `SKStoreProductViewController` now exists. Launcher-era apps and their cross-promotion SDKs probe for the class (PlayHaven's “more games” flow does) and previously got a nil class back, which on iOS UIKit means “unrecognized class” rather than “store unavailable”. `loadProductWithParameters:completionBlock:` reports failure through the completion block with an `SKErrorDomain` error, which is what a device without a store connection reports.
+- `glInsertEventMarkerEXT` is implemented as a no-op instead of being resolved through the generic unimplemented-function stub, and `NSRegularExpression` now implements `-copy`/`-copyWithZone:` instead of returning nil to callers that copy a compiled expression.
+- An Objective-C exception that reaches the guest runtime is now logged with its class, reason and the guest return address. Crash reporters that install `NSSetUncaughtExceptionHandler` swallow the exception (and often call `exit(0)`); without this line the log only showed the app quitting.
+- `TOUCHHLE_TRACE_HOST_CALLS=N` logs the next N guest→host calls with their return addresses. This is what made the Zombie Catchers exit diagnosable: the last calls before the process ended were the ad SDK's `CFRunLoopStop` path, not an app-level `exit`.
+
 Quality and performance:
 
 - Decoded PNGs (game launch icons, launch/splash images) are cached in the touchHLE user data directory as raw RGBA, so the PNG decode and the per-pixel premultiply pass only run once per image. Game launches after the first one skip that work entirely. New `--skip-launch-image` option skips launch image decoding altogether for an even faster start. (@arena-agent)
