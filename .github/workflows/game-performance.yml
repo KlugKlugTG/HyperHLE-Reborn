@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       cases:
-        description: "JSON array of cases with label, run, artifact and runner, optionally renderer=angle-metal on macOS"
+        description: "JSON array of cases with label, run, artifact and runner, optionally before_run + before_artifact for A/B/B/A or renderer=angle-metal on macOS"
         required: true
         type: string
       draft:
@@ -23,7 +23,7 @@ jobs:
   measure:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 18
+    timeout-minutes: 35
     permissions:
       actions: read
       contents: write # Reading an unpublished draft release requires write access.
@@ -33,6 +33,8 @@ jobs:
         include: ${{ fromJSON(inputs.cases) }}
     env:
       BUILD_RUN: ${{ matrix.run }}
+      BEFORE_RUN: ${{ matrix.before_run }}
+      BEFORE_ARTIFACT: ${{ matrix.before_artifact }}
       DRAFT: ${{ inputs.draft }}
       FIXTURE_HASH: ${{ inputs.sha256 }}
       STEPS: ${{ inputs.steps || '1:- 20:-' }}
@@ -50,6 +52,10 @@ jobs:
         run: |
           mkdir -p results "$RUNNER_TEMP/fixture"
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN" --jq '{id,head_sha,html_url}' > results/build.json
+          if [[ -n "$BEFORE_RUN" || -n "$BEFORE_ARTIFACT" ]]; then
+            test -n "$BEFORE_RUN" && test -n "$BEFORE_ARTIFACT"
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BEFORE_RUN" --jq '{id,head_sha,html_url}' > results/before-build.json
+          fi
           test "$(gh release view "$DRAFT" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
           gh release download "$DRAFT" --repo "$GITHUB_REPOSITORY" --pattern game.ipa --dir "$RUNNER_TEMP/fixture"
           cd "$RUNNER_TEMP/fixture"
@@ -62,6 +68,13 @@ jobs:
           run-id: ${{ env.BUILD_RUN }}
           name: ${{ matrix.artifact }}
           path: emulator
+      - uses: actions/download-artifact@v4
+        if: matrix.before_run
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ matrix.before_run }}
+          name: ${{ matrix.before_artifact }}
+          path: baseline
       - name: Install Linux runtime tools and identify renderer
         if: runner.os == 'Linux'
         run: |
@@ -77,15 +90,19 @@ jobs:
           ls -l /dev/dri > results/gpu-devices.txt 2>&1 || true
           lscpu > results/cpu.txt
           chmod +x emulator/touchHLE
+          if [[ -d baseline ]]; then chmod +x baseline/touchHLE; fi
       - name: Prepare Apple Silicon emulator and record Metal hardware
         if: runner.os == 'macOS'
         run: |
           mountpoint="$RUNNER_TEMP/emulator-disk"
-          hdiutil attach -readonly -nobrowse -mountpoint "$mountpoint" emulator/*.dmg
-          # Run the unbundled binary so each launch uses its own working directory.
-          cp "$mountpoint"/*.app/Contents/MacOS/touchHLE emulator/
-          cp -R "$mountpoint"/*.app/Contents/Resources/touchHLE_* emulator/
-          hdiutil detach "$mountpoint"
+          for bundle in emulator baseline; do
+            if [[ ! -d "$bundle" ]]; then continue; fi
+            hdiutil attach -readonly -nobrowse -mountpoint "$mountpoint" "$bundle"/*.dmg
+            # Unbundled binaries use the per-launch working directory for user data.
+            cp "$mountpoint"/*.app/Contents/MacOS/touchHLE "$bundle/"
+            cp -R "$mountpoint"/*.app/Contents/Resources/touchHLE_* "$bundle/"
+            hdiutil detach "$mountpoint"
+          done
           system_profiler SPDisplaysDataType SPHardwareDataType |
             sed -E '/Serial Number|Hardware UUID|Provisioning UDID/d' > results/hardware.txt
           swift -e 'import Metal; print("Default Metal device:", MTLCreateSystemDefaultDevice()?.name ?? "none"); for device in MTLCopyAllDevices() { print("Metal device:", device.name) }' | tee results/metal.txt
@@ -104,48 +121,19 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/game-python"
           "$RUNNER_TEMP/game-python/bin/pip" install --disable-pip-version-check pillow pyobjc-framework-Quartz
           echo "$RUNNER_TEMP/game-python/bin" >> "$GITHUB_PATH"
-      - name: Capture startup and frame intervals
+      - name: Capture comparable game launches
         run: |
           read -r -a steps <<< "$STEPS"
-          graphics=()
-          if [[ -n "$EMULATOR_GL_OPTION" ]]; then graphics+=("$EMULATOR_GL_OPTION"); fi
           args=()
           for step in "${steps[@]}"; do args+=(--step "$step"); done
-          shasum -a 256 "$RUNNER_TEMP/fixture/game.ipa" > results/tested.sha256
+          if [[ -d baseline ]]; then args+=(--before baseline); fi
+          if [[ -n "$EMULATOR_GL_OPTION" ]]; then args+=("--emulator-arg=$EMULATOR_GL_OPTION"); fi
+          if [[ "$RENDERER" == angle-metal ]]; then args+=(--require-metal); fi
           if command -v pidstat >/dev/null; then
             pidstat -h -u -w -r -t -C touchHLE 1 > results/pidstat.txt &
           fi
-          python3 dev-scripts/ai-tap-sequence.py "$RUNNER_TEMP/fixture/game.ipa" \
-            --exe emulator/touchHLE --cwd emulator --out results/timed \
-            "${args[@]}" --final-wait 20 --require-nonblack-frame --require-frame-content --require-eagl-frames \
-            -- "${graphics[@]}" --overlay=off --device-family=iphone-4s --no-error-popup
-      - name: Verify the game used the requested Metal renderer
-        if: matrix.renderer == 'angle-metal'
-        run: |
-          grep -Ei 'Driver info:.*ANGLE.*Metal' results/timed/emulator.log | tee results/active-renderer.txt
-          test -s results/active-renderer.txt
-      - name: Profile a fresh launch without affecting the timed run
-        env:
-          TOUCHHLE_PROFILE_RUNTIME: '1'
-        run: |
-          # Both unbundled desktop executables keep their sandbox in the working directory.
-          mkdir profiler
-          cp -a emulator/touchHLE_{dylibs,fonts,default_options.txt,wallpaper.png} profiler/
-          read -r -a steps <<< "$STEPS"
-          graphics=()
-          if [[ -n "$EMULATOR_GL_OPTION" ]]; then graphics+=("$EMULATOR_GL_OPTION"); fi
-          args=()
-          for step in "${steps[@]}"; do args+=(--step "$step"); done
-          python3 dev-scripts/ai-tap-sequence.py "$RUNNER_TEMP/fixture/game.ipa" \
-            --exe emulator/touchHLE --cwd profiler --out results/profile \
-            "${args[@]}" --final-wait 20 --require-eagl-frames \
-            -- "${graphics[@]}" --overlay=off --device-family=iphone-4s --no-error-popup
-      - name: Preserve emulator diagnostics
-        if: always()
-        run: |
-          mkdir -p results
-          if [ -f emulator/HyperHLE_log.txt ]; then cp emulator/HyperHLE_log.txt results/timed-detailed.log; fi
-          if [ -f profiler/HyperHLE_log.txt ]; then cp profiler/HyperHLE_log.txt results/profile-detailed.log; fi
+          python3 dev-scripts/game-performance.py --app "$RUNNER_TEMP/fixture/game.ipa" \
+            --candidate emulator --out results "${args[@]}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
