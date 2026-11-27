@@ -167,6 +167,7 @@ typedef enum {
 @end
 
 @interface NSNumber : NSValue
++ (NSNumber *)numberWithInt:(int)value;
 + (NSNumber *)numberWithFloat:(float)value;
 + (NSNumber *)numberWithBool:(bool)value;
 @end
