@@ -1316,8 +1316,9 @@ impl MachO {
     ) -> Result<MachO, &'static str> {
         let name = path.as_ref().file_name().unwrap().to_string();
         let mut image = Self::load_from_bytes(
-            &fs.read(path.as_ref())
-                .map_err(|_| "Could not read executable file")?,
+            fs.read_shared(path.as_ref())
+                .map_err(|_| "Could not read executable file")?
+                .as_slice(),
             into_mem,
             name,
             slide_to_address,
@@ -1332,8 +1333,9 @@ impl MachO {
         into_mem: &mut Mem,
     ) -> Result<MachO, &'static str> {
         let mut image = Self::load_with_placement(
-            &fs.read(path)
-                .map_err(|_| "Could not read executable file")?,
+            fs.read_shared(path)
+                .map_err(|_| "Could not read executable file")?
+                .as_slice(),
             into_mem,
             path.file_name().unwrap().to_owned(),
             None,
