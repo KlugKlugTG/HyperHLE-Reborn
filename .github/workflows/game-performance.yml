@@ -1,15 +1,10 @@
 name: Game performance capture
 
 on:
-  push:
-    branches: [fix/profile-game-performance, 'profile/build/**']
-    paths:
-      - .github/workflows/game-performance.yml
-      - dev-scripts/ai-tap-sequence.py
   workflow_dispatch:
     inputs:
       cases:
-        description: "JSON array of {label, run, artifact, runner, fixture} objects"
+        description: "JSON array of cases with label, run, artifact and runner, optionally renderer=angle-metal on macOS"
         required: true
         type: string
       draft:
@@ -35,12 +30,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(inputs.cases || '[{"label":"linux-trunk-control","run":"45892776653","artifact":"HyperHLE_Linux_x86_64","runner":"ubuntu-latest","fixture":"xml-control"},{"label":"mac-trunk-control","run":"45892776653","artifact":"HyperHLE_macOS_AArch64","runner":"macos-15","fixture":"xml-control"}]') }}
+        include: ${{ fromJSON(inputs.cases) }}
     env:
       BUILD_RUN: ${{ matrix.run }}
-      DRAFT: ${{ inputs.draft || 'ci-private-perf-20261127' }}
-      FIXTURE_HASH: ${{ inputs.sha256 || 'e2b6ae966cbce30fe027136debd63d01e18956c8c21592c6d692472db09eb0ba' }}
-      STEPS: ${{ inputs.steps || '1:- 12:0.50,0.64 3:- 6:0.50,0.64 10:- 25:- 20:-' }}
+      DRAFT: ${{ inputs.draft }}
+      FIXTURE_HASH: ${{ inputs.sha256 }}
+      STEPS: ${{ inputs.steps || '1:- 20:-' }}
+      RENDERER: ${{ matrix.renderer }}
+      EMULATOR_GL_OPTION: ''
       ALSOFT_DRIVERS: 'null'
       TOUCHHLE_FRAME_TIMES: '1'
     steps:
@@ -69,7 +66,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends xvfb xdotool x11-utils imagemagick mesa-utils libsndio-dev zip sysstat
+          sudo apt-get install -y --no-install-recommends xvfb xdotool x11-utils imagemagick mesa-utils libsndio-dev sysstat
           if ! xdpyinfo >/dev/null 2>&1; then
             export DISPLAY=:99
             Xvfb "$DISPLAY" -screen 0 1280x960x24 -ac > results/xvfb.log 2>&1 &
@@ -89,35 +86,29 @@ jobs:
           cp "$mountpoint"/*.app/Contents/MacOS/touchHLE emulator/
           cp -R "$mountpoint"/*.app/Contents/Resources/touchHLE_* emulator/
           hdiutil detach "$mountpoint"
-          system_profiler SPDisplaysDataType SPHardwareDataType > results/hardware.txt
+          system_profiler SPDisplaysDataType SPHardwareDataType |
+            sed -E '/Serial Number|Hardware UUID|Provisioning UDID/d' > results/hardware.txt
+          swift -e 'import Metal; print("Default Metal device:", MTLCreateSystemDefaultDevice()?.name ?? "none"); for device in MTLCopyAllDevices() { print("Metal device:", device.name) }' | tee results/metal.txt
+          if [[ "$RENDERER" == angle-metal ]]; then
+            chrome="/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework"
+            libraries="$chrome/Versions/Current/Libraries"
+            test -f "$libraries/libEGL.dylib" && test -f "$libraries/libGLESv2.dylib"
+            # The release binary must request an ES-profile SDL window on Cocoa.
+            # Bootstrap the ES1-on-ES2 backend with ANGLE's ES2 entry points.
+            echo "SDL_VIDEO_EGL_DRIVER=$libraries/libEGL.dylib" >> "$GITHUB_ENV"
+            echo "SDL_VIDEO_GL_DRIVER=$libraries/libGLESv2.dylib" >> "$GITHUB_ENV"
+            echo "ANGLE_DEFAULT_PLATFORM=metal" >> "$GITHUB_ENV"
+            echo "TOUCHHLE_FORCE_GLES1=gles1_on_gles2" >> "$GITHUB_ENV"
+            echo "EMULATOR_GL_OPTION=--gles1=gles1_native" >> "$GITHUB_ENV"
+          fi
           python3 -m venv "$RUNNER_TEMP/game-python"
           "$RUNNER_TEMP/game-python/bin/pip" install --disable-pip-version-check pillow pyobjc-framework-Quartz
           echo "$RUNNER_TEMP/game-python/bin" >> "$GITHUB_PATH"
-      - name: Create labelled XML control inside the runner
-        if: matrix.fixture == 'xml-control'
-        working-directory: ${{ runner.temp }}/fixture
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import plistlib, re, subprocess, zipfile
-          with zipfile.ZipFile("game.ipa") as archive:
-              name, = (name for name in archive.namelist() if re.fullmatch(r"Payload/[^/]+\.app/Info\.plist", name))
-              content = archive.read(name)
-              end = content.index(b"</plist>") + len(b"</plist>")
-              assert content[end:].strip(), "expected trailing non-XML content"
-              document = content[:end]
-              plistlib.loads(document)
-          path = Path(name)
-          path.parent.mkdir(parents=True)
-          path.write_bytes(document)
-          # Info-ZIP updates a single member, copying other compressed streams as-is.
-          subprocess.run(["zip", "-q", "game.ipa", name], check=True)
-          with zipfile.ZipFile("game.ipa") as archive:
-              assert archive.read(name) == document
-          PY
       - name: Capture startup and frame intervals
         run: |
           read -r -a steps <<< "$STEPS"
+          graphics=()
+          if [[ -n "$EMULATOR_GL_OPTION" ]]; then graphics+=("$EMULATOR_GL_OPTION"); fi
           args=()
           for step in "${steps[@]}"; do args+=(--step "$step"); done
           shasum -a 256 "$RUNNER_TEMP/fixture/game.ipa" > results/tested.sha256
@@ -127,21 +118,28 @@ jobs:
           python3 dev-scripts/ai-tap-sequence.py "$RUNNER_TEMP/fixture/game.ipa" \
             --exe emulator/touchHLE --cwd emulator --out results/timed \
             "${args[@]}" --final-wait 20 --require-nonblack-frame --require-frame-content --require-eagl-frames \
-            -- --overlay=off --device-family=iphone-4s --no-error-popup
+            -- "${graphics[@]}" --overlay=off --device-family=iphone-4s --no-error-popup
+      - name: Verify the game used the requested Metal renderer
+        if: matrix.renderer == 'angle-metal'
+        run: |
+          grep -Ei 'Driver info:.*ANGLE.*Metal' results/timed/emulator.log | tee results/active-renderer.txt
+          test -s results/active-renderer.txt
       - name: Profile a fresh launch without affecting the timed run
         env:
           TOUCHHLE_PROFILE_RUNTIME: '1'
         run: |
-          # Linux keeps sandbox and preference files in the working directory.
+          # Both unbundled desktop executables keep their sandbox in the working directory.
           mkdir profiler
           cp -a emulator/touchHLE_{dylibs,fonts,default_options.txt,wallpaper.png} profiler/
           read -r -a steps <<< "$STEPS"
+          graphics=()
+          if [[ -n "$EMULATOR_GL_OPTION" ]]; then graphics+=("$EMULATOR_GL_OPTION"); fi
           args=()
           for step in "${steps[@]}"; do args+=(--step "$step"); done
           python3 dev-scripts/ai-tap-sequence.py "$RUNNER_TEMP/fixture/game.ipa" \
             --exe emulator/touchHLE --cwd profiler --out results/profile \
             "${args[@]}" --final-wait 20 --require-eagl-frames \
-            -- --overlay=off --device-family=iphone-4s --no-error-popup
+            -- "${graphics[@]}" --overlay=off --device-family=iphone-4s --no-error-popup
       - name: Preserve emulator diagnostics
         if: always()
         run: |
