@@ -38,6 +38,7 @@ jobs:
       DRAFT: ${{ inputs.draft }}
       FIXTURE_HASH: ${{ inputs.sha256 }}
       STEPS: ${{ inputs.steps || '1:- 20:-' }}
+      TRACE: ${{ matrix.trace }}
       RENDERER: ${{ matrix.renderer }}
       EMULATOR_GL_OPTION: ''
       ALSOFT_DRIVERS: 'null'
@@ -121,19 +122,53 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/game-python"
           "$RUNNER_TEMP/game-python/bin/pip" install --disable-pip-version-check pillow pyobjc-framework-Quartz
           echo "$RUNNER_TEMP/game-python/bin" >> "$GITHUB_PATH"
-      - name: Capture comparable game launches
+      - name: Capture game, memory use and renderer
+        shell: bash
         run: |
+          export RUST_BACKTRACE=1
+          mkdir -p results/play
+          export TOUCHHLE_TRACE_TOUCHES=1
+          if [[ "$TRACE" == 1 ]]; then export SURFACE_RUNTIME_TRACE=1; fi
+          emulator="$GITHUB_WORKSPACE/emulator/touchHLE"
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            group=/sys/fs/cgroup/hle-test
+            sudo mkdir "$group"
+            echo 1800M | sudo tee "$group/memory.max" >/dev/null
+            echo 0 | sudo tee "$group/memory.swap.max" >/dev/null
+            export HLE_CGROUP="$group"
+            printf '%s\n' '#!/bin/bash' 'echo "$$" | sudo tee "$HLE_CGROUP/cgroup.procs" >/dev/null' 'exec "$HLE_BINARY" "$@"' > "$RUNNER_TEMP/run-game"
+            export HLE_BINARY="$emulator"
+            chmod +x "$RUNNER_TEMP/run-game"
+            emulator="$RUNNER_TEMP/run-game"
+            (
+              while true; do
+                pid=$(pgrep -nx touchHLE || true)
+                if [[ -n "$pid" ]]; then
+                  awk '/VmRSS|VmSize/ {printf "%s %s ",$1,$2} END {print ""}' "/proc/$pid/status" || true
+                  rss=$(awk '/VmRSS/ {print $2}' "/proc/$pid/status" || true)
+                  if [[ ${rss:-0} -gt 700000 && ! -e results/native-stack.txt ]]; then
+                    sudo gdb -nx -batch -p "$pid" -ex 'set pagination off' -ex 'thread apply all bt 14' > results/native-stack.txt 2>&1 || true
+                  fi
+                fi
+                sleep .15
+              done
+            ) > results/memory-samples.txt 2>&1 &
+            watcher=$!
+            trap 'kill "$watcher" || true; cat "$HLE_CGROUP/memory.events" > results/memory-events.txt; cp emulator/HyperHLE_log.txt results/runtime.log || true' EXIT
+          else
+            trap 'cp emulator/HyperHLE_log.txt results/runtime.log || true' EXIT
+            if [[ "$RENDERER" == angle-metal ]]; then
+              otool -L "$SDL_VIDEO_GL_DRIVER" > results/angle-libs.txt
+              export DYLD_LIBRARY_PATH="$(dirname "$SDL_VIDEO_GL_DRIVER"):${DYLD_LIBRARY_PATH:-}"
+              python3 -c 'import os,ctypes; [print(ctypes.CDLL(os.environ[k])) for k in ("SDL_VIDEO_EGL_DRIVER","SDL_VIDEO_GL_DRIVER")]' >> results/angle-libs.txt 2>&1 || true
+            fi
+          fi
           read -r -a steps <<< "$STEPS"
           args=()
           for step in "${steps[@]}"; do args+=(--step "$step"); done
-          if [[ -d baseline ]]; then args+=(--before baseline); fi
-          if [[ -n "$EMULATOR_GL_OPTION" ]]; then args+=("--emulator-arg=$EMULATOR_GL_OPTION"); fi
-          if [[ "$RENDERER" == angle-metal ]]; then args+=(--require-metal); fi
-          if command -v pidstat >/dev/null; then
-            pidstat -h -u -w -r -t -C touchHLE 1 > results/pidstat.txt &
-          fi
-          python3 dev-scripts/game-performance.py --app "$RUNNER_TEMP/fixture/game.ipa" \
-            --candidate emulator --out results "${args[@]}"
+          gl=()
+          if [[ -n "$EMULATOR_GL_OPTION" ]]; then gl+=("$EMULATOR_GL_OPTION"); fi
+          python3 dev-scripts/ai-tap-sequence.py "$RUNNER_TEMP/fixture/game.ipa" --exe "$emulator" --cwd emulator --out results/play "${args[@]}" --final-wait 5 --require-frame-change --require-nonblack-frame --require-frame-content -- "${gl[@]}" --device-family=iphone-4s --overlay=off --no-error-popup
       - uses: actions/upload-artifact@v4
         if: always()
         with:

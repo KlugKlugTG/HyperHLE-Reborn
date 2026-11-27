@@ -3927,6 +3927,14 @@ impl Environment {
                             }
                             let previous_origin = self.replace_direct_guest_call(true);
                             {
+                                if crate::env_flag_cached!("SURFACE_RUNTIME_TRACE") {
+                                    static CALL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                                    let n = CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if n < 100000 || n % 8192 == 0 {
+                                        let regs = self.cpu.regs();
+                                        eprintln!("HLE {n} t{} {} lr={:08x} sp={:08x} args={:08x?}", self.current_thread, self.dyld.svc_symbol(svc), regs[14], regs[13], &regs[..4]);
+                                    }
+                                }
                                 let _profile = crate::runtime_profile::scope(self.current_thread, self.dyld.svc_symbol(svc));
                                 f.call_from_guest(self);
                             }
