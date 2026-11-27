@@ -241,16 +241,16 @@ def has_frame_content(path):
     return float(result.stdout) > 1.0 / 255.0
 
 
-def write_metrics(out, fps_samples, frame_intervals):
+def write_metrics(out, fps_samples, frame_intervals, startup):
     with (out / "fps.csv").open("w", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(["elapsed_seconds", "source", "fps"])
         writer.writerows(fps_samples)
     with (out / "frame-times.csv").open("w", newline="") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["context", "interval_ms"])
+        writer.writerow(["context", "interval_ms", "estimated_end_elapsed_seconds"])
         writer.writerows(frame_intervals)
-    values = sorted(ms for _, ms in frame_intervals)
+    values = sorted(ms for _, ms, _ in frame_intervals)
     metrics = {"fps_samples": len(fps_samples), "frame_time_samples": len(values)}
     if values:
         def percentile(fraction):
@@ -261,6 +261,7 @@ def write_metrics(out, fps_samples, frame_intervals):
 
         metrics.update(mean_ms=statistics.mean(values), p50_ms=percentile(0.5),
                        p95_ms=percentile(0.95), p99_ms=percentile(0.99), max_ms=max(values))
+    metrics["startup_elapsed_seconds"] = startup
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
     return metrics
 
@@ -325,6 +326,7 @@ def main():
     env["RUST_BACKTRACE"] = "full"
     if args.require_touch_delivery:
         env["TOUCHHLE_TRACE_TOUCHES"] = "1"
+    start = time.monotonic()
     try:
         proc = subprocess.Popen(
             [str(exe), str(app), "--print-fps", *extra],
@@ -340,22 +342,43 @@ def main():
     fps_rows = []
     frame_intervals = []
 
-    start = time.time()
+    startup = {}
+    markers = (
+        ("bundle_info", "App bundle info:"),
+        ("first_macho_slice", "::mach_o: Loading "),
+        ("dyld_initial_link", "::dyld: Guest C++ SjLj runtime available:"),
+        ("guest_cpu_begin", "CPU emulation begins now."),
+        ("first_texture_upload", "First glTexImage2D("),
+        ("first_present_call", "[EAGLContext presentRenderbuffer:] first call"),
+    )
 
     def reader():
         for raw in proc.stdout:
+            now = time.monotonic()
+            elapsed = now - start
             line = raw.decode("utf-8", "replace")
-            log.write(f"[{time.time() - start:7.2f}] {line}")
+            log.write(f"[{elapsed:7.2f}] {line}")
+            if len(startup) < len(markers):
+                for name, marker in markers:
+                    if name not in startup and marker in line:
+                        startup[name] = round(elapsed, 4)
             log.flush()
             m = FPS_RE.search(line)
             if m:
-                fps_samples.append((time.time(), float(m.group(1))))
+                fps_samples.append((now, float(m.group(1))))
                 source = "compositor" if "Core Animation compositor" in line else "EAGL"
-                fps_rows.append((time.time() - start, source, float(m.group(1))))
+                fps_rows.append((elapsed, source, float(m.group(1))))
             frame_times = FRAME_TIMES_RE.search(line)
             if frame_times:
-                frame_intervals.extend((frame_times.group(1), float(ms))
-                                       for ms in frame_times.group(2).split(","))
+                # The emulator writes one batch per GL context. Work backwards
+                # from receipt of its last interval to locate hitches in the run.
+                batch = [float(ms) for ms in frame_times.group(2).split(",")]
+                end = elapsed
+                rows = []
+                for ms in reversed(batch):
+                    rows.append((frame_times.group(1), ms, round(end, 4)))
+                    end -= ms / 1000
+                frame_intervals.extend(reversed(rows))
 
     reader_thread = threading.Thread(target=reader, daemon=True)
     reader_thread.start()
@@ -372,7 +395,7 @@ def main():
         proc.wait()
         reader_thread.join()
         log.close()
-        write_metrics(out, fps_rows, frame_intervals)
+        write_metrics(out, fps_rows, frame_intervals, startup)
         print(
             f"FAIL: emulator window never appeared (exit code {proc.returncode}); "
             f"log: {log_path}"
@@ -427,7 +450,7 @@ def main():
             elif len(fps_samples) < 3 or all(f == 0 for f in tail):
                 print("FAIL: frames are not being presented")
                 ok = False
-            elif time.time() - fps_samples[-1][0] > 3.0:
+            elif time.monotonic() - fps_samples[-1][0] > 3.0:
                 print("FAIL: frame counter stopped updating before the final check")
                 ok = False
             if args.require_nonblack_frame and not has_nonblack_pixels(out / "final.png"):
@@ -453,7 +476,7 @@ def main():
     proc.wait()
     reader_thread.join()
     log.close()
-    metrics = write_metrics(out, fps_rows, frame_intervals)
+    metrics = write_metrics(out, fps_rows, frame_intervals, startup)
     if frame_intervals:
         print(f"Game frame intervals (ms): {metrics}")
     log_text = log_path.read_text(encoding="utf-8", errors="replace")

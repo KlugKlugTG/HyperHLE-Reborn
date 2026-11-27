@@ -1,0 +1,154 @@
+name: Game performance capture
+
+on:
+  push:
+    branches: [fix/profile-game-performance, 'profile/build/**']
+    paths:
+      - .github/workflows/game-performance.yml
+      - dev-scripts/ai-tap-sequence.py
+  workflow_dispatch:
+    inputs:
+      build_run:
+        description: Run containing HyperHLE_Linux_x86_64
+        required: true
+        type: string
+      draft:
+        description: Draft release with game.ipa
+        required: true
+        type: string
+      sha256:
+        description: Expected SHA-256 of game.ipa
+        required: true
+        type: string
+      xml_control:
+        description: Also run a copy with trailing text removed from the XML Info.plist
+        type: boolean
+        default: false
+      steps:
+        description: Space-separated WAIT:X,Y steps for ai-tap-sequence.py
+        type: string
+      runner:
+        description: Linux x86_64 runner label
+        type: string
+        default: ubuntu-24.04
+
+jobs:
+  measure:
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 18
+    permissions:
+      actions: read
+      contents: write # Reading an unpublished draft release requires write access.
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: ${{ fromJSON((inputs.xml_control || github.event_name == 'push') && '["original","xml-control"]' || '["original"]') }}
+    env:
+      BUILD_RUN: ${{ inputs.build_run }}
+      DRAFT: ${{ inputs.draft || 'ci-private-perf-20261127' }}
+      FIXTURE_HASH: ${{ inputs.sha256 || 'e2b6ae966cbce30fe027136debd63d01e18956c8c21592c6d692472db09eb0ba' }}
+      STEPS: ${{ inputs.steps || '1:- 15:- 30:- 30:- 30:-' }}
+      ALSOFT_DRIVERS: 'null'
+      TOUCHHLE_FRAME_TIMES: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Identify build and verify private fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p results "$RUNNER_TEMP/fixture"
+          if [[ -z "$BUILD_RUN" ]]; then
+            case "$GITHUB_REF_NAME" in
+              profile/build/*) BUILD_RUN=${GITHUB_REF_NAME##*/} ;;
+              *) BUILD_RUN=45892776653 ;;
+            esac
+          fi
+          [[ "$BUILD_RUN" =~ ^[0-9]+$ ]]
+          echo "BUILD_RUN=$BUILD_RUN" >> "$GITHUB_ENV"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN" --jq '{id,head_sha,html_url}' > results/build.json
+          test "$(gh release view "$DRAFT" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          gh release download "$DRAFT" --repo "$GITHUB_REPOSITORY" --pattern game.ipa --dir "$RUNNER_TEMP/fixture"
+          cd "$RUNNER_TEMP/fixture"
+          actual=$(sha256sum game.ipa)
+          test "${actual%% *}" = "$FIXTURE_HASH"
+          echo "$actual" > "$GITHUB_WORKSPACE/results/source.sha256"
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ env.BUILD_RUN }}
+          name: HyperHLE_Linux_x86_64
+          path: emulator
+      - name: Install runtime tools and identify renderer
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends xvfb xdotool x11-utils imagemagick mesa-utils libsndio7.0 zip sysstat
+          if ! xdpyinfo >/dev/null 2>&1; then
+            export DISPLAY=:99
+            Xvfb "$DISPLAY" -screen 0 1280x960x24 -ac > results/xvfb.log 2>&1 &
+            for _ in {1..30}; do xdpyinfo >/dev/null 2>&1 && break; sleep 0.2; done
+          fi
+          echo "DISPLAY=$DISPLAY" >> "$GITHUB_ENV"
+          glxinfo -B | tee results/glxinfo.txt
+          ls -l /dev/dri > results/gpu-devices.txt 2>&1 || true
+          lscpu > results/cpu.txt
+          chmod +x emulator/touchHLE
+      - name: Create labelled XML control inside the runner
+        if: matrix.fixture == 'xml-control'
+        working-directory: ${{ runner.temp }}/fixture
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import plistlib, re, subprocess, zipfile
+          with zipfile.ZipFile("game.ipa") as archive:
+              name, = (name for name in archive.namelist() if re.fullmatch(r"Payload/[^/]+\.app/Info\.plist", name))
+              content = archive.read(name)
+              end = content.index(b"</plist>") + len(b"</plist>")
+              assert content[end:].strip(), "expected trailing non-XML content"
+              document = content[:end]
+              plistlib.loads(document)
+          path = Path(name)
+          path.parent.mkdir(parents=True)
+          path.write_bytes(document)
+          # Info-ZIP updates a single member, copying other compressed streams as-is.
+          subprocess.run(["zip", "-q", "game.ipa", name], check=True)
+          with zipfile.ZipFile("game.ipa") as archive:
+              assert archive.read(name) == document
+          PY
+      - name: Capture startup and frame intervals
+        run: |
+          read -r -a steps <<< "$STEPS"
+          args=()
+          for step in "${steps[@]}"; do args+=(--step "$step"); done
+          sha256sum "$RUNNER_TEMP/fixture/game.ipa" > results/tested.sha256
+          pidstat -h -u -w -r -t -C touchHLE 1 > results/pidstat.txt &
+          python3 dev-scripts/ai-tap-sequence.py "$RUNNER_TEMP/fixture/game.ipa" \
+            --exe emulator/touchHLE --cwd emulator --out results/timed \
+            "${args[@]}" --final-wait 20 --require-nonblack-frame --require-frame-content --require-eagl-frames \
+            -- --overlay=off --device-family=iphone-4s --no-error-popup
+      - name: Profile a fresh launch without affecting the timed run
+        env:
+          TOUCHHLE_PROFILE_RUNTIME: '1'
+        run: |
+          # Linux keeps sandbox and preference files in the working directory.
+          mkdir profiler
+          cp -a emulator/touchHLE_{dylibs,fonts,default_options.txt,wallpaper.png} profiler/
+          read -r -a steps <<< "$STEPS"
+          args=()
+          for step in "${steps[@]}"; do args+=(--step "$step"); done
+          python3 dev-scripts/ai-tap-sequence.py "$RUNNER_TEMP/fixture/game.ipa" \
+            --exe emulator/touchHLE --cwd profiler --out results/profile \
+            "${args[@]}" --final-wait 20 --require-eagl-frames \
+            -- --overlay=off --device-family=iphone-4s --no-error-popup
+      - name: Preserve emulator diagnostics
+        if: always()
+        run: |
+          mkdir -p results
+          if [ -f emulator/HyperHLE_log.txt ]; then cp emulator/HyperHLE_log.txt results/timed-detailed.log; fi
+          if [ -f profiler/HyperHLE_log.txt ]; then cp profiler/HyperHLE_log.txt results/profile-detailed.log; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: game-performance-${{ matrix.fixture }}
+          path: results/
