@@ -102,37 +102,168 @@ pub fn patch_shadow_samplers_extension(
     output
 }
 
-/// Translate a GLSL ES 1.00 shader source to GLSL 1.20.
+/// Translate ES shaders to the desktop core dialect. Legacy ES interfaces
+/// and texture functions were removed from the desktop core profile.
+pub fn translate_glsl_es_to_330(source: &str, vertex: bool) -> String {
+    let mut body = String::with_capacity(source.len());
+    let mut preamble_end = 0;
+    let mut conditional_depth = 0_u32;
+    let mut in_preamble = true;
+    let mut source_version = "100";
+    let mut output_name = "touchHLE_fragOutput".to_owned();
+    while source.contains(&output_name) {
+        output_name.push('_');
+    }
+
+    let mut fragment_color = false;
+    let mut fragment_data = false;
+    let mut block_comment = false;
+    for line in source.lines() {
+        // Skip only promoted extensions. Keep other directives in their
+        // original conditional scope and let the host compiler handle them.
+        if !block_comment {
+            if let Some(directive) = line.trim_start().strip_prefix('#') {
+                let mut words = directive
+                    .split(|c: char| c.is_ascii_whitespace() || c == ':')
+                    .filter(|word| !word.is_empty());
+                match words.next() {
+                    Some("version") => {
+                        if words.next() == Some("300") {
+                            source_version = "300";
+                        }
+                        body.push('\n');
+                        continue;
+                    }
+                    Some("extension")
+                        if matches!(
+                            words.next(),
+                            Some(
+                                "GL_OES_standard_derivatives"
+                                    | "GL_EXT_shader_texture_lod"
+                                    | "GL_OES_texture_3D"
+                                    | "GL_EXT_draw_buffers"
+                                    | "GL_EXT_frag_depth"
+                                    | "GL_EXT_shadow_samplers"
+                            )
+                        ) =>
+                    {
+                        body.push('\n');
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if in_preamble {
+            let t = line.trim_start();
+            if let Some(directive) = t.strip_prefix('#') {
+                match directive.split_whitespace().next() {
+                    Some("if" | "ifdef" | "ifndef") => conditional_depth += 1,
+                    Some("endif") => conditional_depth = conditional_depth.saturating_sub(1),
+                    _ => {}
+                }
+            } else if !(block_comment || t.is_empty() || t.starts_with("//") || t.starts_with("/*"))
+            {
+                in_preamble = false;
+            }
+        }
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < line.len() {
+            let rest = &line[i..];
+            if block_comment || rest.starts_with("/*") {
+                if let Some(end) = rest.find("*/") {
+                    body.push_str(&rest[..end + 2]);
+                    i += end + 2;
+                    block_comment = false;
+                    continue;
+                }
+                body.push_str(rest);
+                block_comment = true;
+                break;
+            }
+            if rest.starts_with("//") {
+                body.push_str(rest);
+                break;
+            }
+            if !is_ident_char(bytes[i]) {
+                let c = rest.chars().next().unwrap();
+                body.push(c);
+                i += c.len_utf8();
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && is_ident_char(bytes[i]) {
+                i += 1;
+            }
+            let token = &line[start..i];
+            let replacement = match token {
+                "attribute" => "in",
+                "varying" if vertex => "out",
+                "varying" => "in",
+                "texture2D" | "textureCube" | "texture3D" | "texture3DOES" | "shadow2DEXT" => {
+                    "texture"
+                }
+                "texture2DProj" | "texture3DProj" | "texture3DProjOES" | "shadow2DProjEXT" => {
+                    "textureProj"
+                }
+                "texture2DLod" | "textureCubeLod" | "texture2DLodEXT" | "textureCubeLodEXT" => {
+                    "textureLod"
+                }
+                "texture2DProjLod" | "texture2DProjLodEXT" => "textureProjLod",
+                "texture2DGradEXT" | "textureCubeGradEXT" => "textureGrad",
+                "texture2DProjGradEXT" => "textureProjGrad",
+                "gl_FragDepthEXT" => "gl_FragDepth",
+                "gl_FragColor" if !vertex => {
+                    fragment_color = true;
+                    body.push_str(&output_name);
+                    "[0]"
+                }
+                "gl_FragData" if !vertex => {
+                    fragment_data = true;
+                    &output_name
+                }
+                // Guest preprocessors commonly guard stage precision and
+                // version-specific interfaces with these ES built-ins.
+                "GL_ES" => "touchHLE_GLSL_ES",
+                "__VERSION__" => "touchHLE_ES_VERSION",
+                "float16_t" => "float",
+                "f16vec2" => "vec2",
+                "f16vec3" => "vec3",
+                "f16vec4" => "vec4",
+                "f16mat2" => "mat2",
+                "f16mat3" => "mat3",
+                "f16mat4" => "mat4",
+                _ => token,
+            };
+            body.push_str(replacement);
+        }
+        body.push('\n');
+        if in_preamble && conditional_depth == 0 {
+            preamble_end = body.len();
+        }
+    }
+    let mut translated = format!(
+        "#version 330 core\n#define touchHLE_GLSL_ES 1\n#define touchHLE_ES_VERSION {source_version}\n"
+    );
+    translated.push_str(&body[..preamble_end]);
+    if fragment_color || fragment_data {
+        let extent = if fragment_data {
+            "gl_MaxDrawBuffers"
+        } else {
+            "1"
+        };
+        translated.push_str(&format!(
+            "layout(location = 0) out vec4 {output_name}[{extent}];\n"
+        ));
+    }
+    translated.push_str(&body[preamble_end..]);
+    translated
+}
+
+/// Translate legacy ES source for a GL 2.1 compatibility context.
 pub fn translate_glsl_es_to_120(source: &str) -> String {
-    translate_glsl_es_with_version(source, "#version 120\n")
-}
-
-/// Translate a GLSL ES 3.00 shader source to desktop GLSL 3.30 Core.
-///
-/// GLSL ES 3.00 and desktop GLSL 3.30 are syntactically very similar (both
-/// have `in`/`out`/`uniform`, named uniform blocks, integer textures, etc.).
-/// The differences this translator handles:
-///
-/// 1. Rewrite the `#version 300 es` directive to `#version 330 core`.
-/// 2. Drop standalone `precision <qualifier> <type>;` declarations.
-/// 3. Strip inline `lowp`/`mediump`/`highp` qualifiers.
-///
-/// Things this translator does **not** handle — pre-3.20 desktop GLSL also
-/// disallows them but they require non-trivial AST work and we haven't seen
-/// guest shaders that use them yet:
-///
-/// - Implicit conversions from `int` to `uint` that ES allows but desktop
-///   doesn't (rare in hand-written shaders).
-/// - The ES-only built-in `gl_FragData[]` (legacy ES 2 fallback; ES 3 apps
-///   use named `out` variables).
-///
-/// When a guest app trips one of these, extend this function rather than
-/// patching the guest shader source.
-pub fn translate_glsl_es_300_to_330(source: &str) -> String {
-    translate_glsl_es_with_version(source, "#version 330 core\n")
-}
-
-fn translate_glsl_es_with_version(source: &str, version_directive: &'static str) -> String {
     let mut out = String::with_capacity(source.len() + 32);
     let mut emitted_version = false;
 
@@ -180,7 +311,7 @@ fn translate_glsl_es_with_version(source: &str, version_directive: &'static str)
     }
 
     // Emit version directive first.
-    out.push_str(version_directive);
+    out.push_str("#version 120\n");
 
     // Emit hoisted #extension lines right after version.
     for ext in &extension_lines {
@@ -199,22 +330,10 @@ fn translate_glsl_es_with_version(source: &str, version_directive: &'static str)
     // attachment), so map `gl_FragData[0]` to `gl_FragColor` and treat any
     // other index as a write to `gl_FragColor` too — the extra attachments
     // do not exist and their contents are never read back by our
-    // single-buffer surface model. GLSL 3.30 declares `gl_FragData`
-    // unavailable as well, so the same rewrite applies there via a named
-    // `pc_fragColor` out variable, which GL 3.3 Core predefines for
-    // fragment shaders.
+    // single-buffer surface model.
     out = translate_frag_data(&out);
 
-    // Replace texture*LodEXT calls with their desktop equivalents.
-    // In GLSL 1.20 we have texture2DLod as a built-in (from GL_ARB_shader_texture_lod
-    // which is required by GL 2.1). In GLSL 3.30 we have textureLod.
-    if version_directive.contains("120") {
-        out = replace_texture_lod_ext_desktop_120(&out);
-    } else if version_directive.contains("330") {
-        out = replace_texture_lod_ext_desktop_330(&out);
-    }
-
-    out
+    replace_texture_lod_ext_desktop_120(&out)
 }
 
 /// In desktop GLSL 1.20, `texture2DLod` is available as a built-in (via
@@ -226,16 +345,6 @@ fn replace_texture_lod_ext_desktop_120(source: &str) -> String {
         .replace("texture2DProjLodEXT", "texture2DProjLod")
         .replace("textureCubeLodEXT", "textureCubeLod")
         .replace("texture2DGradEXT", "texture2DGrad")
-}
-
-/// In desktop GLSL 3.30, the generic `textureLod` function replaces all
-/// type-specific LOD sampling functions.
-fn replace_texture_lod_ext_desktop_330(source: &str) -> String {
-    source
-        .replace("texture2DLodEXT", "textureLod")
-        .replace("texture2DProjLodEXT", "textureProjLod")
-        .replace("textureCubeLodEXT", "textureLod")
-        .replace("texture2DGradEXT", "textureGrad")
 }
 
 /// Strip occurrences of `lowp`, `mediump`, and `highp` from a line, while
@@ -365,6 +474,33 @@ fn is_ident_char(b: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_stages_use_matching_interfaces_and_keep_distinct_color_outputs() {
+        // https://registry.khronos.org/OpenGL/specs/gl/GLSLangSpec.3.30.pdf
+        let v = translate_glsl_es_to_330(
+            "#version 100\nattribute vec4 pos; varying vec2 uv; // varying unchanged\n",
+            true,
+        );
+        assert!(v.contains("in vec4 pos; out vec2 uv; // varying unchanged"));
+        let f = translate_glsl_es_to_330(
+            "#extension GL_EXT_draw_buffers : require\nvarying vec2 uv;\nvoid main() { gl_FragData[1] = texture2D(s, uv); }", false);
+        assert!(f.starts_with("#version 330 core\n"));
+        assert!(f.contains("out vec4 touchHLE_fragOutput[gl_MaxDrawBuffers]"));
+        assert!(f.contains("in vec2 uv;"));
+        assert!(f.contains("touchHLE_fragOutput[1] = texture(s, uv)"));
+        assert!(!f.contains("#extension GL_EXT_draw_buffers"));
+    }
+
+    #[test]
+    fn core_preserves_version_guards_and_es3_declared_outputs() {
+        let f = translate_glsl_es_to_330(
+            "// header\n#version 300 es\n#if defined(GL_ES) && __VERSION__ >= 300\nlayout(location=0) out vec4 color;\n#endif", false);
+        assert!(f.contains("#define touchHLE_ES_VERSION 300"));
+        assert!(f.contains("#if defined(touchHLE_GLSL_ES) && touchHLE_ES_VERSION >= 300"));
+        assert!(f.contains("layout(location=0) out vec4 color;"));
+        assert!(!f.contains("touchHLE_fragOutput"));
+    }
 
     #[test]
     fn patches_shadow_sampler_extension_by_shader_stage() {

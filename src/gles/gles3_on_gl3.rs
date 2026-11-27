@@ -958,17 +958,7 @@ impl GLES for GLES3OnGL3<'_> {
         string: *const *const GLchar,
         length: *const GLint,
     ) {
-        // The guest app ships GLSL ES (either 1.00 or 3.00) source; the
-        // host driver is a desktop GL 3.3 Core context that only accepts
-        // GLSL 1.20–3.30. Translate before forwarding.
-        //
-        // We pick the version per-source-string by sniffing the leading
-        // `#version` directive: `#version 300 es` triggers the GLSL 3.30
-        // Core translator, anything else (including no directive) uses the
-        // GLSL 1.20 translator that the ES 2.0 path established.
-        use super::gles2_glsl::{
-            patch_shadow_samplers_extension, translate_glsl_es_300_to_330, translate_glsl_es_to_120,
-        };
+        use super::gles2_glsl::translate_glsl_es_to_330;
         use std::ffi::CString;
 
         let n = count.max(0) as usize;
@@ -994,22 +984,8 @@ impl GLES for GLES3OnGL3<'_> {
 
         let mut shader_type = 0;
         gl33::GetShaderiv(shader, gl33::SHADER_TYPE, &mut shader_type);
-        let joined = patch_shadow_samplers_extension(
-            &joined,
-            shader_type as GLenum == gl33::VERTEX_SHADER,
-            self.advertise_es3,
-        );
-
-        let is_es3 = joined
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .map(|l| l.contains("300 es"))
-            .unwrap_or(false);
-        let translated = if is_es3 {
-            translate_glsl_es_300_to_330(&joined)
-        } else {
-            translate_glsl_es_to_120(&joined)
-        };
+        let translated =
+            translate_glsl_es_to_330(&joined, shader_type as GLenum == gl33::VERTEX_SHADER);
         let c = match CString::new(translated) {
             Ok(c) => c,
             Err(_) => {

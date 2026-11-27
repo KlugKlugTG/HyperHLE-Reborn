@@ -32,11 +32,8 @@
 //!   truth for both `EAGL` ES 2.0 and ES 3.0 paths and zero behavioural
 //!   drift between the two.
 //!
-//! GLSL ES 1.00 shader source is translated to desktop GLSL 1.20 by
-//! [`crate::gles::gles2_glsl::translate_glsl_es_to_120`] before being passed
-//! to the driver. The GL 3.3 Core context still accepts `#version 120`
-//! shaders because compatibility with older shader profiles is part of the
-//! core spec.
+//! ShaderSource translates the guest's GLSL ES to the GLSL 3.30 Core stage
+//! interfaces and built-ins required by the selected desktop context.
 
 use super::gles3_on_gl3::GLES3OnGL3Context;
 use super::gles_generic::GLES;
