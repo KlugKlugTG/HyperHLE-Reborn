@@ -711,7 +711,7 @@ impl Environment {
         let executable_path = bundle.executable_path();
         let executable_name = executable_path.file_name().unwrap().to_string();
         let executable_bytes = fs
-            .read(&executable_path)
+            .read_shared(&executable_path)
             .map_err(|_| "Could not load executable: Could not read executable file".to_string())?;
 
         let window = if options.headless {
