@@ -2217,6 +2217,54 @@ int test_mach_semaphore_destroy() {
   return 0;
 }
 
+// XNU registers the wait and signals its peer before sleeping. A timeout
+// must not leave a waiter that can consume a later signal.
+// https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/sync_sema.c
+struct semaphore_timeout { unsigned int sec, nsec; };
+extern kern_return_t semaphore_timedwait(mach_port_t, struct semaphore_timeout);
+extern kern_return_t semaphore_timedwait_signal(mach_port_t, mach_port_t,
+                                                struct semaphore_timeout);
+extern kern_return_t semaphore_signal_thread(mach_port_t, mach_port_t);
+
+static void *semaphore_peer(void *arg) {
+  mach_port_t *ports = arg;
+  kern_return_t result =
+      semaphore_timedwait(ports[1], (struct semaphore_timeout){2, 0});
+  if (result == KERN_SUCCESS)
+    result = semaphore_signal(ports[0]);
+  return (void *)(intptr_t)result;
+}
+
+int test_mach_semaphore_handoff() {
+  mach_port_t ports[2];
+  for (int i = 0; i < 2; i++)
+    if (semaphore_create(mach_task_self_, &ports[i], 0, 0) != KERN_SUCCESS)
+      return 1;
+  struct semaphore_timeout poll = {0, 0};
+  if (semaphore_signal_thread(ports[0], 0) != KERN_NOT_WAITING ||
+      semaphore_timedwait(ports[0], poll) != KERN_OPERATION_TIMED_OUT)
+    return 2;
+  // Even a zero-time wait signals its peer.
+  if (semaphore_timedwait_signal(ports[0], ports[1], poll) != KERN_OPERATION_TIMED_OUT ||
+      semaphore_timedwait(ports[1], poll) != KERN_SUCCESS)
+    return 3;
+  pthread_t peer;
+  if (pthread_create(&peer, NULL, semaphore_peer, ports))
+    return 4;
+  kern_return_t result = semaphore_timedwait_signal(
+      ports[0], ports[1], (struct semaphore_timeout){2, 0});
+  void *peer_result;
+  if (pthread_join(peer, &peer_result) || result != KERN_SUCCESS || peer_result)
+    return 5;
+  if (semaphore_timedwait(ports[0], (struct semaphore_timeout){0, 1000000}) != KERN_OPERATION_TIMED_OUT ||
+      semaphore_signal(ports[0]) != KERN_SUCCESS ||
+      semaphore_timedwait(ports[0], poll) != KERN_SUCCESS ||
+      semaphore_timedwait(ports[0], poll) != KERN_OPERATION_TIMED_OUT)
+    return 6;
+  return semaphore_destroy(mach_task_self_, ports[0]) != KERN_SUCCESS ||
+         semaphore_destroy(mach_task_self_, ports[1]) != KERN_SUCCESS;
+}
+
 sem_t *mt_semaphore;
 
 void mtsem_thread() {
@@ -7462,6 +7510,7 @@ struct {
     FUNC_DEF(test_strtof),
     FUNC_DEF(test_sem),
     FUNC_DEF(test_mach_semaphore_destroy),
+    FUNC_DEF(test_mach_semaphore_handoff),
     FUNC_DEF(test_mtsem),
     FUNC_DEF(test_thread_suspend_resume),
     FUNC_DEF(test_CGAffineTransform),

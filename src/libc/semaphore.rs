@@ -11,9 +11,10 @@ use crate::libc::posix_io::stat::mode_t;
 use crate::libc::posix_io::{O_CREAT, O_EXCL};
 use crate::mem::{ConstPtr, MutPtr};
 use crate::{Environment, ThreadId};
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::time::Instant;
 
 use super::errno::{EAGAIN, EEXIST, EINVAL, ENOENT};
 
@@ -39,9 +40,127 @@ pub type sem_t = i32;
 
 pub struct SemaphoreHostObject {
     pub value: i32,
-    pub waiting: HashSet<ThreadId>,
+    pub waiting: VecDeque<Rc<SemaphoreWaiter>>,
     guest_sem: Option<MutPtr<sem_t>>,
     named: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum WaitResult {
+    Acquired,
+    TimedOut,
+    Destroyed,
+    Invalid,
+}
+
+/// A signal belongs to the selected waiter as soon as it is posted, even if
+/// another guest thread runs before that waiter resumes.
+#[derive(Debug, PartialEq)]
+pub struct SemaphoreWaiter {
+    pub thread: ThreadId,
+    pub deadline: Option<Instant>,
+    result: Cell<Option<WaitResult>>,
+}
+
+impl SemaphoreWaiter {
+    pub fn result(&self, clock: &crate::guest_clock::GuestClock) -> Option<WaitResult> {
+        if self.result.get().is_none() && self.deadline.is_some_and(|due| due <= clock.now()) {
+            self.result.set(Some(WaitResult::TimedOut));
+        }
+        self.result.get()
+    }
+}
+
+pub(crate) enum Signal {
+    One,
+    All,
+    Thread(Option<ThreadId>),
+}
+
+impl SemaphoreHostObject {
+    fn terminate_waiters(&mut self) {
+        for waiter in self.waiting.drain(..) {
+            waiter.result.set(Some(WaitResult::Destroyed));
+        }
+    }
+
+    pub(crate) fn signal(
+        &mut self,
+        clock: &crate::guest_clock::GuestClock,
+        signal: Signal,
+    ) -> bool {
+        let mut woke = false;
+        self.waiting.retain(|waiter| {
+            if waiter.result(clock).is_some() {
+                return false;
+            }
+            if (!woke || matches!(signal, Signal::All))
+                && !matches!(signal, Signal::Thread(Some(id)) if id != waiter.thread)
+            {
+                waiter.result.set(Some(WaitResult::Acquired));
+                woke = true;
+                return false;
+            }
+            true
+        });
+        if !woke && !matches!(signal, Signal::Thread(_)) {
+            self.value += 1;
+        }
+        woke
+    }
+}
+
+impl Environment {
+    /// Prepare the wait and optional Mach handoff before yielding the CPU.
+    pub(crate) fn wait_semaphore(
+        &mut self,
+        sem: MutPtr<sem_t>,
+        deadline: Option<Instant>,
+        signal: Option<MutPtr<sem_t>>,
+    ) -> WaitResult {
+        let semaphores = &self.libc_state.semaphore.open_semaphores;
+        if signal.is_some_and(|sem| !semaphores.contains_key(&sem)) {
+            return WaitResult::Invalid;
+        }
+        let Some(semaphore) = semaphores.get(&sem).cloned() else {
+            return WaitResult::Invalid;
+        };
+        let mut object = semaphore.borrow_mut();
+        let prepared = if object.value > 0 {
+            object.value -= 1;
+            Ok(WaitResult::Acquired)
+        } else if deadline.is_some_and(|due| due <= self.guest_clock.now()) {
+            Ok(WaitResult::TimedOut)
+        } else {
+            let waiter = Rc::new(SemaphoreWaiter {
+                thread: self.current_thread,
+                deadline,
+                result: Cell::new(None),
+            });
+            object.waiting.push_back(waiter.clone());
+            Err(waiter)
+        };
+        drop(object);
+        if let Some(signal) = signal {
+            self.sem_increment(signal);
+        }
+        let waiter = match prepared {
+            Ok(result) => return result,
+            Err(waiter) => waiter,
+        };
+        if waiter.result(&self.guest_clock).is_none() {
+            self.yield_thread(crate::environment::ThreadBlock::Semaphore(waiter.clone()));
+        }
+        // A host call before the guest coroutine exists cannot suspend.
+        let result = waiter.result(&self.guest_clock).unwrap_or(WaitResult::Invalid);
+        if matches!(result, WaitResult::TimedOut | WaitResult::Invalid) {
+            semaphore
+                .borrow_mut()
+                .waiting
+                .retain(|w| !Rc::ptr_eq(w, &waiter));
+        }
+        result
+    }
 }
 
 pub fn sem_init(env: &mut Environment, sem: MutPtr<sem_t>, pshared: i32, value: u32) -> i32 {
@@ -56,7 +175,7 @@ pub fn sem_init(env: &mut Environment, sem: MutPtr<sem_t>, pshared: i32, value: 
     }
     let host_sem_rc = Rc::new(RefCell::new(SemaphoreHostObject {
         value: value as i32,
-        waiting: HashSet::new(),
+        waiting: VecDeque::new(),
         guest_sem: Some(sem),
         named: false,
     }));
@@ -70,6 +189,7 @@ pub fn sem_destroy(env: &mut Environment, sem: MutPtr<sem_t>) -> i32 {
     let sem = state.open_semaphores.remove(&sem);
     if let Some(sem) = sem {
         assert!(!sem.borrow().named);
+        sem.borrow_mut().terminate_waiters();
         // Don't free, it's not our resposibility to.
         0
     } else {
@@ -121,7 +241,7 @@ pub fn sem_open(
         }
         let host_sem_rc = Rc::new(RefCell::new(SemaphoreHostObject {
             value: value as i32,
-            waiting: HashSet::new(),
+            waiting: VecDeque::new(),
             guest_sem: None,
             named: true,
         }));
@@ -217,6 +337,7 @@ pub fn sem_close(env: &mut Environment, sem: MutPtr<sem_t>) -> i32 {
         set_errno(env, EINVAL);
         return -1;
     }
+    host_sem.terminate_waiters();
     if let Some(guest_sem) = host_sem.guest_sem {
         env.mem.free(guest_sem.cast());
     }
