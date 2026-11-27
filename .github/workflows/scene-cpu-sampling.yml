@@ -1,0 +1,213 @@
+name: Sample guest scene CPU
+on:
+  push:
+    branches: [fix/profile-game-performance]
+    paths: [.github/workflows/scene-cpu-sampling.yml]
+  workflow_dispatch:
+
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    env:
+      BUILD_RUN: '46042780385'
+      DRAFT: ci-private-perf-20261127
+      SHA256: e2b6ae966cbce30fe027136debd63d01e18956c8c21592c6d692472db09eb0ba
+      TOUCHHLE_FRAME_TIMES: '1'
+      ALSOFT_DRIVERS: 'null'
+      DISPLAY: ':99'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ env.BUILD_RUN }}
+          name: HyperHLE_Linux_x86_64
+          path: emulator
+      - name: Verify private input and prebuilt emulator
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p results "$RUNNER_TEMP/fixture"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN" --jq '{id,head_sha,html_url}' > results/build.json
+          test "$(gh release view "$DRAFT" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          gh release download "$DRAFT" --repo "$GITHUB_REPOSITORY" -p game.ipa -D "$RUNNER_TEMP/fixture"
+          (cd "$RUNNER_TEMP/fixture" && echo "$SHA256  game.ipa" | sha256sum -c -) > results/source-check.txt
+          chmod +x emulator/touchHLE
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends xvfb xdotool x11-utils imagemagick mesa-utils libsndio-dev linux-tools-generic
+          Xvfb "$DISPLAY" -screen 0 1280x960x24 -ac > results/xvfb.log 2>&1 &
+          for _ in {1..30}; do xdpyinfo >/dev/null 2>&1 && break; sleep 0.2; done
+          glxinfo -B > results/glxinfo.txt
+          lscpu > results/cpu.txt
+          file emulator/touchHLE > results/elf.txt
+      - name: Prepare sampling of native or JIT instruction addresses
+        run: |
+          cat > "$RUNNER_TEMP/sample.c" <<'C'
+          #define _GNU_SOURCE
+          #include <fcntl.h>
+          #include <signal.h>
+          #include <stdint.h>
+          #include <stdlib.h>
+          #include <sys/syscall.h>
+          #include <sys/time.h>
+          #include <time.h>
+          #include <ucontext.h>
+          #include <unistd.h>
+          static int output;
+          static uint64_t start;
+          static uint64_t now(void) {
+              struct timespec t;
+              clock_gettime(CLOCK_MONOTONIC, &t);
+              return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec;
+          }
+          static void sample(int sig, siginfo_t *info, void *ctx) {
+              ucontext_t *u = ctx;
+              uint64_t record[] = {now() - start, syscall(SYS_gettid), u->uc_mcontext.gregs[REG_RIP]};
+              write(output, record, sizeof(record));
+          }
+          __attribute__((constructor)) static void setup(void) {
+              output = open(getenv("SAMPLE_OUT"), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+              if (output < 0) _exit(90);
+              start = now();
+              write(output, &start, sizeof(start));
+              struct sigaction a = { .sa_sigaction = sample, .sa_flags = SA_SIGINFO | SA_RESTART };
+              sigemptyset(&a.sa_mask);
+              sigaction(SIGPROF, &a, NULL);
+              struct itimerval t = {{0, 5033}, {0, 5033}};
+              setitimer(ITIMER_PROF, &t, NULL);
+          }
+          C
+          cc -O2 -fPIC -shared "$RUNNER_TEMP/sample.c" -o "$RUNNER_TEMP/sample.so"
+          cat > "$RUNNER_TEMP/launch" <<'SH'
+          #!/bin/bash
+          echo "$$" > "$RUNNER_TEMP/game.pid"
+          export PERF_BUILDID_DIR=/tmp SAMPLE_OUT="$RUNNER_TEMP/ips.bin"
+          export LD_PRELOAD="$RUNNER_TEMP/sample.so"
+          exec "$GITHUB_WORKSPACE/emulator/touchHLE" "$@"
+          SH
+          chmod +x "$RUNNER_TEMP/launch"
+      - name: Capture timed scene and sample CPU instructions
+        run: |
+          perfbin=$(find /usr/lib/linux-tools -name perf -executable | sort -V | tail -1)
+          echo "PERFBIN=$perfbin" >> "$GITHUB_ENV"
+          (
+            until [[ -s "$RUNNER_TEMP/game.pid" ]]; do sleep .05; done
+            pid=$(cat "$RUNNER_TEMP/game.pid")
+            if [[ -n "$perfbin" ]]; then
+              sudo "$perfbin" record --clockid mono -e cpu-clock:u -F 97 --call-graph fp -p "$pid" \
+                -o "$RUNNER_TEMP/native.data" > results/native-record.txt 2>&1 &
+            fi
+            while [[ -r "/proc/$pid/maps" && ! -e "$RUNNER_TEMP/finished" ]]; do
+              cp "/proc/$pid/maps" "$RUNNER_TEMP/maps.tmp" && test -s "$RUNNER_TEMP/maps.tmp" && cp "$RUNNER_TEMP/maps.tmp" "$RUNNER_TEMP/maps"
+              if [[ -f "/tmp/perf-$pid.map" ]]; then
+                echo "$(date +%s) $(stat -c %s "/tmp/perf-$pid.map")" >> results/map-sizes.txt
+              fi
+              sleep .7
+            done
+            wait || true
+          ) &
+          observer=$!
+          python3 dev-scripts/ai-tap-sequence.py "$RUNNER_TEMP/fixture/game.ipa" \
+            --exe "$RUNNER_TEMP/launch" --cwd emulator --out results/timed --final-wait 20 \
+            --require-nonblack-frame --require-eagl-frames --require-frame-content \
+            --step '1:-' --step '29:0.5,0.64' --step '5:0.5,0.96' --step '6:-' --step '12:-' \
+            --step '15:-' --step '20:0.86,0.55' --step '15:0.2,0.7>0.2,0.4@1.0' --step '12:-' \
+            -- --overlay=off --device-family=iphone-4s --no-error-popup
+          touch "$RUNNER_TEMP/finished"
+          wait "$observer"
+      - name: Attribute samples to frame intervals, guest function starts and native symbols
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import bisect, collections, csv, os, pathlib, re, struct, zipfile
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])
+          out=pathlib.Path('results')
+          log=(out/'timed/emulator.log').read_text()
+          assert max(map(int,re.findall(r'Loaded Objects now: (\d+)',log))) > 8000
+          gap=max(csv.DictReader((out/'timed/frame-times.csv').open()),key=lambda r:float(r['interval_ms']))
+          hi=float(gap['estimated_end_elapsed_seconds'])
+          lo=hi-float(gap['interval_ms'])/1000
+          assert lo>30 and hi>lo+3
+          pid=int((p/'game.pid').read_text())
+          host={}
+          jit={}
+          for line in (p/'maps').read_text().splitlines():
+              f=line.split()
+              if len(f)>=6 and 'x' in f[1]:
+                  a,b=map(lambda s:int(s,16),f[0].split('-'));host[a]=(b,' '.join(f[5:]),int(f[2],16))
+          for line in pathlib.Path(f'/tmp/perf-{pid}.map').open():
+              a,n,name=line.split(maxsplit=2);a=int(a,16)
+              jit[a]=(a+int(n,16),name.strip(),0)
+          assert len(jit)>100
+          def lookup(keys,table,ip):
+              i=bisect.bisect_right(keys,ip)-1
+              if i>=0:
+                  a=keys[i];b,name,offset=table[a]
+                  if ip<b: return name,ip-a+offset
+              return 'unknown',ip
+          hkeys=sorted(host);jkeys=sorted(jit)
+          # Resolve offsets against the stripped Mach-O's LC_FUNCTION_STARTS.
+          with zipfile.ZipFile(p/'fixture/game.ipa') as z:
+              exe=next(n for n in z.namelist() if (m:=re.fullmatch(r'Payload/([^/]+)\.app/([^/]+)',n)) and m[1]==m[2])
+              data=z.read(exe)
+          m=memoryview(data)[struct.unpack_from('>I',data,16)[0]:]
+          h=28;funcs=[];text_range=None
+          for _ in range(struct.unpack_from('<I',m,16)[0]):
+              cmd,size=struct.unpack_from('<II',m,h)
+              if cmd==1 and bytes(m[h+8:h+24]).rstrip(b'\0')==b'__TEXT':
+                  textbase,vmsize=struct.unpack_from('<II',m,h+24);text_range=(textbase,textbase+vmsize)
+              if cmd==0x26: ofs,n=struct.unpack_from('<II',m,h+8)
+              h+=size
+          addr=textbase;delta=0;shift=0
+          for byte in m[ofs:ofs+n]:
+              delta|=(byte&127)<<shift
+              if byte&128: shift+=7;continue
+              if not delta:break
+              addr+=delta;funcs.append(addr&~1);delta=shift=0
+          bins=collections.defaultdict(collections.Counter)
+          raw=(p/'ips.bin').read_bytes();start,=struct.unpack_from('<Q',raw)
+          for ns,tid,ip in struct.iter_unpack('<3Q',raw[8:]):
+              sec=ns/1e9
+              phase='startup' if sec<lo else 'scene' if sec<=hi else 'gameplay' if sec>=hi+3 else 'activation'
+              name,elf_off=lookup(jkeys,jit,ip);match=re.fullmatch(r'a32_[at]([0-9a-fA-F]+)_.*',name)
+              if match:
+                  pc=int(match[1],16)
+                  bucket='guest-main' if text_range[0]<=pc<text_range[1] else 'guest-other'
+                  func=pc
+                  if bucket=='guest-main':
+                      i=bisect.bisect_right(funcs,pc)-1
+                      if i>=0:func=funcs[i]
+                  bins[phase,'guest-block'][f'0x{pc:08x}']+=1
+                  bins[phase,'guest-function'][f'{bucket} 0x{func:08x}']+=1
+              elif name!='unknown':
+                  bucket=name
+              else:
+                  path,elf_off=lookup(hkeys,host,ip);bucket=os.path.basename(path)
+                  bins[phase,'native-ip'][f'{bucket} +0x{elf_off:x}']+=1
+              bins[phase,'category'][bucket]+=1
+          for (phase,kind),c in bins.items():
+              with (out/f'{phase}-{kind}.tsv').open('w') as f:
+                  for name,n in c.most_common(): f.write(f'{n}\t{name}\n')
+          for phase,(a,b) in {'scene':(lo,hi),'gameplay':(hi+3,ns/1e9)}.items():
+              (p/f'{phase}.range').write_text(f'{start/1e9+a:.6f},{start/1e9+b:.6f}')
+          (out/'phases.txt').write_text(f'room load {lo:g} to {hi:g} sec; gameplay from {hi+3:g}; JIT blocks {len(jit)}\n')
+          PY
+          if [[ -s "$RUNNER_TEMP/native.data" && -n "$PERFBIN" ]]; then
+            for phase in scene gameplay; do
+              sudo "$PERFBIN" report -i "$RUNNER_TEMP/native.data" --stdio --no-children \
+                --percent-limit 0.4 --sort dso,symbol --time "$(cat "$RUNNER_TEMP/$phase.range")" \
+                > "results/$phase-native.txt" 2>&1 || true
+            done
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scene-sampling
+          path: results/
+          retention-days: 5
