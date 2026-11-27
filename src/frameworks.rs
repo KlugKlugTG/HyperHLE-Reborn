@@ -45,6 +45,7 @@ pub mod core_image;
 pub mod core_location;
 pub mod core_media;
 pub mod core_motion;
+pub mod core_surface;
 pub mod core_telephony;
 pub mod core_text;
 pub mod core_video;
@@ -92,6 +93,7 @@ pub struct State {
     avfoundation: avfoundation::State,
     core_animation: core_animation::State,
     core_foundation: core_foundation::State,
+    core_surface: core_surface::State,
     foundation: foundation::State,
     pub game_kit: game_kit::State,
     pub store_kit: store_kit::State,

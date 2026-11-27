@@ -1318,14 +1318,14 @@ fn render_layer_in_context(env: &mut Environment, layer: id, ctx: CGContextRef) 
         CGContextFillRect(env, ctx, bounds);
     }
 
-    // Image contents (e.g. UIImage-backed UIImageView). Only handle the
-    // CGImage case; layer.contents may also be a UIImage which exposes
-    // its CGImage via `-CGImage` — match how the GPU compositor handles
-    // it: try CGImage first, otherwise log and skip.
-    if contents != nil {
-        // Probe whether `contents` is a CGImage-equivalent. A CGImage is a
-        // CF type, not an Obj-C class, so we duck-type using the
-        // existing pure-CG getter `CGImageGetWidth` returning non-zero.
+    if let Some(surface) = crate::frameworks::core_surface::surface(&env.objc, contents) {
+        let opaque = env.objc.borrow::<CALayerHostObject>(layer).opaque;
+        if let Some(image) = surface.image(&env.mem, opaque) {
+            let image = crate::frameworks::core_graphics::cg_image::from_image(env, image);
+            CGContextDrawImage(env, ctx, bounds, image);
+            crate::frameworks::core_graphics::cg_image::CGImageRelease(env, image);
+        }
+    } else if contents != nil {
         let width = crate::frameworks::core_graphics::cg_image::CGImageGetWidth(env, contents);
         if width != 0 {
             CGContextDrawImage(env, ctx, bounds, contents);

@@ -419,6 +419,58 @@ int test_dlopen_handle_lifetime_and_constants(void) {
   return dlclose(mainOnly);
 }
 
+// Legacy CoreSurface is opened dynamically on devices that provide it.
+// Exercise data-symbol indirection, guest writes and the lifetime of global IDs.
+// https://github.com/rileytestut/SNES4iOS/blob/master/CoreSurface/CoreSurface.h
+int test_core_surface_buffer(void) {
+  void *h = dlopen("/System/Library/PrivateFrameworks/CoreSurface.framework/"
+                   "CoreSurface", RTLD_LAZY);
+  if (!h)
+    return -1;
+  NSString **w = dlsym(h, "kCoreSurfaceBufferWidth");
+  NSString **y = dlsym(h, "kCoreSurfaceBufferHeight");
+  NSString **pitch = dlsym(h, "kCoreSurfaceBufferPitch");
+  NSString **format = dlsym(h, "kCoreSurfaceBufferPixelFormat");
+  NSString **global = dlsym(h, "kCoreSurfaceBufferGlobal");
+  id (*create)(id) = dlsym(h, "CoreSurfaceBufferCreate");
+  id (*lookup)(unsigned) = dlsym(h, "CoreSurfaceBufferLookup");
+  unsigned (*get_id)(id) = dlsym(h, "CoreSurfaceBufferGetID");
+  unsigned (*size)(id) = dlsym(h, "CoreSurfaceBufferGetAllocSize");
+  unsigned (*stride)(id) = dlsym(h, "CoreSurfaceBufferGetBytesPerRow");
+  unsigned (*get_width)(id) = dlsym(h, "CoreSurfaceBufferGetWidth");
+  unsigned (*get_height)(id) = dlsym(h, "CoreSurfaceBufferGetHeight");
+  unsigned (*get_format)(id) = dlsym(h, "CoreSurfaceBufferGetPixelFormatType");
+  unsigned (*planes)(id) = dlsym(h, "CoreSurfaceBufferGetPlaneCount");
+  unsigned char *(*base)(id) = dlsym(h, "CoreSurfaceBufferGetBaseAddress");
+  int (*lock)(id, unsigned) = dlsym(h, "CoreSurfaceBufferLock");
+  int (*unlock)(id) = dlsym(h, "CoreSurfaceBufferUnlock");
+  if (!w || !y || !pitch || !format || !global || !create || !lookup ||
+      !get_id || !size || !stride || !get_width || !get_height || !get_format ||
+      !planes || !base || !lock || !unlock)
+    return -2;
+  // A row can have trailing padding.
+  id s = create(@{*w : @2, *y : @3, *pitch : @12, *format : @0x42475241,
+                  *global : @1});
+  if (!s || !base(s) || size(s) < 36 || stride(s) != 12 || get_width(s) != 2 ||
+      get_height(s) != 3 || get_format(s) != 0x42475241 || planes(s) != 0)
+    return -3;
+  unsigned number = get_id(s);
+  id shared = lookup(number);
+  if (!number || shared != s || lock(s, 3))
+    return -4;
+  base(s)[24] = 0x5a;
+  if (unlock(s))
+    return -5;
+  CFRelease(s);
+  if (base(shared)[24] != 0x5a)
+    return -6;
+  CFRelease(shared);
+  if (lookup(number) || create(@{*w : @2, *y : @3, *pitch : @4,
+                                  *format : @0x42475241}))
+    return -7;
+  return dlclose(h);
+}
+
 static id dynamic_runtime_echo(id self, SEL cmd, id value) {
   (void)self;
   (void)cmd;
@@ -7636,6 +7688,7 @@ struct {
     FUNC_DEF(test_dlsym_executable_exports),
     FUNC_DEF(test_dladdr_image_and_symbols),
     FUNC_DEF(test_dlopen_handle_lifetime_and_constants),
+    FUNC_DEF(test_core_surface_buffer),
     FUNC_DEF(test_objc_dynamic_class_pair),
     FUNC_DEF(test_UIViewController_nib_name_selection),
     FUNC_DEF(test_UINavigationController_modal_layout),

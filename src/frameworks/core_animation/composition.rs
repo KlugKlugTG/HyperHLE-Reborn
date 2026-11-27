@@ -15,6 +15,7 @@ use super::ca_layer::CALayerHostObject;
 use crate::frameworks::core_animation::animation;
 use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
 use crate::frameworks::core_graphics::{cg_bitmap_context, cg_image, CGFloat, CGRect, CGSize};
+use crate::frameworks::core_surface;
 use crate::gles::gles11_raw as gles11; // constants only
 use crate::gles::gles11_raw::types::*;
 use crate::gles::present::{present_frame, FpsCounter};
@@ -71,7 +72,8 @@ fn snapshot_layers(objc: &mut ObjC, roots: &[id]) -> Option<Vec<(id, CALayerHost
         if !snapshot.hidden {
             // Animation values are calculated during composition; never
             // reuse a scene while an animation or bitmap redraw is pending.
-            if snapshot.needs_display
+            if core_surface::surface(objc, snapshot.contents).is_some()
+                || snapshot.needs_display
                 || !snapshot.animations.is_empty()
                 || !snapshot.anonymous_animations.is_empty()
             {
@@ -1075,7 +1077,10 @@ unsafe fn composite_layer_recursive(
     let need_texture = host_obj.presented_pixels.is_some()
         || host_obj.contents != nil
         || host_obj.cg_context.is_some();
-    let need_update = need_texture && !host_obj.gles_texture_is_up_to_date;
+    // A CoreSurface can change through a guest CPU pointer while its layer
+    // retains the same contents object between frames.
+    let is_surface = core_surface::surface(&env.objc, host_obj.contents).is_some();
+    let need_update = need_texture && (!host_obj.gles_texture_is_up_to_date || is_surface);
 
     if need_texture {
         if let Some(texture) = host_obj.gles_texture {
@@ -1120,7 +1125,15 @@ unsafe fn composite_layer_recursive(
 
     // Update texture with CGImageRef or CGContextRef pixels, if any
     if need_update {
-        if host_obj.contents != nil {
+        if let Some(surface) = core_surface::surface(&env.objc, host_obj.contents) {
+            if let Some(image) = surface.image(&env.mem, host_obj.opaque) {
+                texture_size = Some(upload_rgba8_pixels(
+                    gles.as_mut(), image.pixels(), image.dimensions(), texture_size,
+                ));
+            } else {
+                texture_size = None;
+            }
+        } else if host_obj.contents != nil {
             let image = cg_image::borrow_image(&env.objc, host_obj.contents);
 
             // No special handling for opacity is needed here: the alpha channel
@@ -1154,7 +1167,7 @@ unsafe fn composite_layer_recursive(
     }
 
     // Draw texture, if any
-    if need_texture {
+    if let Some(dimensions) = texture_size.filter(|_| need_texture) {
         let misc = env
             .framework_state
             .core_animation
@@ -1168,7 +1181,7 @@ unsafe fn composite_layer_recursive(
         if host_obj.contents != nil
             && host_obj.contents_gravity != super::ca_layer::kCAGravityResize
         {
-            let (width, height) = cg_image::borrow_image(&env.objc, host_obj.contents).dimensions();
+            let (width, height) = dimensions;
             let scale = host_obj.contents_scale;
             let size = CGSize {
                 width: width as CGFloat / scale,
