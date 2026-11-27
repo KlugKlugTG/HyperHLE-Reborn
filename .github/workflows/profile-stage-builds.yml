@@ -1,5 +1,11 @@
 name: Performance comparison builds
 on:
+  workflow_dispatch:
+    inputs:
+      stages:
+        description: JSON array of stage names and full revisions
+        type: string
+        required: true
   push:
     branches: [fix/profile-game-performance]
     paths: [.github/workflows/profile-stage-builds.yml]
@@ -10,11 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - {stage: archive, revision: ea356abbf70a5893b2fc195ce5e5995c8714fd16}
-          - {stage: rebase, revision: 6d7b011a5472386d17969413d712a98da70d7847}
-          - {stage: pvrtc, revision: 4a87d6a5c5e3d6f18eba544ea8ea6fc9ab8a66d0}
-          - {stage: native, revision: 6e0cecac1d92f92555468f10af2157f59e38848d}
+        include: ${{ fromJSON(inputs.stages || '[{"stage":"semaphore","revision":"79712f8fbbbe4d25cb0e0bd32ee5ca17bb16191e"},{"stage":"discard","revision":"f515fb097b3dda1e5645405f63be680f045da429"}]') }}
     runs-on: ubuntu-latest
     env:
       # GCC 15 defaults to C23; bundled SDL2 uses bool/true/false as identifiers.
