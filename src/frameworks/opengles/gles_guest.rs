@@ -3806,29 +3806,6 @@ fn glCompressedTexImage2D(
         if let Some(texture) = bound_texture {
             shadow.forget_pvrtc_texture_level(target, texture, level);
         }
-        // Pre-flight: drain any sticky GL error left by the previous call
-        // (e.g. an oversized RGBA8 glTexImage2D on a strict Mali driver),
-        // so when we check post-upload below we can attribute a fresh error
-        // to *this* compressed upload only. Without this, every PVRTC /
-        // paletted upload that follows a failed glTexImage2D would report
-        // a misleading "compressed upload failed" on the very first call —
-        // that's exactly what was happening on Mali-G57 with Temple Run
-        // (HyperHLE log: 1024x1024 RGBA8 upload immediately followed by
-        // 256x256 PVRTC upload, both blamed on the PVRTC path).
-        let mut drained = 0u32;
-        loop {
-            let e = gles.GetError();
-            if e == 0 {
-                break;
-            }
-            drained += 1;
-            if drained > 16 {
-                // Pathological driver that won't clear; bail out instead of
-                // looping forever.
-                break;
-            }
-        }
-
         let image_size_usize = match usize::try_from(image_size) {
             Ok(size) => size,
             Err(_) => return,
@@ -3850,20 +3827,15 @@ fn glCompressedTexImage2D(
             mem.ptr_at(data.cast::<u8>(), image_size_usize as GuestUSize)
                 .cast()
         };
-        let is_pvrtc = matches!(
-            internalformat,
-            gles11::COMPRESSED_RGBA_PVRTC_2BPPV1_IMG
-                | gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG
-                | gles11::COMPRESSED_RGB_PVRTC_2BPPV1_IMG
-                | gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG
-        );
+        let emulate_pvrtc = crate::gles::util::pvrtc_format_properties(internalformat).is_some()
+            && !gles.pvrtc_native();
         // PVRTC storage allocated with no data: desktop GL can't honour the
         // PVRTC internalformat, so our decode path uploads RGBA instead.
         // Mirror that for the allocate-only case by reserving RGBA storage of
         // the same dimensions (uninitialised), so the texture object is
         // complete and later CompressedTexSubImage2D updates have somewhere to
         // land. Without this the texture would be left in its default state.
-        if is_pvrtc && data_was_null && width > 0 && height > 0 {
+        if emulate_pvrtc && data_was_null && width > 0 && height > 0 {
             gles.TexImage2D(
                 target,
                 level,
@@ -3912,7 +3884,7 @@ fn glCompressedTexImage2D(
             }
             return;
         }
-        if is_pvrtc && !data.is_null() && image_size > 0 {
+        if emulate_pvrtc && !data.is_null() && image_size > 0 {
             let payload = std::slice::from_raw_parts(data.cast::<u8>(), image_size_usize);
             if crate::gles::try_decode_pvrtc(
                 gles,
@@ -3958,6 +3930,30 @@ fn glCompressedTexImage2D(
                 return;
             }
         }
+        // Pre-flight: drain any sticky GL error left by the previous call
+        // (e.g. an oversized RGBA8 glTexImage2D on a strict Mali driver),
+        // so when we check post-upload below we can attribute a fresh error
+        // to *this* compressed upload only. Without this, every PVRTC /
+        // paletted upload that follows a failed glTexImage2D would report
+        // a misleading "compressed upload failed" on the very first call —
+        // that's exactly what was happening on Mali-G57 with Temple Run
+        // (HyperHLE log: 1024x1024 RGBA8 upload immediately followed by
+        // 256x256 PVRTC upload, both blamed on the PVRTC path).
+        let mut drained = 0u32;
+        loop {
+            let e = gles.GetError();
+            if e == 0 {
+                break;
+            }
+            shadow.record_error(e);
+            drained += 1;
+            if drained > 16 {
+                // Pathological driver that won't clear; bail out instead of
+                // looping forever.
+                break;
+            }
+        }
+
         gles.CompressedTexImage2D(
             target,
             level,
@@ -3988,6 +3984,7 @@ fn glCompressedTexImage2D(
             }
         }
         if post_err != 0 {
+            shadow.record_error(post_err);
             use std::sync::atomic::{AtomicU64, Ordering};
             // Pack (internalformat << 32) | post_err into a single 64-bit
             // slot per "ever seen" entry; cap at 8 distinct entries.

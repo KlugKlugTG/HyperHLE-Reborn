@@ -329,6 +329,10 @@ impl GLES for GLES1Native<'_> {
         true
     }
 
+    fn pvrtc_native(&self) -> bool {
+        self.pvrtc_native
+    }
+
     fn discard_ext_supported(&self) -> bool {
         self.discard_ext
     }
@@ -1815,22 +1819,8 @@ impl GLES1Native<'_> {
         data: *const GLvoid,
     ) {
 
-        // POSIX-style guard: a NULL data pointer with image_size==0 is
-        // technically allowed by the spec for some texture-storage queries,
-        // but in practice no iPhone OS app does this — it'd just be a guest
-        // bug. Drop the call on the floor instead of dereferencing the
-        // pointer.
-        if data.is_null() && image_size > 0 {
-            log!(
-                "Warning: GLES1Native::CompressedTexImage2D: NULL data with \
-                 non-zero image_size {image_size} (target={target:#x}, \
-                 level={level}, format={internalformat:#x}, {width}x{height}); \
-                 dropping upload."
-            );
-            return;
-        }
-
-        if width <= 0 || height <= 0 {
+        // A null pointer specifies storage with undefined contents.
+        if data.is_null() || width <= 0 || height <= 0 {
             gles11::CompressedTexImage2D(
                 target,
                 level,
