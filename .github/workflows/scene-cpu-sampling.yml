@@ -50,6 +50,9 @@ jobs:
         run: |
           cat > "$RUNNER_TEMP/sample.c" <<'C'
           #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <errno.h>
+          #include <pthread.h>
           #include <fcntl.h>
           #include <signal.h>
           #include <stdint.h>
@@ -67,9 +70,35 @@ jobs:
               return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec;
           }
           static void sample(int sig, siginfo_t *info, void *ctx) {
+              int saved_errno = errno;
               ucontext_t *u = ctx;
               uint64_t record[] = {now() - start, syscall(SYS_gettid), u->uc_mcontext.gregs[REG_RIP]};
               write(output, record, sizeof(record));
+              errno = saved_errno;
+          }
+          static _Thread_local timer_t tid_timer;
+          static void arm(void) {
+              struct sigevent ev = { .sigev_notify = SIGEV_THREAD_ID, .sigev_signo = SIGPROF };
+              ev._sigev_un._tid = syscall(SYS_gettid);
+              if (timer_create(CLOCK_THREAD_CPUTIME_ID, &ev, &tid_timer)) return;
+              struct itimerspec t = {{0,5033000}, {0,5033000}};
+              timer_settime(tid_timer, 0, &t, NULL);
+          }
+          struct thread_entry { void *(*fn)(void *); void *arg; };
+          static void *entry(void *opaque) {
+              struct thread_entry e=*(struct thread_entry*)opaque;
+              free(opaque);
+              arm();
+              void *r=e.fn(e.arg);
+              timer_delete(tid_timer);
+              return r;
+          }
+          int pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *), void *arg) {
+              int (*create)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *) = dlsym(RTLD_NEXT, "pthread_create");
+              struct thread_entry *e=malloc(sizeof(*e));
+              if (!e) return create(t,a,fn,arg);
+              e->fn=fn; e->arg=arg;
+              int ret=create(t,a,entry,e); if (ret) free(e); return ret;
           }
           __attribute__((constructor)) static void setup(void) {
               output = open(getenv("SAMPLE_OUT"), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
@@ -79,8 +108,7 @@ jobs:
               struct sigaction a = { .sa_sigaction = sample, .sa_flags = SA_SIGINFO | SA_RESTART };
               sigemptyset(&a.sa_mask);
               sigaction(SIGPROF, &a, NULL);
-              struct itimerval t = {{0, 5033}, {0, 5033}};
-              setitimer(ITIMER_PROF, &t, NULL);
+              arm();
           }
           C
           cc -O2 -fPIC -shared "$RUNNER_TEMP/sample.c" -o "$RUNNER_TEMP/sample.so"
@@ -94,14 +122,16 @@ jobs:
           chmod +x "$RUNNER_TEMP/launch"
       - name: Capture timed scene and sample CPU instructions
         run: |
-          perfbin=$(find /usr/lib/linux-tools -name perf -executable | sort -V | tail -1)
+          perfbin=$(find /usr/lib -path '*linux-tools*' -name perf -type f -executable | sort -V | tail -1)
+          echo "${perfbin:-no-perf-found}" > results/native-record.txt
+          dpkg-query -W 'linux-tools*' >> results/native-record.txt
           echo "PERFBIN=$perfbin" >> "$GITHUB_ENV"
           (
             until [[ -s "$RUNNER_TEMP/game.pid" ]]; do sleep .05; done
             pid=$(cat "$RUNNER_TEMP/game.pid")
             if [[ -n "$perfbin" ]]; then
               sudo "$perfbin" record --clockid mono -e cpu-clock:u -F 97 --call-graph fp -p "$pid" \
-                -o "$RUNNER_TEMP/native.data" > results/native-record.txt 2>&1 &
+                -o "$RUNNER_TEMP/native.data" >> results/native-record.txt 2>&1 &
             fi
             while [[ -r "/proc/$pid/maps" && ! -e "$RUNNER_TEMP/finished" ]]; do
               cp "/proc/$pid/maps" "$RUNNER_TEMP/maps.tmp" && test -s "$RUNNER_TEMP/maps.tmp" && cp "$RUNNER_TEMP/maps.tmp" "$RUNNER_TEMP/maps"
@@ -191,6 +221,7 @@ jobs:
                   path,elf_off=lookup(hkeys,host,ip);bucket=os.path.basename(path)
                   bins[phase,'native-ip'][f'{bucket} +0x{elf_off:x}']+=1
               bins[phase,'category'][bucket]+=1
+              bins[phase,'thread'][f'{tid} {bucket}']+=1
           for (phase,kind),c in bins.items():
               with (out/f'{phase}-{kind}.tsv').open('w') as f:
                   for name,n in c.most_common(): f.write(f'{n}\t{name}\n')
