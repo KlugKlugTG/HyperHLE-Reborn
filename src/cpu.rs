@@ -395,3 +395,54 @@ mod fastmem_tests {
         assert_eq!(cpu.regs()[0], 0x1234_5678);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exclusive_store_requires_a_reservation_from_the_current_guest_thread() {
+        // Thumb-2 LDREXD r2, r3, [r0] followed by STREXD r1, r4, r5, [r0].
+        // XNU's context-switch path issues CLREX before resuming the thread.
+        // https://github.com/darwin-on-arm/xnu/blob/master/osfmk/arm/cswitch.s
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(0x1000);
+        let code = mem.alloc(8).cast::<u16>();
+        for (i, halfword) in [0xe8d0, 0x237f, 0xe8c0, 0x4571].into_iter().enumerate() {
+            mem.write(code + i as u32, halfword);
+        }
+        let initial = 0x1234_5678_0123_4567u64;
+        let word = mem.alloc_and_write(initial);
+        let mut cpu = Cpu::new(None);
+        let start = crate::abi::GuestFunction::from_addr_with_thumb_bit(code.to_bits() | 1);
+        let step = |cpu: &mut Cpu, mem: &mut Mem| {
+            assert!(matches!(cpu.run_or_step(mem, None), CpuState::Normal));
+        };
+
+        cpu.branch(start);
+        cpu.regs_mut()[0] = word.to_bits();
+        cpu.regs_mut()[4] = 42;
+        cpu.regs_mut()[5] = 24;
+        step(&mut cpu, &mut mem);
+        assert_eq!(cpu.regs()[2], initial as u32);
+        assert_eq!(cpu.regs()[3], (initial >> 32) as u32);
+        step(&mut cpu, &mut mem);
+        assert_eq!(cpu.regs()[1], 0);
+        assert_eq!(mem.read(word), (24u64 << 32) | 42);
+
+        mem.write(word, initial);
+        cpu.branch(start);
+        step(&mut cpu, &mut mem);
+        let mut other = CpuContext::new();
+        other.cpsr = cpu.cpsr();
+        other.regs[Cpu::PC] = (code + 2).to_bits();
+        other.regs[0] = word.to_bits();
+        cpu.swap_context(&mut other);
+        step(&mut cpu, &mut mem);
+        assert_ne!(cpu.regs()[1], 0);
+        cpu.swap_context(&mut other);
+        step(&mut cpu, &mut mem);
+        assert_ne!(cpu.regs()[1], 0);
+        assert_eq!(mem.read(word), initial);
+    }
+}

@@ -377,6 +377,10 @@ public:
   }
 
   void swap_context(touchHLE_DynarmicContext *context) {
+    // All guest threads share one emulated core. XNU clears its local
+    // exclusive monitor when switching threads (CLREX), so an interrupted
+    // LDREX/STREX sequence cannot commit on behalf of a different thread.
+    cpu->ClearExclusiveState();
     touchHLE_DynarmicContext tmp = {cpu->Regs(), cpu->ExtRegs(), cpu->Cpsr(),
                                     cpu->Fpscr()};
     cpu->Regs() = context->regs;
