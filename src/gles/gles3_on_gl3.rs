@@ -171,34 +171,8 @@ impl GLES3OnGL3Context {
     }
 }
 
-/// Query `GL_EXTENSIONS` and return whether the current OpenGL ES 3.0 driver
-/// advertises `GL_IMG_texture_compression_pvrtc`. Must be called with a
-/// current GL context.
-///
-/// On strict OpenGL ES 3.0+ contexts `glGetString(GL_EXTENSIONS)` is
-/// deprecated and may return an empty string — we fall back to
-/// `glGetStringi(GL_EXTENSIONS, i)` in that case, iterating over
-/// `GL_NUM_EXTENSIONS`. If neither path produces a useful list we
-/// conservatively return `false` and software-decode PVRTC. That's the safe
-/// choice: it produces correct output everywhere, at the cost of one extra
-/// in-memory pass per texture upload on hosts where PVRTC could otherwise
-/// be uploaded directly.
+/// A desktop core profile exposes extensions through the indexed query only.
 unsafe fn detect_pvrtc_support() -> bool {
-    // First try the legacy `glGetString(GL_EXTENSIONS)` path.
-    let legacy = gl33::GetString(gles11::EXTENSIONS);
-    if legacy.is_null() {
-        return false;
-    }
-    let Ok(s) = CStr::from_ptr(legacy as *const _).to_str() else {
-        return false;
-    };
-    if !s.is_empty()
-        && s.split(' ')
-            .any(|ext| ext == "GL_IMG_texture_compression_pvrtc")
-    {
-        return true;
-    }
-    // Fallback: ES 3.0 indexed extension query.
     let mut count: GLint = 0;
     gl33::GetIntegerv(gl33::NUM_EXTENSIONS, &mut count);
     for i in 0..count.max(0) {
