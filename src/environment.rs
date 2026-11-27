@@ -360,7 +360,7 @@ pub enum ThreadBlock {
     // Mutex acquisition with a deadline in guest time.
     TimedMutex(MutexId, Instant),
     // Thread is waiting on a semaphore.
-    Semaphore(MutPtr<sem_t>),
+    Semaphore(Rc<libc::semaphore::SemaphoreWaiter>),
     // Thread is waiting on a condition variable
     Condition(MutPtr<pthread_cond_t>, Option<Duration>),
     // Thread is waiting for another thread to finish (joining).
@@ -711,7 +711,7 @@ impl Environment {
         let executable_path = bundle.executable_path();
         let executable_name = executable_path.file_name().unwrap().to_string();
         let executable_bytes = fs
-            .read(&executable_path)
+            .read_shared(&executable_path)
             .map_err(|_| "Could not load executable: Could not read executable file".to_string())?;
 
         let window = if options.headless {
@@ -1948,37 +1948,17 @@ impl Environment {
     /// execution of the current host thread (if the semaphore is
     /// currently at 0).
     pub fn sem_decrement(&mut self, sem: MutPtr<sem_t>, wait_on_lock: bool) -> bool {
-        let Some(host_sem_rc) = self.libc_state.semaphore.open_semaphores.get_mut(&sem) else {
-            // The guest called sem_wait/sem_trywait on an uninitialised or
-            // already-destroyed semaphore. POSIX/Apple document this as an
-            // `EINVAL` failure of the wait, so we report failure to the caller
-            // (which sets errno) instead of aborting the whole process.
-            log!(
-                "Warning: sem_decrement called on unknown semaphore {:?}; \
-                 failing without blocking (guest likely waited on an \
-                 uninitialised or destroyed semaphore).",
-                sem
-            );
+        if wait_on_lock {
+            return self.wait_semaphore(sem, None, None) == libc::semaphore::WaitResult::Acquired;
+        }
+        let Some(host_sem) = self.libc_state.semaphore.open_semaphores.get(&sem) else {
             return false;
         };
-        let mut host_sem = (*host_sem_rc).borrow_mut();
-
-        if host_sem.value > 0 {
-            host_sem.value -= 1;
-            return true;
-        }
-
-        if !wait_on_lock {
-            log_dbg!(
-                "sem_decrement: semaphore {:?} attempted decrement without waiting, failed",
-                sem,
-            );
+        let mut host_sem = host_sem.borrow_mut();
+        if host_sem.value <= 0 {
             return false;
         }
-        host_sem.waiting.insert(self.current_thread);
-        std::mem::drop(host_sem);
-        // The scheduler will decrement the semaphore value when it unblocks.
-        self.yield_thread(ThreadBlock::Semaphore(sem));
+        host_sem.value -= 1;
         true
     }
 
@@ -2000,14 +1980,9 @@ impl Environment {
             );
             return false;
         };
-        let mut host_sem = (*host_sem_rc).borrow_mut();
-
-        host_sem.value += 1;
-        log_dbg!(
-            "sem_increment: semaphore {:?} is now {}",
-            sem,
-            host_sem.value
-        );
+        host_sem_rc
+            .borrow_mut()
+            .signal(&self.guest_clock, libc::semaphore::Signal::One);
         true
     }
 
@@ -2229,6 +2204,7 @@ impl Environment {
                     let deadline = match thread.blocked_by {
                         ThreadBlock::Sleeping(due) => Some(due),
                         ThreadBlock::GuestSleeping(due) | ThreadBlock::TimedMutex(_, due) => Some(self.guest_clock.host_deadline(due)),
+                        ThreadBlock::Semaphore(ref waiter) => waiter.deadline.map(|due| self.guest_clock.host_deadline(due)),
                         _ => None,
                     };
                     deadline.is_some_and(|due| due < Instant::now() + Duration::from_millis(10))
@@ -4368,38 +4344,15 @@ impl Environment {
                         let host_due = self.guest_clock.host_deadline(due);
                         next_awakening = Some(next_awakening.map_or(host_due, |d| d.min(host_due)));
                     }
-                    ThreadBlock::Semaphore(sem) => {
-                        // The semaphore a thread is waiting on may have been
-                        // destroyed (e.g. sem_destroy / sem_close) while the
-                        // thread was still blocked. Rather than panicking, treat
-                        // a now-unknown semaphore as "the wait can no longer be
-                        // satisfied here" and wake the thread so it can return
-                        // from sem_wait (which fails with EINVAL) instead of
-                        // deadlocking or aborting the process.
-                        let Some(host_sem_rc) =
-                            self.libc_state.semaphore.open_semaphores.get_mut(&sem)
-                        else {
-                            log!(
-                                "Warning: thread {} was blocked on semaphore {:?} \
-                                 that no longer exists; waking it.",
-                                thread_id,
-                                sem
-                            );
-                            self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
+                    ThreadBlock::Semaphore(ref waiter) => {
+                        if waiter.result(&self.guest_clock).is_some() {
+                            candidate.blocked_by = ThreadBlock::NotBlocked;
                             return thread_id;
-                        };
-                        let mut host_sem = (*host_sem_rc).borrow_mut();
-                        if host_sem.value > 0 {
-                            log_dbg!(
-                                "Thread {} has awaken on semaphore {:?} with value {}",
-                                thread_id,
-                                sem,
-                                host_sem.value
-                            );
-                            host_sem.value -= 1;
-                            host_sem.waiting.remove(&thread_id);
-                            self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
-                            return thread_id;
+                        }
+                        if let Some(due) = waiter.deadline {
+                            let host_due = self.guest_clock.host_deadline(due);
+                            next_awakening =
+                                Some(next_awakening.map_or(host_due, |d| d.min(host_due)));
                         }
                     }
                     ThreadBlock::Condition(cond, deadline) => {

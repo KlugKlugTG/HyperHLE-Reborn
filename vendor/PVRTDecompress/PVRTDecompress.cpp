@@ -425,8 +425,6 @@ static void pvrtcGetDecompressedPixels(const PVRTCWord& P, const PVRTCWord& Q, c
 	}
 }
 
-static uint32_t wrapWordIndex(uint32_t numWords, int word) { return ((word + numWords) % numWords); }
-
 static bool isPowerOf2(uint32_t input)
 {
 	uint32_t minus1;
@@ -515,45 +513,40 @@ static uint32_t pvrtcDecompress(uint8_t* pCompressedData, Pixel32* pDecompressed
 	constexpr unsigned int maxThreadCount = 4;
 	constexpr std::size_t minimumParallelWords = 8192;
 	const std::size_t totalWords = static_cast<std::size_t>(i32NumXWords) * i32NumYWords;
+	// The Morton address is the OR of disjoint column and row bits, including
+	// the high bits of the longer axis on rectangular surfaces.
+	const uint32_t columnMask = TwiddleUV(i32NumXWords, i32NumYWords, i32NumXWords - 1, 0);
+	auto loadWord = [&](uint32_t offset) -> PVRTCWord {
+		return { pWordMembers[2 * offset], pWordMembers[2 * offset + 1] };
+	};
+
 	// Each iteration writes disjoint halves of neighboring output rows.
 	auto decompressRows = [&](int32_t firstRow, int32_t lastRow) {
-		PVRTCWordIndices indices;
 		Pixel32 pPixels[32];
-
+		int32_t top = firstRow == 0 ? i32NumYWords - 1 : firstRow - 1;
+		uint32_t topOffset = TwiddleUV(i32NumXWords, i32NumYWords, 0, top);
 		for (int32_t row = firstRow; row < lastRow; ++row)
 		{
-			const int32_t wordY = row - 1;
-			for (int32_t wordX = -1; wordX < i32NumXWords - 1; ++wordX)
+			const uint32_t bottomOffset = TwiddleUV(i32NumXWords, i32NumYWords, 0, row);
+			int32_t left = i32NumXWords - 1;
+			PVRTCWord P = loadWord(columnMask | topOffset);
+			PVRTCWord R = loadWord(columnMask | bottomOffset);
+			uint32_t columnOffset = 0;
+			for (int32_t column = 0; column < i32NumXWords; ++column)
 			{
-				indices.P[0] = static_cast<int>(wrapWordIndex(i32NumXWords, wordX));
-				indices.P[1] = static_cast<int>(wrapWordIndex(i32NumYWords, wordY));
-				indices.Q[0] = static_cast<int>(wrapWordIndex(i32NumXWords, wordX + 1));
-				indices.Q[1] = static_cast<int>(wrapWordIndex(i32NumYWords, wordY));
-				indices.R[0] = static_cast<int>(wrapWordIndex(i32NumXWords, wordX));
-				indices.R[1] = static_cast<int>(wrapWordIndex(i32NumYWords, wordY + 1));
-				indices.S[0] = static_cast<int>(wrapWordIndex(i32NumXWords, wordX + 1));
-				indices.S[1] = static_cast<int>(wrapWordIndex(i32NumYWords, wordY + 1));
-
-				uint32_t WordOffsets[4] = {
-					TwiddleUV(i32NumXWords, i32NumYWords, indices.P[0], indices.P[1]) * 2,
-					TwiddleUV(i32NumXWords, i32NumYWords, indices.Q[0], indices.Q[1]) * 2,
-					TwiddleUV(i32NumXWords, i32NumYWords, indices.R[0], indices.R[1]) * 2,
-					TwiddleUV(i32NumXWords, i32NumYWords, indices.S[0], indices.S[1]) * 2,
-				};
-
-				PVRTCWord P, Q, R, S;
-				P.colorData = static_cast<uint32_t>(pWordMembers[WordOffsets[0] + 1]);
-				P.modulationData = static_cast<uint32_t>(pWordMembers[WordOffsets[0]]);
-				Q.colorData = static_cast<uint32_t>(pWordMembers[WordOffsets[1] + 1]);
-				Q.modulationData = static_cast<uint32_t>(pWordMembers[WordOffsets[1]]);
-				R.colorData = static_cast<uint32_t>(pWordMembers[WordOffsets[2] + 1]);
-				R.modulationData = static_cast<uint32_t>(pWordMembers[WordOffsets[2]]);
-				S.colorData = static_cast<uint32_t>(pWordMembers[WordOffsets[3] + 1]);
-				S.modulationData = static_cast<uint32_t>(pWordMembers[WordOffsets[3]]);
-
+				const PVRTCWord Q = loadWord(columnOffset | topOffset);
+				const PVRTCWord S = loadWord(columnOffset | bottomOffset);
+				const PVRTCWordIndices indices = { { left, top }, { column, top }, { left, row }, { column, row } };
 				pvrtcGetDecompressedPixels(P, Q, R, S, pPixels, bpp);
 				mapDecompressedData(pOutData, width, pPixels, indices, bpp);
+				P = Q;
+				R = S;
+				left = column;
+				// Increment only the Morton bits belonging to the column.
+				columnOffset = (columnOffset - columnMask) & columnMask;
 			}
+			top = row;
+			topOffset = bottomOffset;
 		}
 	};
 

@@ -1109,38 +1109,42 @@ impl MachO {
                         &bytes[off_usize..end]
                     }
 
-                    let rebase_opcodes = Rebase::parse(
-                        checked_dyld_info_slice(
-                            bytes,
-                            rebase_off as u64,
-                            rebase_size as u64,
-                            "rebase",
-                            &name,
-                        ),
-                        size_of::<GuestUSize>(),
-                    );
+                    // At the preferred address every internal pointer already has its
+                    // final value. Binding imports below is independent of this slide.
+                    if slide != 0 {
+                        let rebase_opcodes = Rebase::parse(
+                            checked_dyld_info_slice(
+                                bytes,
+                                rebase_off as u64,
+                                rebase_size as u64,
+                                "rebase",
+                                &name,
+                            ),
+                            size_of::<GuestUSize>(),
+                        );
 
-                    for symb in rebase_opcodes {
-                        match symb.symbol_type {
-                            BindSymbolType::Pointer => {
-                                let addr = segment_offsets[symb.segment_index]
-                                    + symb.symbol_offset as u32
-                                    + slide;
-                                let original_location = Ptr::from_bits(addr);
-                                let old: u32 = into_mem.read(original_location);
-                                log_dbg!(
-                                    "Pointer rebase at {:#x} from {:#x} to {:#x}",
-                                    addr,
-                                    old,
-                                    old + slide
-                                );
-                                into_mem.write(original_location, old + slide);
-                            }
-                            other => {
-                                log!(
-                                    "Warning: unhandled DyldInfo rebase symbol type: {:?}; skipping.",
-                                    other
-                                );
+                        for symb in rebase_opcodes {
+                            match symb.symbol_type {
+                                BindSymbolType::Pointer => {
+                                    let addr = segment_offsets[symb.segment_index]
+                                        + symb.symbol_offset as u32
+                                        + slide;
+                                    let original_location = Ptr::from_bits(addr);
+                                    let old: u32 = into_mem.read(original_location);
+                                    log_dbg!(
+                                        "Pointer rebase at {:#x} from {:#x} to {:#x}",
+                                        addr,
+                                        old,
+                                        old + slide
+                                    );
+                                    into_mem.write(original_location, old + slide);
+                                }
+                                other => {
+                                    log!(
+                                        "Warning: unhandled DyldInfo rebase symbol type: {:?}; skipping.",
+                                        other
+                                    );
+                                }
                             }
                         }
                     }
@@ -1316,8 +1320,9 @@ impl MachO {
     ) -> Result<MachO, &'static str> {
         let name = path.as_ref().file_name().unwrap().to_string();
         let mut image = Self::load_from_bytes(
-            &fs.read(path.as_ref())
-                .map_err(|_| "Could not read executable file")?,
+            fs.read_shared(path.as_ref())
+                .map_err(|_| "Could not read executable file")?
+                .as_slice(),
             into_mem,
             name,
             slide_to_address,
@@ -1332,8 +1337,9 @@ impl MachO {
         into_mem: &mut Mem,
     ) -> Result<MachO, &'static str> {
         let mut image = Self::load_with_placement(
-            &fs.read(path)
-                .map_err(|_| "Could not read executable file")?,
+            fs.read_shared(path)
+                .map_err(|_| "Could not read executable file")?
+                .as_slice(),
             into_mem,
             path.file_name().unwrap().to_owned(),
             None,

@@ -13,10 +13,10 @@
 
 use crate::fs::{BundleData, Fs, GuestPath, GuestPathBuf};
 use crate::image::{Image, load_image_cached};
+use crate::property_list;
 use crate::window::{DeviceFamily, DeviceOrientation};
 use plist::dictionary::Dictionary;
 use plist::Value;
-use std::io::Cursor;
 
 #[derive(Debug)]
 pub struct Bundle {
@@ -35,8 +35,8 @@ impl Bundle {
     ) -> Result<(Bundle, Fs), String> {
         let plist_bytes = bundle_data.read_plist()?;
 
-        let plist = Value::from_reader(Cursor::new(plist_bytes))
-            .map_err(|_| "Could not deserialize plist data".to_string())?;
+        let plist = property_list::read(&plist_bytes)
+            .map_err(|error| format!("Could not deserialize Info.plist: {error}"))?;
 
         let plist = plist
             .into_dictionary()

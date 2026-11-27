@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automated tap-sequence smoke test for touchHLE/HyperHLE on Windows and Linux/X11.
+"""Automated tap-sequence smoke test for touchHLE/HyperHLE on Windows, macOS and Linux/X11.
 
 Launches the emulator with --print-fps, performs a sequence of taps at
 coordinates relative to the emulator window, captures screenshots and checks
@@ -25,7 +25,8 @@ A changing image alone does not prove that a game reached its menu.
 Use X,Y>END_X,END_Y@SECONDS for a held drag (SECONDS defaults to 0.5),
 for example --step '3:0.6,0.5>0.3,0.7@0.5' to aim and release a shot.
 
-Windows requires Pillow and pywin32. Linux/X11 requires xdotool, xwininfo,
+Windows requires Pillow and pywin32. macOS requires Pillow, pyobjc-framework-Quartz
+and a desktop session with screen capture and input access. Linux/X11 requires xdotool, xwininfo,
 and ImageMagick's import.
 """
 
@@ -46,6 +47,9 @@ if sys.platform == "win32":
     import win32con
     import win32gui
     from PIL import ImageGrab
+elif sys.platform == "darwin":
+    import AppKit
+    import Quartz
 
 FPS_RE = re.compile(r"(?:EAGLContext .*|Core Animation compositor) FPS: ([0-9.]+)")
 FRAME_TIMES_RE = re.compile(r"FRAME-TIMES context=(\S+) ms=([0-9.,]+)")
@@ -68,6 +72,17 @@ def find_window(process_id=None, pid_hint_title="touchHLE"):
         win32gui.EnumWindows(cb, None)
         candidates = found or fallback
         return candidates[0] if candidates else None
+    if sys.platform == "darwin":
+        windows = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements, 0)
+        candidates = [w for w in windows if w.get("kCGWindowLayer") == 0]
+        for window in candidates:
+            if window.get("kCGWindowOwnerPID") == process_id:
+                return window["kCGWindowNumber"]
+        for window in candidates:
+            if pid_hint_title.lower() in window.get("kCGWindowName", "").lower():
+                return window["kCGWindowNumber"]
+        return None
     if process_id is not None:
         result = subprocess.run(
             ["xdotool", "search", "--onlyvisible", "--pid", str(process_id)],
@@ -86,7 +101,28 @@ def find_window(process_id=None, pid_hint_title="touchHLE"):
     return int(ids[0]) if ids else None
 
 
+def mac_window_rects(hwnd):
+    windows = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionIncludingWindow, hwnd)
+    bounds = windows[0]["kCGWindowBounds"]
+    x, y, w, h = [int(bounds[k]) for k in ("X", "Y", "Width", "Height")]
+    full = (x, y, x + w, y + h)
+    screen = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
+    if w == screen.size.width and h == screen.size.height:
+        return full, full
+    content = AppKit.NSWindow.contentRectForFrameRect_styleMask_(
+        ((0, 0), (w, h)), AppKit.NSWindowStyleMaskTitled)
+    # Quartz coordinates start at the top-left. SDL's title bar is above the client.
+    return full, (x, y + h - int(content.size.height), x + w, y + h)
+
+
+def mac_mouse(event, x, y):
+    mouse = Quartz.CGEventCreateMouseEvent(None, event, (x, y), Quartz.kCGMouseButtonLeft)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, mouse)
+
+
 def client_rect(hwnd):
+    if sys.platform == "darwin":
+        return mac_window_rects(hwnd)[1]
     if sys.platform == "win32":
         left, top, right, bottom = win32gui.GetClientRect(hwnd)
         x0, y0 = win32gui.ClientToScreen(hwnd, (left, top))
@@ -115,6 +151,14 @@ def tap(hwnd, fx, fy, tap_count=1):
             win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
             time.sleep(0.06)
             win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
+            if n + 1 < tap_count:
+                time.sleep(0.08)
+    elif sys.platform == "darwin":
+        mac_mouse(Quartz.kCGEventMouseMoved, x, y)
+        for n in range(tap_count):
+            mac_mouse(Quartz.kCGEventLeftMouseDown, x, y)
+            time.sleep(0.06)
+            mac_mouse(Quartz.kCGEventLeftMouseUp, x, y)
             if n + 1 < tap_count:
                 time.sleep(0.08)
     else:
@@ -156,20 +200,25 @@ def drag(hwnd, position):
         raise ValueError("drag coordinates must be fractions between 0 and 1")
     x0, y0, x1, y1 = client_rect(hwnd)
 
-    def move(x, y):
+    def move(x, y, dragging=False):
         px, py = int(x0 + (x1 - x0) * x), int(y0 + (y1 - y0) * y)
         if sys.platform == "win32":
             win32api.SetCursorPos((px, py))
+        elif sys.platform == "darwin":
+            event = Quartz.kCGEventLeftMouseDragged if dragging else Quartz.kCGEventMouseMoved
+            mac_mouse(event, px, py)
         else:
             subprocess.run(["xdotool", "mousemove", "--sync", "--window",
                             str(hwnd), str(px), str(py)], check=True)
 
     if sys.platform == "win32":
         win32gui.SetForegroundWindow(hwnd)
-    else:
+    elif sys.platform != "darwin":
         subprocess.run(["xdotool", "windowfocus", "--sync", str(hwnd)], check=True)
     move(fx, fy)
-    if sys.platform == "win32":
+    if sys.platform == "darwin":
+        mac_mouse(Quartz.kCGEventLeftMouseDown, x0 + (x1 - x0) * fx, y0 + (y1 - y0) * fy)
+    elif sys.platform == "win32":
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
     else:
         subprocess.run(["xdotool", "mousedown", "1"], check=True)
@@ -178,9 +227,11 @@ def drag(hwnd, position):
         for index in range(1, steps + 1):
             time.sleep(duration / steps)
             fraction = index / steps
-            move(fx + (ex - fx) * fraction, fy + (ey - fy) * fraction)
+            move(fx + (ex - fx) * fraction, fy + (ey - fy) * fraction, dragging=True)
     finally:
-        if sys.platform == "win32":
+        if sys.platform == "darwin":
+            mac_mouse(Quartz.kCGEventLeftMouseUp, x0 + (x1 - x0) * ex, y0 + (y1 - y0) * ey)
+        elif sys.platform == "win32":
             win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
         else:
             subprocess.run(["xdotool", "mouseup", "1"], check=True)
@@ -189,6 +240,16 @@ def drag(hwnd, position):
 def screenshot(hwnd, path):
     if sys.platform == "win32":
         ImageGrab.grab(bbox=client_rect(hwnd), all_screens=True).save(path)
+    elif sys.platform == "darwin":
+        from PIL import Image
+        outer, client = mac_window_rects(hwnd)
+        subprocess.run(["screencapture", "-x", "-o", "-l", str(hwnd), str(path)], check=True)
+        # The captured window can be at Retina backing resolution.
+        with Image.open(path) as frame:
+            scale = frame.height / (outer[3] - outer[1])
+            top = round((client[1] - outer[1]) * scale)
+            pixels = frame.crop((0, top, frame.width, frame.height))
+        pixels.save(path)
     else:
         subprocess.run(
             ["import", "-window", f"0x{hwnd:x}", str(path)], check=True
@@ -196,7 +257,7 @@ def screenshot(hwnd, path):
 
 
 def has_nonblack_pixels(path):
-    if sys.platform == "win32":
+    if sys.platform in ("win32", "darwin"):
         from PIL import Image
 
         with Image.open(path) as frame:
@@ -209,7 +270,7 @@ def has_nonblack_pixels(path):
 
 
 def frames_differ(first, final):
-    if sys.platform == "win32":
+    if sys.platform in ("win32", "darwin"):
         from PIL import Image, ImageChops
 
         with Image.open(first) as a, Image.open(final) as b:
@@ -229,7 +290,7 @@ def frames_differ(first, final):
 
 def has_frame_content(path):
     """Reject a uniform gray/black/white surface as evidence of game progress."""
-    if sys.platform == "win32":
+    if sys.platform in ("win32", "darwin"):
         from PIL import Image, ImageStat
 
         with Image.open(path) as frame:
@@ -241,16 +302,16 @@ def has_frame_content(path):
     return float(result.stdout) > 1.0 / 255.0
 
 
-def write_metrics(out, fps_samples, frame_intervals):
+def write_metrics(out, fps_samples, frame_intervals, startup):
     with (out / "fps.csv").open("w", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(["elapsed_seconds", "source", "fps"])
         writer.writerows(fps_samples)
     with (out / "frame-times.csv").open("w", newline="") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["context", "interval_ms"])
+        writer.writerow(["context", "interval_ms", "estimated_end_elapsed_seconds"])
         writer.writerows(frame_intervals)
-    values = sorted(ms for _, ms in frame_intervals)
+    values = sorted(ms for _, ms, _ in frame_intervals)
     metrics = {"fps_samples": len(fps_samples), "frame_time_samples": len(values)}
     if values:
         def percentile(fraction):
@@ -261,6 +322,7 @@ def write_metrics(out, fps_samples, frame_intervals):
 
         metrics.update(mean_ms=statistics.mean(values), p50_ms=percentile(0.5),
                        p95_ms=percentile(0.95), p99_ms=percentile(0.99), max_ms=max(values))
+    metrics["startup_elapsed_seconds"] = startup
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
     return metrics
 
@@ -302,8 +364,8 @@ def main():
     p.add_argument("--require-frame-content", action="store_true")
     p.add_argument("--require-eagl-frames", action="store_true")
     args = p.parse_args(argv)
-    if sys.platform not in ("win32", "linux"):
-        p.error("This script supports Windows and Linux/X11 hosts.")
+    if sys.platform not in ("win32", "darwin", "linux"):
+        p.error("This script supports Windows, macOS and Linux/X11 hosts.")
 
     if args.require_frame_change and not args.step:
         p.error("--require-frame-change needs at least one --step screenshot")
@@ -325,6 +387,7 @@ def main():
     env["RUST_BACKTRACE"] = "full"
     if args.require_touch_delivery:
         env["TOUCHHLE_TRACE_TOUCHES"] = "1"
+    start = time.monotonic()
     try:
         proc = subprocess.Popen(
             [str(exe), str(app), "--print-fps", *extra],
@@ -340,22 +403,43 @@ def main():
     fps_rows = []
     frame_intervals = []
 
-    start = time.time()
+    startup = {}
+    markers = (
+        ("bundle_info", "App bundle info:"),
+        ("first_macho_slice", "::mach_o: Loading "),
+        ("dyld_initial_link", "::dyld: Guest C++ SjLj runtime available:"),
+        ("guest_cpu_begin", "CPU emulation begins now."),
+        ("first_texture_upload", "First glTexImage2D("),
+        ("first_present_call", "[EAGLContext presentRenderbuffer:] first call"),
+    )
 
     def reader():
         for raw in proc.stdout:
+            now = time.monotonic()
+            elapsed = now - start
             line = raw.decode("utf-8", "replace")
-            log.write(f"[{time.time() - start:7.2f}] {line}")
+            log.write(f"[{elapsed:7.2f}] {line}")
+            if len(startup) < len(markers):
+                for name, marker in markers:
+                    if name not in startup and marker in line:
+                        startup[name] = round(elapsed, 4)
             log.flush()
             m = FPS_RE.search(line)
             if m:
-                fps_samples.append((time.time(), float(m.group(1))))
+                fps_samples.append((now, float(m.group(1))))
                 source = "compositor" if "Core Animation compositor" in line else "EAGL"
-                fps_rows.append((time.time() - start, source, float(m.group(1))))
+                fps_rows.append((elapsed, source, float(m.group(1))))
             frame_times = FRAME_TIMES_RE.search(line)
             if frame_times:
-                frame_intervals.extend((frame_times.group(1), float(ms))
-                                       for ms in frame_times.group(2).split(","))
+                # The emulator writes one batch per GL context. Work backwards
+                # from receipt of its last interval to locate hitches in the run.
+                batch = [float(ms) for ms in frame_times.group(2).split(",")]
+                end = elapsed
+                rows = []
+                for ms in reversed(batch):
+                    rows.append((frame_times.group(1), ms, round(end, 4)))
+                    end -= ms / 1000
+                frame_intervals.extend(reversed(rows))
 
     reader_thread = threading.Thread(target=reader, daemon=True)
     reader_thread.start()
@@ -372,7 +456,7 @@ def main():
         proc.wait()
         reader_thread.join()
         log.close()
-        write_metrics(out, fps_rows, frame_intervals)
+        write_metrics(out, fps_rows, frame_intervals, startup)
         print(
             f"FAIL: emulator window never appeared (exit code {proc.returncode}); "
             f"log: {log_path}"
@@ -427,7 +511,7 @@ def main():
             elif len(fps_samples) < 3 or all(f == 0 for f in tail):
                 print("FAIL: frames are not being presented")
                 ok = False
-            elif time.time() - fps_samples[-1][0] > 3.0:
+            elif time.monotonic() - fps_samples[-1][0] > 3.0:
                 print("FAIL: frame counter stopped updating before the final check")
                 ok = False
             if args.require_nonblack_frame and not has_nonblack_pixels(out / "final.png"):
@@ -453,7 +537,7 @@ def main():
     proc.wait()
     reader_thread.join()
     log.close()
-    metrics = write_metrics(out, fps_rows, frame_intervals)
+    metrics = write_metrics(out, fps_rows, frame_intervals, startup)
     if frame_intervals:
         print(f"Game frame intervals (ms): {metrics}")
     log_text = log_path.read_text(encoding="utf-8", errors="replace")

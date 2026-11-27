@@ -54,7 +54,9 @@ pub fn tsd_array_for_thread(env: &mut Environment, thread: ThreadId) -> MutPtr<M
     {
         return array;
     }
-    let array: MutPtr<MutVoidPtr> = env.mem.calloc(TSD_SLOTS * 4).cast();
+    // One private byte after the visible array for each key. A set byte
+    // means that the host validated a write to this key on this thread.
+    let array: MutPtr<MutVoidPtr> = env.mem.calloc(TSD_SLOTS * (4 + 1)).cast();
     assert!(!array.is_null(), "Could not allocate thread-specific data");
     let arrays = &mut get_state(env).tsd_arrays;
     if arrays.len() <= thread {
@@ -62,6 +64,44 @@ pub fn tsd_array_for_thread(env: &mut Environment, thread: ThreadId) -> MutPtr<M
     }
     arrays[thread] = Some(array);
     array
+}
+
+fn validated_slot(array: MutPtr<MutVoidPtr>, key: pthread_key_t) -> MutPtr<u8> {
+    (array + TSD_SLOTS).cast::<u8>() + key
+}
+
+/// ARM entry sequences for the exported functions. Both fall through to the
+/// ordinary SVC when host state is needed. Only the getter reads reserved
+/// slots. The setter must validate even NULL values on the first set, which
+/// can establish a static key's destructor. Deletion clears its flag on all
+/// threads before the key can be reused.
+/// https://github.com/apple-oss-distributions/libpthread/blob/libpthread-137.1.1/src/pthread_tsd.c
+pub(crate) fn guest_function_prefix(symbol: &str) -> &'static [u32] {
+    const _: () = assert!(TSD_SLOTS == 512);
+    match symbol {
+        "_pthread_getspecific" => &[
+            0xe3500c02, // cmp r0, #512
+            0x2a000003, // bhs slow
+            0xee1d1f70, // mrc p15, 0, r1, c13, c0, 3 (TPIDRURO)
+            0xe3510000, // cmp r1, #0
+            0x17910100, // ldrne r0, [r1, r0, lsl #2]
+            0x112fff1e, // bxne lr
+        ],
+        "_pthread_setspecific" => &[
+            0xe3500c02, // cmp r0, #512
+            0x2a000008, // bhs slow
+            0xee1d2f70, // mrc p15, 0, r2, c13, c0, 3 (TPIDRURO)
+            0xe3520000, // cmp r2, #0
+            0x0a000005, // beq slow
+            0xe2823b02, // add r3, r2, #2048 (validation bytes)
+            0xe7d33000, // ldrb r3, [r3, r0]
+            0xe3530000, // cmp r3, #0
+            0x17821100, // strne r1, [r2, r0, lsl #2]
+            0x13a00000, // movne r0, #0
+            0x112fff1e, // bxne lr
+        ],
+        _ => &[],
+    }
 }
 
 fn get_state(env: &mut Environment) -> &mut State {
@@ -129,6 +169,7 @@ fn pthread_setspecific(env: &mut Environment, key: pthread_key_t, value: ConstVo
     let current_thread = env.current_thread;
     let array = tsd_array_for_thread(env, current_thread);
     env.mem.write(array + key, value.cast_mut());
+    env.mem.write(validated_slot(array, key), 1);
     0
 }
 
@@ -143,6 +184,7 @@ fn pthread_key_delete(env: &mut Environment, key: pthread_key_t) -> i32 {
     }
     for &array in env.libc_state.pthread.key.tsd_arrays.iter().flatten() {
         env.mem.write(array + key, Ptr::null());
+        env.mem.write(validated_slot(array, key), 0);
     }
     0
 }
