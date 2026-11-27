@@ -4,6 +4,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 #include <atomic>
+#include "dynarmic/frontend/A32/a32_ir_emitter.h"
+#include "dynarmic/ir/basic_block.h"
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -87,6 +89,19 @@ private:
       cpu->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
     }
     return value;
+  }
+
+  bool PreCodeReadHook(bool thumb, VAddr pc, Dynarmic::A32::IREmitter &ir) override {
+    if (ir.block.CycleCount() == 512) {
+      const auto &r = cpu->Regs();
+      fprintf(stderr, "LONG BLOCK start=%08x pc=%08x thumb=%d regs=", Dynarmic::A32::LocationDescriptor(ir.block.Location()).PC(), pc, thumb);
+      for (auto value : r) fprintf(stderr, "%08x ", value);
+      fprintf(stderr, "stack=");
+      for (unsigned i = 0; i < 16; ++i) { bool error; fprintf(stderr, "%08x ", touchHLE_cpu_read_u32(mem, r[13]+4*i, &error)); }
+      fprintf(stderr, "\n");
+      fflush(stderr);
+    }
+    return true;
   }
 
   std::optional<std::uint32_t> MemoryReadCode(VAddr vaddr) override {
