@@ -8,8 +8,8 @@ on:
       - dev-scripts/ai-tap-sequence.py
   workflow_dispatch:
     inputs:
-      build_run:
-        description: Run containing HyperHLE_Linux_x86_64
+      cases:
+        description: "JSON array of {label, run, artifact, runner, fixture} objects"
         required: true
         type: string
       draft:
@@ -20,21 +20,14 @@ on:
         description: Expected SHA-256 of game.ipa
         required: true
         type: string
-      xml_control:
-        description: Also run a copy with trailing text removed from the XML Info.plist
-        type: boolean
-        default: false
       steps:
         description: Space-separated WAIT:X,Y steps for ai-tap-sequence.py
         type: string
-      runner:
-        description: Linux x86_64 runner label
-        type: string
-        default: ubuntu-latest
 
 jobs:
   measure:
-    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 18
     permissions:
       actions: read
@@ -42,12 +35,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        fixture: ${{ fromJSON((inputs.xml_control || github.event_name == 'push') && '["original","xml-control"]' || '["original"]') }}
+        include: ${{ fromJSON(inputs.cases || '[{"label":"linux-trunk-control","run":"45892776653","artifact":"HyperHLE_Linux_x86_64","runner":"ubuntu-latest","fixture":"xml-control"},{"label":"mac-trunk-control","run":"45892776653","artifact":"HyperHLE_macOS_AArch64","runner":"macos-15","fixture":"xml-control"}]') }}
     env:
-      BUILD_RUN: ${{ inputs.build_run }}
+      BUILD_RUN: ${{ matrix.run }}
       DRAFT: ${{ inputs.draft || 'ci-private-perf-20261127' }}
       FIXTURE_HASH: ${{ inputs.sha256 || 'e2b6ae966cbce30fe027136debd63d01e18956c8c21592c6d692472db09eb0ba' }}
-      STEPS: ${{ inputs.steps || '1:- 15:- 30:- 30:- 30:-' }}
+      STEPS: ${{ inputs.steps || '1:- 12:0.50,0.64 3:- 6:0.50,0.64 10:- 25:- 20:-' }}
       ALSOFT_DRIVERS: 'null'
       TOUCHHLE_FRAME_TIMES: '1'
     steps:
@@ -59,28 +52,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p results "$RUNNER_TEMP/fixture"
-          if [[ -z "$BUILD_RUN" ]]; then
-            case "$GITHUB_REF_NAME" in
-              profile/build/*) BUILD_RUN=${GITHUB_REF_NAME##*/} ;;
-              *) BUILD_RUN=45892776653 ;;
-            esac
-          fi
-          [[ "$BUILD_RUN" =~ ^[0-9]+$ ]]
-          echo "BUILD_RUN=$BUILD_RUN" >> "$GITHUB_ENV"
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN" --jq '{id,head_sha,html_url}' > results/build.json
           test "$(gh release view "$DRAFT" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
           gh release download "$DRAFT" --repo "$GITHUB_REPOSITORY" --pattern game.ipa --dir "$RUNNER_TEMP/fixture"
           cd "$RUNNER_TEMP/fixture"
-          actual=$(sha256sum game.ipa)
+          actual=$(shasum -a 256 game.ipa)
           test "${actual%% *}" = "$FIXTURE_HASH"
           echo "$actual" > "$GITHUB_WORKSPACE/results/source.sha256"
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
           run-id: ${{ env.BUILD_RUN }}
-          name: HyperHLE_Linux_x86_64
+          name: ${{ matrix.artifact }}
           path: emulator
-      - name: Install runtime tools and identify renderer
+      - name: Install Linux runtime tools and identify renderer
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends xvfb xdotool x11-utils imagemagick mesa-utils libsndio-dev zip sysstat
@@ -94,6 +80,19 @@ jobs:
           ls -l /dev/dri > results/gpu-devices.txt 2>&1 || true
           lscpu > results/cpu.txt
           chmod +x emulator/touchHLE
+      - name: Prepare Apple Silicon emulator and record Metal hardware
+        if: runner.os == 'macOS'
+        run: |
+          mountpoint="$RUNNER_TEMP/emulator-disk"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mountpoint" emulator/*.dmg
+          # Run the unbundled binary so each launch uses its own working directory.
+          cp "$mountpoint"/*.app/Contents/MacOS/touchHLE emulator/
+          cp -R "$mountpoint"/*.app/Contents/Resources/touchHLE_* emulator/
+          hdiutil detach "$mountpoint"
+          system_profiler SPDisplaysDataType SPHardwareDataType > results/hardware.txt
+          python3 -m venv "$RUNNER_TEMP/game-python"
+          "$RUNNER_TEMP/game-python/bin/pip" install --disable-pip-version-check pillow pyobjc-framework-Quartz
+          echo "$RUNNER_TEMP/game-python/bin" >> "$GITHUB_PATH"
       - name: Create labelled XML control inside the runner
         if: matrix.fixture == 'xml-control'
         working-directory: ${{ runner.temp }}/fixture
@@ -121,8 +120,10 @@ jobs:
           read -r -a steps <<< "$STEPS"
           args=()
           for step in "${steps[@]}"; do args+=(--step "$step"); done
-          sha256sum "$RUNNER_TEMP/fixture/game.ipa" > results/tested.sha256
-          pidstat -h -u -w -r -t -C touchHLE 1 > results/pidstat.txt &
+          shasum -a 256 "$RUNNER_TEMP/fixture/game.ipa" > results/tested.sha256
+          if command -v pidstat >/dev/null; then
+            pidstat -h -u -w -r -t -C touchHLE 1 > results/pidstat.txt &
+          fi
           python3 dev-scripts/ai-tap-sequence.py "$RUNNER_TEMP/fixture/game.ipa" \
             --exe emulator/touchHLE --cwd emulator --out results/timed \
             "${args[@]}" --final-wait 20 --require-nonblack-frame --require-frame-content --require-eagl-frames \
@@ -150,5 +151,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: game-performance-${{ matrix.fixture }}
+          name: game-performance-${{ matrix.label }}
           path: results/
