@@ -1947,32 +1947,143 @@ fn glResolveMultisampleFramebufferAPPLE(env: &mut Environment) {
         gles.ResolveMultisampleFramebufferAPPLE()
     })
 }
+enum FramebufferHint {
+    Discard,
+    Invalidate,
+    Region(GLint, GLint, GLsizei, GLsizei),
+}
+
+/// EXT_discard_framebuffer and ES3 invalidation share the default framebuffer
+/// enums (COLOR, DEPTH, STENCIL) and named attachment enums. EXT accepts only
+/// FRAMEBUFFER and COLOR_ATTACHMENT0, DEPTH_ATTACHMENT or STENCIL_ATTACHMENT
+/// for a named framebuffer.
+fn framebuffer_hint(
+    env: &mut Environment,
+    hint: FramebufferHint,
+    target: GLenum,
+    count: GLsizei,
+    attachments: ConstPtr<GLenum>,
+) {
+    use crate::gles::gles30_raw as gl;
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let ext = matches!(hint, FramebufferHint::Discard);
+        if target != gl::FRAMEBUFFER
+            && (ext || !matches!(target, gl::READ_FRAMEBUFFER | gl::DRAW_FRAMEBUFFER))
+        {
+            shadow.record_error(gl::INVALID_ENUM);
+            return;
+        }
+        let Some(len) = u32::try_from(count).ok().and_then(|n| n.checked_mul(4)) else {
+            shadow.record_error(gl::INVALID_VALUE);
+            return;
+        };
+        if (len != 0 && attachments.is_null())
+            || matches!(hint, FramebufferHint::Region(_, _, w, h) if w < 0 || h < 0)
+        {
+            shadow.record_error(gl::INVALID_VALUE);
+            return;
+        }
+        if count == 0 {
+            return;
+        }
+        let bytes = mem.bytes_at(attachments.cast(), len);
+        let pointer = bytes.as_ptr().cast();
+
+        if ext && gles.discard_ext_supported() {
+            gles.DiscardFramebufferEXT(target, count, pointer);
+            return;
+        }
+        let extension_attachment = |a| {
+            matches!(
+                a,
+                gl::COLOR
+                    | gl::DEPTH
+                    | gl::STENCIL
+                    | gl::COLOR_ATTACHMENT0
+                    | gl::DEPTH_ATTACHMENT
+                    | gl::STENCIL_ATTACHMENT
+            )
+        };
+        let enums = || {
+            bytes
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        };
+        if ext && !enums().all(extension_attachment) {
+            shadow.record_error(gl::INVALID_ENUM);
+            return;
+        }
+        if gles.supports_framebuffer_invalidation() {
+            match hint {
+                FramebufferHint::Region(x, y, w, h) => {
+                    gles.InvalidateSubFramebuffer(target, count, pointer, x, y, w, h)
+                }
+                _ => gles.InvalidateFramebuffer(target, count, pointer),
+            }
+            return;
+        }
+
+        // Validate even on drivers where the hint itself can be ignored.
+        let mut framebuffer = 0;
+        let binding = if target == gl::READ_FRAMEBUFFER && gles.is_es3() {
+            gl::READ_FRAMEBUFFER_BINDING
+        } else {
+            gl::FRAMEBUFFER_BINDING
+        };
+        gles.GetIntegerv(binding, &mut framebuffer);
+        let mut ext_compatible = true;
+        for attachment in enums() {
+            let default_buffer = matches!(attachment, gl::COLOR | gl::DEPTH | gl::STENCIL);
+            if default_buffer != (framebuffer == 0) {
+                shadow.record_error(gl::INVALID_ENUM);
+                return;
+            }
+            if extension_attachment(attachment) {
+                continue;
+            }
+            ext_compatible = false;
+            if attachment == gl::DEPTH_STENCIL_ATTACHMENT {
+                continue;
+            }
+            if (gl::COLOR_ATTACHMENT0..=gl::COLOR_ATTACHMENT31).contains(&attachment) {
+                let mut max_colors = 1;
+                if gles.is_es3() {
+                    gles.GetIntegerv(gl::MAX_COLOR_ATTACHMENTS, &mut max_colors);
+                }
+                if attachment - gl::COLOR_ATTACHMENT0 >= max_colors as u32 {
+                    shadow.record_error(gl::INVALID_OPERATION);
+                    return;
+                }
+            } else {
+                shadow.record_error(gl::INVALID_ENUM);
+                return;
+            }
+        }
+        // A whole-framebuffer discard cannot implement a subrectangle or a
+        // separately bound read framebuffer.
+        if matches!(hint, FramebufferHint::Invalidate)
+            && target == gl::FRAMEBUFFER
+            && ext_compatible
+            && gles.discard_ext_supported()
+        {
+            gles.DiscardFramebufferEXT(target, count, pointer);
+        }
+    });
+}
+
 fn glDiscardFramebufferEXT(
     env: &mut Environment,
     target: GLenum,
-    numAttachments: GLsizei,
+    num_attachments: GLsizei,
     attachments: ConstPtr<GLenum>,
 ) {
-    // GL_EXT_discard_framebuffer is a bandwidth hint. On tile-based GPUs
-    // (ARM Mali, Qualcomm Adreno, PowerVR) honouring it lets the driver skip
-    // writing tile memory back to system RAM at the end of the frame. The
-    // guest attachment enums (GL_COLOR_EXT / GL_DEPTH_EXT / GL_STENCIL_EXT)
-    // share their values with the host extension, so forward them unchanged.
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        // Discarding is only a bandwidth hint; on backends without
-        // GL_EXT_discard_framebuffer there is nothing to forward, and asking
-        // anyway would log an "unimplemented GLES API" warning per frame.
-        if !gles.discard_ext_supported() {
-            return;
-        }
-        let n = numAttachments.max(0) as GuestUSize;
-        let ptr = if n == 0 || attachments.is_null() {
-            std::ptr::null()
-        } else {
-            mem.bytes_at(attachments.cast(), n * 4).as_ptr().cast()
-        };
-        gles.DiscardFramebufferEXT(target, numAttachments, ptr);
-    });
+    framebuffer_hint(
+        env,
+        FramebufferHint::Discard,
+        target,
+        num_attachments,
+        attachments,
+    );
 }
 
 /// `glPushGroupMarkerEXT` — debug marker from `GL_EXT_debug_marker`.
@@ -7844,10 +7955,13 @@ fn glInvalidateFramebuffer(
     num_attachments: GLsizei,
     attachments: ConstPtr<GLenum>,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let slice = mem.bytes_at(attachments.cast(), (num_attachments as GuestUSize) * 4);
-        gles.InvalidateFramebuffer(target, num_attachments, slice.as_ptr().cast())
-    });
+    framebuffer_hint(
+        env,
+        FramebufferHint::Invalidate,
+        target,
+        num_attachments,
+        attachments,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7861,18 +7975,13 @@ fn glInvalidateSubFramebuffer(
     width: GLsizei,
     height: GLsizei,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        let slice = mem.bytes_at(attachments.cast(), (num_attachments as GuestUSize) * 4);
-        gles.InvalidateSubFramebuffer(
-            target,
-            num_attachments,
-            slice.as_ptr().cast(),
-            x,
-            y,
-            width,
-            height,
-        )
-    });
+    framebuffer_hint(
+        env,
+        FramebufferHint::Region(x, y, width, height),
+        target,
+        num_attachments,
+        attachments,
+    );
 }
 
 // -- 3D textures and immutable storage --
