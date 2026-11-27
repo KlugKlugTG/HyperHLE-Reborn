@@ -965,10 +965,6 @@ fn dispatch_semaphore_wait(env: &mut Environment, sem: dispatch_semaphore_t, tim
         log!("dispatch_semaphore_wait: unknown semaphore {:?}", sem);
         return -1;
     };
-    // `DISPATCH_TIME_NOW` means "poll": return non-zero instead of blocking
-    // when the semaphore is unavailable. Any other timeout blocks; we do not
-    // model a finite timeout yet, so those wait until signalled (documented
-    // below) rather than spinning.
     if timeout == DISPATCH_TIME_NOW {
         if env.sem_decrement(backing, false) {
             0
@@ -998,15 +994,8 @@ fn dispatch_semaphore_wait(env: &mut Environment, sem: dispatch_semaphore_t, tim
         }
         0
     } else {
-        // Finite timeout: wait up to `timeout` and return non-zero (timed out)
-        // if no signal arrives. This MUST be honored, not treated as infinite:
-        // touchHLE's `dispatch_time(DISPATCH_TIME_NOW, ns)` returns the
-        // relative nanosecond delta (it adds to a zero base), so `timeout` is
-        // that duration. Telltale's `PlatformSemaphore::TimedWait` — the
-        // render thread's frame handshake — depends on the wait actually
-        // timing out so the render loop can poll and advance; treating it as
-        // infinite deadlocked `RenderThread::FinishFrame` (the frozen-spinner
-        // hang). Poll like semaphore_timedwait does.
+        // dispatch_time currently expresses finite deadlines in relative
+        // nanoseconds in the guest clock's time domain.
         if crate::env_flag_cached!("TOUCHHLE_TRACE_DISPATCHSEM") {
             log!(
                 "DSEM t={} timedwait-enter sem={:#x} timeout_ns={} lr={:#x}",
@@ -1018,18 +1007,10 @@ fn dispatch_semaphore_wait(env: &mut Environment, sem: dispatch_semaphore_t, tim
         }
         let timeout_ns = timeout.min(3_600_000_000_000); // cap at 1 hour
         let deadline = env.guest_clock.now() + std::time::Duration::from_nanos(timeout_ns);
-        const POLL: std::time::Duration = std::time::Duration::from_millis(1);
-        loop {
-            if env.sem_decrement(backing, false) {
-                return 0;
-            }
-            let now = env.guest_clock.now();
-            if now >= deadline {
-                // Timed out: dispatch_semaphore_wait returns non-zero.
-                return 1;
-            }
-            env.sleep_guest((deadline - now).min(POLL));
-        }
+        i32::from(
+            env.wait_semaphore(backing, Some(deadline), None)
+                != crate::libc::semaphore::WaitResult::Acquired,
+        )
     }
 }
 
@@ -1047,10 +1028,12 @@ fn dispatch_semaphore_signal(env: &mut Environment, sem: dispatch_semaphore_t) -
             env.cpu.regs()[14]
         );
     }
-    env.sem_increment(backing);
-    // Returns non-zero if a thread was woken. We do not track that here, and
-    // every in-tree caller ignores the result.
-    0
+    let object = &env.libc_state.semaphore.open_semaphores[&backing];
+    i32::from(
+        object
+            .borrow_mut()
+            .signal(&env.guest_clock, crate::libc::semaphore::Signal::One),
+    )
 }
 
 /// Release the backing semaphore for a dispatch semaphore handle, if `obj` is

@@ -17,7 +17,7 @@ use crate::export_c_func;
 use crate::libc::mach::arm::task::task_t;
 use crate::libc::mach::init::MACH_TASK_SELF;
 use crate::libc::mach::thread_info::{kern_return_t, KERN_INVALID_ARGUMENT, KERN_SUCCESS};
-use crate::libc::semaphore::{sem_destroy, sem_init, sem_post, sem_t, sem_wait};
+use crate::libc::semaphore::{sem_destroy, sem_init, sem_post, sem_t, Signal, WaitResult};
 use crate::mem::MutPtr;
 
 // Opaque type. Reusing sem_t for convenience
@@ -29,18 +29,17 @@ type semaphore_t = MutPtr<semaphore>;
 /// below return when the timeout expires before the semaphore is acquired.
 const KERN_OPERATION_TIMED_OUT: kern_return_t = 49;
 
-/// Upper bound applied to the `tv_sec` of a timed wait. Mach semaphores are
-/// never legitimately waited on for longer than this, and clamping keeps a
-/// garbage (e.g. `UINT32_MAX`) timeout from overflowing the `Instant`
-/// arithmetic below.
-const MAX_TIMED_WAIT_SECS: u32 = 3600;
+const KERN_TERMINATED: kern_return_t = 37;
+const KERN_NOT_WAITING: kern_return_t = 48;
 
-/// How long a timed wait parks the guest thread between acquisition attempts.
-/// Mach semaphores have no deadline-aware block in our scheduler (the
-/// `ThreadBlock::Semaphore` variant is woken only by `sem_post`), so timed
-/// waits poll. 1ms is well below the granularity any Apple audio/engine worker
-/// uses (they typically wait in 5–50ms slices) while costing almost nothing.
-const TIMED_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+fn mach_wait_result(result: WaitResult) -> kern_return_t {
+    match result {
+        WaitResult::Acquired => KERN_SUCCESS,
+        WaitResult::TimedOut => KERN_OPERATION_TIMED_OUT,
+        WaitResult::Invalid => KERN_INVALID_ARGUMENT,
+        WaitResult::Destroyed => KERN_TERMINATED,
+    }
+}
 
 /// DIAG (TOUCHHLE_TRACE_MACHSEM=1): trace Mach semaphore traffic. FMOD drives
 /// its async/bank-loader threads entirely through these, so a lost signal shows
@@ -128,66 +127,44 @@ fn semaphore_signal(env: &mut Environment, semaphore: semaphore_t) -> kern_retur
 
 /// `kern_return_t semaphore_signal_all(semaphore_t semaphore)`
 ///
-/// Wakes *every* thread waiting on the semaphore. Mach does that by releasing
-/// one unit per waiter, which is what we do here (a single `sem_post` would
-/// only wake the first one and leave the rest blocked forever).
+/// XNU wakes all current waiters, or preposts one unit if nobody is waiting.
 fn semaphore_signal_all(env: &mut Environment, semaphore: semaphore_t) -> kern_return_t {
-    // `.cloned()` so the `Rc` is owned: the loop below needs `&mut env` for
-    // `sem_post` and must not be holding a borrow of `env.libc_state`.
-    let Some(host_sem_rc) = env
-        .libc_state
-        .semaphore
-        .open_semaphores
-        .get(&semaphore)
-        .cloned()
-    else {
-        log!(
-            "Warning: semaphore_signal_all({:?}) called with an unknown \
-             semaphore; returning KERN_INVALID_ARGUMENT.",
-            semaphore
-        );
+    let Some(object) = env.libc_state.semaphore.open_semaphores.get(&semaphore) else {
         return KERN_INVALID_ARGUMENT;
     };
-    let waiters = {
-        let host_sem = host_sem_rc.borrow();
-        host_sem.waiting.len()
-    };
-    drop(host_sem_rc);
-    for _ in 0..waiters.max(1) {
-        // `sem_post` re-looks-up the semaphore and reports EINVAL for a stale
-        // handle; ignore the result, the validity check above already covers
-        // the interesting failure mode.
-        let _ = sem_post(env, semaphore);
-    }
-    let result = KERN_SUCCESS;
-    log_dbg!(
-        "semaphore_signal_all({:?}) woke {} waiter(s) -> {:?}",
-        semaphore,
-        waiters,
-        result
-    );
-    result
+    object.borrow_mut().signal(&env.guest_clock, Signal::All);
+    KERN_SUCCESS
 }
 
-/// `kern_return_t semaphore_signal_thread(semaphore_t semaphore, thread_act_t thread)`
-///
-/// Signals the semaphore only if the given thread is waiting on it. We don't
-/// track which thread a Mach semaphore port belongs to, so signal
-/// unconditionally: over-signalling is benign (the waiter wakes up, which is
-/// what the caller wanted) whereas under-signalling would deadlock it.
+/// A null thread port selects any waiter. A targeted signal never preposts.
+/// https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/sync_sema.c
 fn semaphore_signal_thread(
     env: &mut Environment,
     semaphore: semaphore_t,
     thread: u32,
 ) -> kern_return_t {
-    let result = semaphore_signal(env, semaphore);
-    log_dbg!(
-        "semaphore_signal_thread({:?}, thread {:?}) -> {:?}",
-        semaphore,
-        thread,
-        result
-    );
-    result
+    let Some(object) = env.libc_state.semaphore.open_semaphores.get(&semaphore) else {
+        return KERN_INVALID_ARGUMENT;
+    };
+    let target = if thread == 0 {
+        None
+    } else {
+        let Some(id) = crate::libc::pthread::thread::thread_id_from_mach_thread_port(
+            thread,
+            env.threads.len(),
+        ) else {
+            return KERN_INVALID_ARGUMENT;
+        };
+        Some(id)
+    };
+    if object
+        .borrow_mut()
+        .signal(&env.guest_clock, Signal::Thread(target))
+    {
+        KERN_SUCCESS
+    } else {
+        KERN_NOT_WAITING
+    }
 }
 
 // Opt-in deadlock-breaker for the otherwise-infinite `semaphore_wait`,
@@ -238,36 +215,12 @@ fn semaphore_wait(env: &mut Environment, semaphore: semaphore_t) -> kern_return_
         .filter(|_| env.current_thread == 0)
         .map(Duration::from_millis);
     let deadline = spurious_wake_after.map(|after| env.guest_clock.now() + after);
-    let result = loop {
-        if env.sem_decrement(semaphore, false) {
-            break KERN_SUCCESS;
+    let result = match env.wait_semaphore(semaphore, deadline, None) {
+        WaitResult::TimedOut => {
+            log!("Warning: semaphore_wait({:?}) on thread {} reporting a spurious KERN_SUCCESS (--mach-semaphore-spurious-wake).", semaphore, env.current_thread);
+            KERN_SUCCESS
         }
-        if !is_known_semaphore(env, semaphore) {
-            break KERN_INVALID_ARGUMENT;
-        }
-        let Some(deadline) = deadline else {
-            // No breaker configured: block until signalled, like Mach does.
-            env.sleep_guest(TIMED_WAIT_POLL_INTERVAL);
-            continue;
-        };
-        let now = env.guest_clock.now();
-        if now >= deadline {
-            // Spurious wake: no real signal arrived in time. Report success
-            // so a re-check-on-wake worker loop makes progress. Say so
-            // loudly: if the guest is not one of those loops, this is where
-            // its state silently goes wrong.
-            log!(
-                "Warning: semaphore_wait({:?}) on thread {} timed out after \
-                 {} ms and is reporting a spurious KERN_SUCCESS \
-                 (--mach-semaphore-spurious-wake). The waiter will proceed \
-                 without having acquired the semaphore.",
-                semaphore,
-                env.current_thread,
-                spurious_wake_after.unwrap_or_default().as_millis()
-            );
-            break KERN_SUCCESS;
-        }
-        env.sleep_guest((deadline - now).min(TIMED_WAIT_POLL_INTERVAL));
+        result => mach_wait_result(result),
     };
     if crate::env_flag_cached!("TOUCHHLE_TRACE_MACHSEM") {
         let ret_lr = env.cpu.regs()[14];
@@ -343,90 +296,41 @@ fn semaphore_timedwait(
     tv_sec: u32,
     tv_nsec: u32,
 ) -> kern_return_t {
-    let secs = tv_sec.min(MAX_TIMED_WAIT_SECS);
-    let timeout = Duration::from_secs(u64::from(secs)) + Duration::from_nanos(u64::from(tv_nsec));
-    // Compare against the guest clock so the timeout follows the game-speed
-    // setting, exactly like `sleep_guest` does.
-    let deadline = env.guest_clock.now() + timeout;
-
-    loop {
-        if !is_known_semaphore(env, semaphore) {
-            log!(
-                "Warning: semaphore_timedwait({:?}) called with an unknown \
-                 semaphore; returning KERN_INVALID_ARGUMENT.",
-                semaphore
-            );
-            return KERN_INVALID_ARGUMENT;
-        }
-        if env.sem_decrement(semaphore, false) {
-            log_dbg!("semaphore_timedwait({:?}) -> {:?}", semaphore, KERN_SUCCESS);
-            return KERN_SUCCESS;
-        }
-        let now = env.guest_clock.now();
-        if now >= deadline {
-            log_dbg!(
-                "semaphore_timedwait({:?}, {}s {}ns) -> {:?}",
-                semaphore,
-                tv_sec,
-                tv_nsec,
-                KERN_OPERATION_TIMED_OUT
-            );
-            return KERN_OPERATION_TIMED_OUT;
-        }
-        // Park the thread (letting the scheduler run everybody else) and retry.
-        let remaining = deadline - now;
-        env.sleep_guest(remaining.min(TIMED_WAIT_POLL_INTERVAL));
-    }
+    timedwait(env, semaphore, None, tv_sec, tv_nsec)
 }
 
-/// `kern_return_t semaphore_wait_signal(semaphore_t wait_semaphore, semaphore_t signal_semaphore)`
-///
-/// Atomically waits on one semaphore and signals another — the classic
-/// hand-off used to pass a token between two worker threads.
-fn semaphore_wait_signal(
+fn timedwait(
     env: &mut Environment,
-    wait_semaphore: semaphore_t,
-    signal_semaphore: semaphore_t,
-) -> kern_return_t {
-    let result = if sem_wait(env, wait_semaphore) == 0 {
-        let _ = sem_post(env, signal_semaphore);
-        KERN_SUCCESS
-    } else {
-        KERN_INVALID_ARGUMENT
-    };
-    log_dbg!(
-        "semaphore_wait_signal({:?}, {:?}) -> {:?}",
-        wait_semaphore,
-        signal_semaphore,
-        result
-    );
-    result
-}
-
-/// `kern_return_t semaphore_timedwait_signal(semaphore_t wait_semaphore, semaphore_t signal_semaphore, mach_timespec_t wait_time)`
-///
-/// Timed variant of [semaphore_wait_signal]. The second semaphore is only
-/// signalled when the wait succeeded; on timeout nothing is posted (matching
-/// Mach, where the pair is described as atomic).
-fn semaphore_timedwait_signal(
-    env: &mut Environment,
-    wait_semaphore: semaphore_t,
-    signal_semaphore: semaphore_t,
+    semaphore: semaphore_t,
+    signal: Option<semaphore_t>,
     tv_sec: u32,
     tv_nsec: u32,
 ) -> kern_return_t {
-    let result = semaphore_timedwait(env, wait_semaphore, tv_sec, tv_nsec);
-    if result == KERN_SUCCESS {
-        let _ = sem_post(env, signal_semaphore);
+    if tv_nsec >= 1_000_000_000 {
+        return KERN_INVALID_ARGUMENT;
     }
-    log_dbg!(
-        "semaphore_timedwait_signal({:?}, {:?}, {}s) -> {:?}",
-        wait_semaphore,
-        signal_semaphore,
-        tv_sec,
-        result
-    );
-    result
+    let timeout = Duration::new(u64::from(tv_sec), tv_nsec);
+    let deadline = env.guest_clock.now() + timeout;
+    mach_wait_result(env.wait_semaphore(semaphore, Some(deadline), signal))
+}
+
+/// XNU enqueues the wait and signals the peer before blocking the caller.
+fn semaphore_wait_signal(
+    env: &mut Environment,
+    wait: semaphore_t,
+    signal: semaphore_t,
+) -> kern_return_t {
+    mach_wait_result(env.wait_semaphore(wait, None, Some(signal)))
+}
+
+fn semaphore_timedwait_signal(
+    env: &mut Environment,
+    wait: semaphore_t,
+    signal: semaphore_t,
+    tv_sec: u32,
+    tv_nsec: u32,
+) -> kern_return_t {
+    timedwait(env, wait, Some(signal), tv_sec, tv_nsec)
 }
 
 // https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/man/semaphore_destroy.html
