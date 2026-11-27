@@ -451,6 +451,13 @@ pub struct Options {
     pub dumping_options: DumpingOptions,
     pub dumping_file: PathBuf,
     pub ignore_gl_errors: bool,
+    /// Ignore `CFRunLoopStop` for the application's main run loop. Some
+    /// launcher-era apps bundle ad/analytics SDKs whose startup path stops the
+    /// main run loop when their (now dead) server can't be reached; on iOS that
+    /// ends `UIApplicationMain` and the app quits immediately, which looks like
+    /// a crash in the emulator. Opt-in so emulator behaviour stays faithful by
+    /// default.
+    pub ignore_main_runloop_stop: bool,
     /// Wrap every guest GL entry point with a `glGetError()` check after the
     /// call and log the source location (in `gles_guest.rs`) of any non-zero
     /// error. Useful when an app silently misrenders (e.g. a black screen
@@ -599,6 +606,7 @@ impl Default for Options {
             dumping_options: Default::default(),
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
             ignore_gl_errors: false,
+            ignore_main_runloop_stop: false,
             trace_gl_errors: false,
             verbose_gles: false,
             gles_native: false,
@@ -954,6 +962,10 @@ impl Options {
             self.dumping_file = crate::paths::user_data_base_path().join(path);
         } else if arg == "--ignore-gl-errors" {
             self.ignore_gl_errors = true;
+        } else if arg == "--ignore-main-runloop-stop" {
+            self.ignore_main_runloop_stop = true;
+        } else if arg == "--no-ignore-main-runloop-stop" {
+            self.ignore_main_runloop_stop = false;
         } else if arg == "--trace-gl-errors" {
             self.trace_gl_errors = true;
         } else if arg == "--no-trace-gl-errors" {

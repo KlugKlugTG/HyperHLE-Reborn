@@ -1989,8 +1989,14 @@ fn framebuffer_hint(
         let bytes = mem.bytes_at(attachments.cast(), len);
         let pointer = bytes.as_ptr().cast();
 
-        if ext && gles.discard_ext_supported() {
-            gles.DiscardFramebufferEXT(target, count, pointer);
+        // GL_EXT_discard_framebuffer is only a bandwidth hint, and honouring it
+        // costs correctness rather than saving work: the guest's attachments
+        // don't map one-to-one onto the host's, so the host throws away tiles
+        // the guest still samples later in the frame. Minecraft: Pocket Edition
+        // goes black as soon as the hint is forwarded. Accept the call (the
+        // validation above still reports the same errors) and drop the hint,
+        // exactly like a host without the extension.
+        if ext {
             return;
         }
         let extension_attachment = |a| {
@@ -2060,14 +2066,10 @@ fn framebuffer_hint(
             }
         }
         // A whole-framebuffer discard cannot implement a subrectangle or a
-        // separately bound read framebuffer.
-        if matches!(hint, FramebufferHint::Invalidate)
-            && target == gl::FRAMEBUFFER
-            && ext_compatible
-            && gles.discard_ext_supported()
-        {
-            gles.DiscardFramebufferEXT(target, count, pointer);
-        }
+        // separately bound read framebuffer. The EXT call itself is not
+        // forwarded (see the `ext` early return above), so there is nothing
+        // to do here for a compatible ES3 invalidation either.
+        let _ = ext_compatible;
     });
 }
 
@@ -2095,6 +2097,12 @@ fn glPushGroupMarkerEXT(_env: &mut Environment, _length: GLsizei, _marker: Const
 /// `glPopGroupMarkerEXT` — debug marker from `GL_EXT_debug_marker`.
 /// No-op on hosts that don't expose the extension.
 fn glPopGroupMarkerEXT(_env: &mut Environment) {
+    // Debug markers are hints; safe to ignore.
+}
+
+/// `glInsertEventMarkerEXT` — event marker from `GL_EXT_debug_marker`.
+/// No-op: it only labels the frame for GPU debuggers.
+fn glInsertEventMarkerEXT(_env: &mut Environment, _length: GLsizei, _marker: ConstPtr<u8>) {
     // Debug markers are hints; safe to ignore.
 }
 
@@ -9632,6 +9640,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glDiscardFramebufferEXT(_, _, _)),
     export_c_func!(glPushGroupMarkerEXT(_, _)),
     export_c_func!(glPopGroupMarkerEXT()),
+    export_c_func!(glInsertEventMarkerEXT(_, _)),
     export_c_func!(glBindVertexArrayOES(_)),
     export_c_func!(glDeleteVertexArraysOES(_, _)),
     export_c_func!(glGenVertexArraysOES(_, _)),

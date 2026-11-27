@@ -8,7 +8,8 @@ use super::{ns_string, NSRange, NSUInteger};
 use crate::mem::MutPtr;
 use crate::msg;
 use crate::objc::{
-    autorelease, id, msg_class, nil, objc_classes, release, ClassExports, HostObject, NSZonePtr,
+    autorelease, id, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
+    NSZonePtr,
 };
 use regex::Regex;
 
@@ -261,6 +262,20 @@ pub const CLASSES: ClassExports = objc_classes! {
         let result = format!("{}{}{}", prefix, replaced, suffix);
         let ns = ns_string::from_rust_string(env, result);
         autorelease(env, ns)
+    }
+
+    // NSRegularExpression is immutable and conforms to NSCopying; `-copy` and
+    // `-copyWithZone:` retain and return the receiver, like NSString/NSArray.
+    // Without this, Foundation clients that copy a regex (some JSON/analytics
+    // serializers do) got nil back and then messaged a dead object.
+    - (id)copy {
+        retain(env, this);
+        this
+    }
+
+    - (id)copyWithZone:(NSZonePtr)_zone {
+        retain(env, this);
+        this
     }
 
     @end

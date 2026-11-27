@@ -277,6 +277,15 @@ Debugging options:
         BackStab enables this through its bundled defaults. The second option
         restores the usual zero-on-free policy for apps without older overrides.
 
+    --ignore-main-runloop-stop / --no-ignore-main-runloop-stop
+        Ignore CFRunLoopStop calls that would end the application's main run
+        loop. Launcher-era games bundle ad and analytics SDKs whose startup
+        path stops the main run loop when their (usually long-dead) server
+        cannot be reached; on iOS that returns from UIApplicationMain and the
+        app quits during launch, which is indistinguishable from a crash.
+        With this option the request simply times out and the game keeps
+        running. Enabled by default for Zombie Catchers.
+
     --preserve-dyld-stubs / --no-preserve-dyld-stubs
         Resolve lazy imports through their data pointers at startup, preserving
         the executable's original linker instructions. This supports engines
