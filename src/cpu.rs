@@ -401,6 +401,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn long_straight_line_blocks_yield_and_resume_at_the_next_instruction() {
+        for thumb in [false, true] {
+            let mut mem = Mem::new();
+            mem.set_null_segment_size(0x1000);
+            let code = mem.alloc(0x2000);
+            let size = if thumb { 2 } else { 4 };
+            for i in 0..1024 {
+                if thumb {
+                    mem.write(code.cast::<u16>() + i, 0x3001); // adds r0, #1
+                } else {
+                    mem.write(code.cast::<u32>() + i, 0xe2800001); // add r0, r0, #1
+                }
+            }
+            let stop = code.to_bits() + size * 1024;
+            if thumb {
+                mem.write(Ptr::<u16, true>::from_bits(stop), 0xdf01);
+            } else {
+                mem.write(Ptr::<u32, true>::from_bits(stop), 0xef000001);
+            }
+            let mut cpu = Cpu::new(None);
+            cpu.branch(GuestFunction::from_addr_with_thumb_bit(code.to_bits() | u32::from(thumb)));
+            cpu.regs_mut()[0] = 0;
+            assert!(matches!(cpu.run_or_step(&mut mem, Some(&mut 1)), CpuState::Normal));
+            let count = cpu.regs()[0];
+            assert!(count > 0 && count < 1024);
+            assert_eq!(cpu.regs()[Cpu::PC], code.to_bits() + count * size);
+            assert!(matches!(cpu.run_or_step(&mut mem, Some(&mut 2048)), CpuState::Svc(1)));
+            assert_eq!(cpu.regs()[0], 1024);
+        }
+    }
+
+    #[test]
     fn exclusive_store_requires_a_reservation_from_the_current_guest_thread() {
         // Thumb-2 LDREXD r2, r3, [r0] followed by STREXD r1, r4, r5, [r0].
         // XNU's context-switch path issues CLREX before resuming the thread.
