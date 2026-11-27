@@ -27,6 +27,7 @@ use crate::abi::{CallFromGuest, GuestFunction};
 use crate::bundle;
 use crate::cpu::Cpu;
 use crate::frameworks::foundation::ns_string;
+use crate::libc::pthread::key::guest_function_prefix;
 use crate::mach_o::{MachO, SectionType};
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{nil, ClassExports, ObjC};
@@ -589,7 +590,7 @@ impl Dyld {
             // Eager binding overwrites pointer slots. Apply relocation addends
             // first so a slot shared with an external relocation is not bound
             // twice, treating the first resolved address as an addend.
-            self.setup_lazy_linking(bin, mem, preserve_stubs.then_some(bins));
+            self.setup_lazy_linking(bin, mem, bins, preserve_stubs);
         }
 
         for bin in bins {
@@ -849,7 +850,7 @@ impl Dyld {
     ///
     /// These stubs already exist in the binary, but they need to be rewritten
     /// so that they will invoke our dynamic linker.
-    fn setup_lazy_linking(&mut self, bin: &MachO, mem: &mut Mem, preserve: Option<&[MachO]>) {
+    fn setup_lazy_linking(&mut self, bin: &MachO, mem: &mut Mem, bins: &[MachO], preserve: bool) {
         let Some(stubs) = bin.get_section(SectionType::SymbolStubs) else {
             return;
         };
@@ -885,14 +886,13 @@ impl Dyld {
             // LOCAL/ABS entries describe already-bound pointers, rather than
             // undefined symbols. Preserve their original call sequence.
             // https://github.com/apple-oss-distributions/dyld/blob/dyld-360.22/src/ImageLoaderMachOClassic.cpp
-            if indirect_info
+            let Some(symbol) = indirect_info
                 .indirect_undef_symbols
                 .get(i as usize)
-                .and_then(Option::as_ref)
-                .is_none()
-            {
+                .and_then(Option::as_deref)
+            else {
                 continue;
-            }
+            };
             let ptr: MutPtr<u32> = Ptr::from_bits(stubs.addr + i * entry_size);
 
             // Check that the stub matches the expected pattern.
@@ -922,7 +922,12 @@ impl Dyld {
                 continue;
             }
 
-            if let Some(bins) = preserve {
+            // A guest implementation needs a pointer binding so the JIT can
+            // execute it without trapping into a lazy host-function stub.
+            // A 4-byte literal load encodes its own pointer-slot offset.
+            let has_pointer_slot = entry_size != 4
+                || mem.read(ptr) & !0xfff == Self::SYMBOL_STUB1_INSTRUCTIONS[0];
+            if preserve || (!guest_function_prefix(symbol).is_empty() && has_pointer_slot) {
                 // iOS dyld binds the pointer slot, leaving these instructions
                 // intact. Engines can therefore inspect/checksum their code.
                 // https://github.com/apple-oss-distributions/dyld/blob/dyld-210.2.3/src/ImageLoaderMachOClassic.cpp
@@ -939,9 +944,6 @@ impl Dyld {
                         .wrapping_add(mem.read(ptr + 3)),
                     _ => unreachable!(),
                 };
-                let symbol = indirect_info.indirect_undef_symbols[i as usize]
-                    .as_deref()
-                    .unwrap();
                 let target = self.resolve_preserved_stub(bin, bins, mem, symbol);
                 mem.write(Ptr::<u32, true>::from_bits(slot), target);
                 continue;
@@ -2075,7 +2077,8 @@ impl Dyld {
     ) -> Result<GuestFunction, ()> {
         let function_ptr = self.create_proc_address_no_inval(mem, symbol)?;
         // Just in case
-        cpu.invalidate_cache_range(function_ptr.addr_without_thumb_bit(), 8);
+        let size = 4 * (guest_function_prefix(symbol).len() as u32 + 2);
+        cpu.invalidate_cache_range(function_ptr.addr_without_thumb_bit(), size);
         Ok(function_ptr)
     }
 
@@ -2136,10 +2139,14 @@ impl Dyld {
         self.linked_host_functions.push((symbol, f));
 
         // Create guest function to call this host function
-        let function_ptr = mem.alloc(8);
-        let function_ptr: MutPtr<u32> = function_ptr.cast();
-        mem.write(function_ptr + 0, encode_a32_svc(svc));
-        mem.write(function_ptr + 1, encode_a32_ret());
+        let prefix = guest_function_prefix(symbol);
+        let prefix_len = prefix.len() as u32;
+        let function_ptr: MutPtr<u32> = mem.alloc((prefix_len + 2) * 4).cast();
+        for (i, &instruction) in prefix.iter().enumerate() {
+            mem.write(function_ptr + i as u32, instruction);
+        }
+        mem.write(function_ptr + prefix_len, encode_a32_svc(svc));
+        mem.write(function_ptr + (prefix_len + 1), encode_a32_ret());
         // Keep address-to-symbol mappings available when dyld debugging is enabled.
         log_dbg!("host fn stub {} at {:#x}", symbol, function_ptr.to_bits());
         GuestFunction::from_addr_with_thumb_bit(function_ptr.to_bits())
@@ -2588,7 +2595,7 @@ mod lazy_link_recovery_tests {
             }),
         }];
 
-        Dyld::new().setup_lazy_linking(&bin, &mut mem, None);
+        Dyld::new().setup_lazy_linking(&bin, &mut mem, &[], false);
         for (index, &instruction) in original.iter().enumerate() {
             assert_eq!(mem.read(stubs + index as u32), instruction);
         }
