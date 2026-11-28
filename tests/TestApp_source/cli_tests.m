@@ -141,6 +141,7 @@ int test_UINib_top_level_objects_exclude_proxies(void) {
 }
 
 @interface UIViewController : NSObject
+- (BOOL)shouldAutorotateToInterfaceOrientation:(int)orientation;
 - (instancetype)initWithNibName:(id)name bundle:(id)bundle;
 - (id)nibName;
 - (UIView *)view;
@@ -417,6 +418,109 @@ int test_dlopen_handle_lifetime_and_constants(void) {
   if (dlerror() == NULL || dlerror() != NULL)
     return -10;
   return dlclose(mainOnly);
+}
+
+// A UIView subclass opts in to EAGL by overriding the backing-layer class.
+@interface HyperHLETestEAGLView : UIView
+@end
+@implementation HyperHLETestEAGLView
++ (Class)layerClass { return objc_getClass("CAEAGLLayer"); }
+@end
+
+int test_view_backing_layer(void) {
+  UIViewController *controller = [[UIViewController alloc] init];
+  BOOL portrait = [controller shouldAutorotateToInterfaceOrientation:1];
+  [controller release];
+  if (!portrait || [UIView layerClass] != [CALayer class])
+    return -1;
+  UIView *view = [[HyperHLETestEAGLView alloc] initWithFrame:(CGRect){{0, 0}, {3, 5}}];
+  if ([view contentScaleFactor] != 1 || [[view layer] contentsScale] != 1)
+    return -2;
+  [view setContentScaleFactor:2];
+  if ([[view layer] contentsScale] != 2)
+    return -3;
+  [view release];
+  return 0;
+}
+
+// Legacy CoreSurface is opened dynamically on devices that provide it.
+// Exercise data-symbol indirection, guest writes and the lifetime of global IDs.
+// https://github.com/rileytestut/SNES4iOS/blob/master/CoreSurface/CoreSurface.h
+int test_core_surface_buffer(void) {
+  void *h = dlopen("/System/Library/PrivateFrameworks/CoreSurface.framework/"
+                   "CoreSurface", RTLD_LAZY);
+  if (!h)
+    return -1;
+  NSString **w = dlsym(h, "kCoreSurfaceBufferWidth");
+  NSString **y = dlsym(h, "kCoreSurfaceBufferHeight");
+  NSString **pitch = dlsym(h, "kCoreSurfaceBufferPitch");
+  NSString **format = dlsym(h, "kCoreSurfaceBufferPixelFormat");
+  NSString **global = dlsym(h, "kCoreSurfaceBufferGlobal");
+  id (*create)(id) = dlsym(h, "CoreSurfaceBufferCreate");
+  id (*lookup)(unsigned) = dlsym(h, "CoreSurfaceBufferLookup");
+  unsigned (*get_id)(id) = dlsym(h, "CoreSurfaceBufferGetID");
+  unsigned (*size)(id) = dlsym(h, "CoreSurfaceBufferGetAllocSize");
+  unsigned (*stride)(id) = dlsym(h, "CoreSurfaceBufferGetBytesPerRow");
+  unsigned (*get_width)(id) = dlsym(h, "CoreSurfaceBufferGetWidth");
+  unsigned (*get_height)(id) = dlsym(h, "CoreSurfaceBufferGetHeight");
+  unsigned (*get_format)(id) = dlsym(h, "CoreSurfaceBufferGetPixelFormatType");
+  unsigned (*planes)(id) = dlsym(h, "CoreSurfaceBufferGetPlaneCount");
+  unsigned char *(*base)(id) = dlsym(h, "CoreSurfaceBufferGetBaseAddress");
+  int (*lock)(id, unsigned) = dlsym(h, "CoreSurfaceBufferLock");
+  int (*unlock)(id) = dlsym(h, "CoreSurfaceBufferUnlock");
+  if (!w || !y || !pitch || !format || !global || !create || !lookup ||
+      !get_id || !size || !stride || !get_width || !get_height || !get_format ||
+      !planes || !base || !lock || !unlock)
+    return -2;
+  // A row can have trailing padding.
+  id s = create(@{*w : @2, *y : @3, *pitch : @12, *format : @0x42475241,
+                  *global : @1});
+  if (!s || !base(s) || size(s) < 36 || stride(s) != 12 || get_width(s) != 2 ||
+      get_height(s) != 3 || get_format(s) != 0x42475241 || planes(s) != 0)
+    return -3;
+  NSString **client = dlsym(h, "kCoreSurfaceBufferClientAddress");
+  int (*wrap)(id) = dlsym(h, "CoreSurfaceBufferWrapClientMemory");
+  if (!client || !wrap || !wrap(nil))
+    return -8;
+  unsigned char source[36];
+  memset(source, 0xa5, sizeof(source));
+  for (int i = 0; i < 3; ++i)
+    memcpy(source + 12 * i, "\0\0\xff\xff\xff\0\0\xff", 8);
+  id borrowed = create(@{*w : @2, *y : @3, *pitch : @12, *format : @0x42475241,
+                         *client : [NSNumber numberWithUnsignedInt:(unsigned)source]});
+  if (!borrowed || wrap(borrowed) || base(borrowed) != source)
+    return -9;
+  unsigned char rendered[24] = {0};
+  CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+  CGContextRef ctx = CGBitmapContextCreate(rendered, 2, 3, 8, 8, cs,
+                                           kCGImageAlphaPremultipliedLast);
+  CALayer *layer = [[CALayer alloc] init];
+  [layer setFrame:(CGRect){{0, 0}, {2, 3}}];
+  [layer setContents:borrowed];
+  CFRelease(borrowed);
+  [layer renderInContext:ctx];
+  [layer release];
+  CGContextRelease(ctx);
+  CGColorSpaceRelease(cs);
+  for (int i = 0; i < 3; ++i) {
+    if (memcmp(rendered + 8 * i, "\xff\0\0\xff\0\0\xff\xff", 8))
+      return -10;
+  }
+  unsigned number = get_id(s);
+  id shared = lookup(number);
+  if (!number || shared != s || lock(s, 3))
+    return -4;
+  base(s)[24] = 0x5a;
+  if (unlock(s))
+    return -5;
+  CFRelease(s);
+  if (base(shared)[24] != 0x5a)
+    return -6;
+  CFRelease(shared);
+  if (lookup(number) || create(@{*w : @2, *y : @3, *pitch : @4,
+                                  *format : @0x42475241}))
+    return -7;
+  return dlclose(h);
 }
 
 static id dynamic_runtime_echo(id self, SEL cmd, id value) {
@@ -2777,6 +2881,27 @@ int normal_unlock_res = -1;
 void *normal_unlocker(void *arg) {
   normal_unlock_res = pthread_mutex_unlock(&normal_mutex);
   return NULL;
+}
+
+// Apple's original pthread implementation checks the signature before lazily
+// registering a static mutex and preserves a busy mutex on failed destruction.
+int test_pthread_mutex_errors(void) {
+  pthread_mutex_t m = {0};
+  if (pthread_mutex_unlock(&m) != EINVAL || pthread_mutex_trylock(&m) != EINVAL)
+    return -1;
+  pthread_mutexattr_t attr;
+  if (pthread_mutexattr_init(&attr) || pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK) ||
+      pthread_mutex_init(&m, &attr) || pthread_mutexattr_destroy(&attr))
+    return -2;
+  if (pthread_mutex_unlock(&m) != EPERM || pthread_mutex_lock(&m) ||
+      pthread_mutex_lock(&m) != EDEADLK || pthread_mutex_destroy(&m) != EBUSY)
+    return -3;
+  if (pthread_mutex_unlock(&m) || pthread_mutex_destroy(&m))
+    return -4;
+  pthread_mutex_t normal = PTHREAD_MUTEX_INITIALIZER;
+  if (pthread_mutex_unlock(&normal) || pthread_mutex_destroy(&normal))
+    return -5;
+  return 0;
 }
 
 int test_pthread_mutex_normal() {
@@ -7555,6 +7680,7 @@ struct {
     FUNC_DEF(test_cond_timedwait_broadcast),
     FUNC_DEF(test_cond_timedwait_flag_not_sticky),
     FUNC_DEF(test_cond_timedwait_sibling_not_dropped),
+    FUNC_DEF(test_pthread_mutex_errors),
     FUNC_DEF(test_pthread_mutex_normal),
     FUNC_DEF(test_pthread_mutex_recursive_trylock),
     XFUNC_DEF(test_CFMutableDictionary_NullCallbacks),
@@ -7636,6 +7762,8 @@ struct {
     FUNC_DEF(test_dlsym_executable_exports),
     FUNC_DEF(test_dladdr_image_and_symbols),
     FUNC_DEF(test_dlopen_handle_lifetime_and_constants),
+    FUNC_DEF(test_core_surface_buffer),
+    FUNC_DEF(test_view_backing_layer),
     FUNC_DEF(test_objc_dynamic_class_pair),
     FUNC_DEF(test_UIViewController_nib_name_selection),
     FUNC_DEF(test_UINavigationController_modal_layout),

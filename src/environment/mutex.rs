@@ -70,6 +70,10 @@ impl TryFrom<i32> for MutexType {
 pub const PTHREAD_MUTEX_DEFAULT: MutexType = MutexType::PTHREAD_MUTEX_NORMAL;
 
 impl MutexState {
+    pub fn contains_mutex(&self, mutex_id: MutexId) -> bool {
+        self.mutexes.contains_key(&mutex_id)
+    }
+
     /// Initializes a mutex and returns a handle to it. Similar to
     /// `pthread_mutex_init`, but for host code.
     pub fn init_mutex(&mut self, mutex_type: MutexType) -> MutexId {
@@ -301,12 +305,9 @@ impl Environment {
         let Some((locking_thread, lock_count)) = mutex.locked else {
             match mutex.type_ {
                 MutexType::PTHREAD_MUTEX_NORMAL => {
-                    // Убираем panic!, так как реальные iOS-игры часто пытаются
-                    // разблокировать уже разблокированные мьютексы.
-                    log_dbg!(
-                        "Warning: Attempted to unlock non-error-checking mutex #{mutex_id} for thread {current_thread}, already unlocked! Ignoring and returning EPERM.",
-                    );
-                    return Err(EPERM);
+                    // The original Darwin normal mutex clears the owner even
+                    // when already unlocked. Other types check ownership.
+                    return Ok(0);
                 }
                 MutexType::PTHREAD_MUTEX_ERRORCHECK | MutexType::PTHREAD_MUTEX_RECURSIVE => {
                     log_dbg!(

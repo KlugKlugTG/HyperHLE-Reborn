@@ -8,10 +8,12 @@
 #include <cstdio>
 #include <exception>
 
+#include "dynarmic/frontend/A32/a32_ir_emitter.h"
 #include "dynarmic/interface/A32/a32.h"
 #include "dynarmic/interface/A32/config.h"
 #include "dynarmic/interface/A32/coprocessor.h"
 #include "dynarmic/interface/exclusive_monitor.h"
+#include "dynarmic/ir/basic_block.h"
 
 namespace touchHLE::cpu {
 
@@ -87,6 +89,18 @@ private:
       cpu->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
     }
     return value;
+  }
+
+  bool PreCodeReadHook(bool, VAddr, Dynarmic::A32::IREmitter &ir) override {
+    // Dynarmic normally translates up to the next control transfer. A run of
+    // zero halfwords is valid Thumb (LSLS r0, r0, #0) and can span megabytes.
+    // End the block at an instruction boundary so IR memory and the latency
+    // of checking the emulated thread's tick budget stay bounded.
+    if (ir.block.CycleCount() < 256) {
+      return true;
+    }
+    ir.SetTerm(Dynarmic::IR::Term::LinkBlock{ir.current_location});
+    return false;
   }
 
   std::optional<std::uint32_t> MemoryReadCode(VAddr vaddr) override {

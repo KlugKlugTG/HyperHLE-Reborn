@@ -167,6 +167,8 @@ typedef enum {
 @end
 
 @interface NSNumber : NSValue
++ (NSNumber *)numberWithInt:(int)value;
++ (NSNumber *)numberWithUnsignedInt:(unsigned)value;
 + (NSNumber *)numberWithFloat:(float)value;
 + (NSNumber *)numberWithBool:(bool)value;
 @end
@@ -432,6 +434,9 @@ CFTimeInterval CACurrentMediaTime();
 - (void)setToValue:(id)value;
 @end
 @interface CALayer : NSObject
+- (CGFloat)contentsScale;
+- (void)setContents:(id)contents;
+- (void)renderInContext:(CGContextRef)context;
 - (void)setAffineTransform:(CGAffineTransform)transform;
 - (void)setAnchorPoint:(CGPoint)point;
 - (void)setCornerRadius:(CGFloat)radius;
@@ -526,6 +531,9 @@ typedef enum {
 @end
 @class UIWindow;
 @interface UIView : UIResponder
++ (Class)layerClass;
+- (CGFloat)contentScaleFactor;
+- (void)setContentScaleFactor:(CGFloat)scale;
 - (instancetype)initWithFrame:(CGRect)frame;
 - (CALayer *)layer;
 - (CGRect)bounds;
@@ -548,7 +556,6 @@ typedef enum {
 - (void)setAlpha:(CGFloat)alpha;
 - (BOOL)isHidden;
 - (void)setHidden:(BOOL)hidden;
-- (CALayer *)layer;
 @end
 @interface UIWindow : UIView
 - (void)makeKeyAndVisible;

@@ -927,14 +927,13 @@ impl Dyld {
             // A 4-byte literal load encodes its own pointer-slot offset.
             let has_pointer_slot = entry_size != 4
                 || mem.read(ptr) & !0xfff == Self::SYMBOL_STUB1_INSTRUCTIONS[0];
-            if preserve || (!guest_function_prefix(symbol).is_empty() && has_pointer_slot) {
+            if has_pointer_slot && (preserve || !guest_function_prefix(symbol).is_empty()) {
                 // iOS dyld binds the pointer slot, leaving these instructions
                 // intact. Engines can therefore inspect/checksum their code.
                 // https://github.com/apple-oss-distributions/dyld/blob/dyld-210.2.3/src/ImageLoaderMachOClassic.cpp
                 let slot = match entry_size {
                     4 => {
                         let instruction = mem.read(ptr);
-                        assert_eq!(instruction & !0xfff, Self::SYMBOL_STUB1_INSTRUCTIONS[0]);
                         ptr.to_bits().wrapping_add(8 + (instruction & 0xfff))
                     }
                     12 => mem.read(ptr + 2),

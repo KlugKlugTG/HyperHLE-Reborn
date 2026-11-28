@@ -76,7 +76,7 @@ fn main() {
     // Allow providing Boost manually regardless of what platform we're on
     // (or whether the target platform was detected correctly…)
     if boost_path.is_dir() {
-        build.define("Boost_INCLUDE_DIR", boost_path);
+        build.define("Boost_INCLUDE_DIR", &boost_path);
     }
     // Prevent CMake from using macOS-only linker commands when cross-compiling
     // for Android.
@@ -155,8 +155,14 @@ fn main() {
     wrapper_build
         .file(package_root.join("lib.cpp"))
         .cpp(true)
-        .std("c++17")
+        .std("c++20")
         .include(dynarmic_out.join("include"));
+    if wrapper_build.get_compiler().is_like_msvc() {
+        wrapper_build.flag("/utf-8");
+    }
+    if boost_path.is_dir() {
+        wrapper_build.include(&boost_path);
+    }
     if !cfg!(debug_assertions) {
         wrapper_build.define("NDEBUG", "1");
     }
