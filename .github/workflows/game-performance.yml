@@ -39,6 +39,7 @@ jobs:
       FIXTURE_HASH: ${{ inputs.sha256 }}
       STEPS: ${{ inputs.steps || '1:- 20:-' }}
       TRACE: ${{ matrix.trace }}
+      DEBUGGER: ${{ matrix.debugger }}
       RENDERER: ${{ matrix.renderer }}
       EMULATOR_GL_OPTION: ''
       ALSOFT_DRIVERS: 'null'
@@ -80,7 +81,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends xvfb xdotool x11-utils imagemagick mesa-utils libsndio-dev sysstat gdb
+          sudo apt-get install -y --no-install-recommends xvfb xdotool x11-utils imagemagick mesa-utils libsndio-dev sysstat gdb gdb-multiarch
           if ! xdpyinfo >/dev/null 2>&1; then
             export DISPLAY=:99
             Xvfb "$DISPLAY" -screen 0 1280x960x24 -ac > results/xvfb.log 2>&1 &
@@ -164,11 +165,25 @@ jobs:
               python3 -c 'import os,ctypes; [print(ctypes.CDLL(os.environ[k])) for k in ("SDL_VIDEO_EGL_DRIVER","SDL_VIDEO_GL_DRIVER")]' >> results/angle-libs.txt 2>&1 || true
             fi
           fi
+          if [[ "$DEBUGGER" == guest ]]; then
+            (
+              for i in {1..120}; do
+                if ss -lt | grep -q ':23450 '; then break; fi
+                sleep .2
+              done
+              gdb-multiarch -nx -q -batch -x "$GITHUB_WORKSPACE/dev-scripts/pes-guest.gdb"
+            ) > results/guest-debugger.txt 2>&1 &
+          fi
           read -r -a steps <<< "$STEPS"
           args=()
           for step in "${steps[@]}"; do args+=(--step "$step"); done
           gl=()
           if [[ -n "$EMULATOR_GL_OPTION" ]]; then gl+=("$EMULATOR_GL_OPTION"); fi
+          if [[ "$DEBUGGER" == guest ]]; then gl+=(--gdb=127.0.0.1:23450); fi
+          if [[ "$DEBUGGER" == watch ]]; then
+            export HLE_WATCH_SCRIPT="$GITHUB_WORKSPACE/dev-scripts/pes-host.gdb"
+            printf '%s\n' '#!/bin/bash' 'echo "$$" | sudo tee "$HLE_CGROUP/cgroup.procs" >/dev/null' 'exec gdb -nx -q -batch -x "$HLE_WATCH_SCRIPT" --args "$HLE_BINARY" "$@"' > "$RUNNER_TEMP/run-game"
+          fi
           python3 dev-scripts/ai-tap-sequence.py "$RUNNER_TEMP/fixture/game.ipa" --exe "$emulator" --cwd emulator --out results/play "${args[@]}" --final-wait 5 --require-frame-change --require-nonblack-frame --require-frame-content -- "${gl[@]}" --device-family=iphone-4s --overlay=off --no-error-popup
       - uses: actions/upload-artifact@v4
         if: always()
