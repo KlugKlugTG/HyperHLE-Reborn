@@ -429,6 +429,12 @@ pub const CLASSES: ClassExports = objc_classes! {
         let b = env.objc.borrow::<UIFontHostObject>(other);
         (b.kind, b.size, b.custom.clone())
     };
+    if !env.options.fix_text {
+        // Legacy behavior: fonts were compared by their built-in kind and an
+        // approximate point size, so custom faces of the same kind compared
+        // equal.
+        return a_kind == b_kind && (a_size - b_size).abs() < 0.001;
+    }
     let same_face = match (a_custom, b_custom) {
         (Some(a), Some(b)) => a.raw_data() == b.raw_data(),
         (None, None) => a_kind == b_kind,
@@ -483,17 +489,34 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)fontName {
+    let fix_text = env.options.fix_text;
     let host = env.objc.borrow::<UIFontHostObject>(this);
-    let name = host.custom.as_ref().and_then(|font| font.name(6))
-        .unwrap_or_else(|| font_kind_to_name(host.kind).to_string());
+    // Exposing the real PostScript name of an application font is part of
+    // the `--fix-text` behavior; the legacy path answered with the name of
+    // the built-in face it was substituting.
+    let name = if fix_text {
+        host.custom
+            .as_ref()
+            .and_then(|font| font.name(6))
+            .unwrap_or_else(|| font_kind_to_name(host.kind).to_string())
+    } else {
+        font_kind_to_name(host.kind).to_string()
+    };
     let ns = from_rust_string(env, name);
     autorelease(env, ns)
 }
 
 - (id)familyName {
+    let fix_text = env.options.fix_text;
     let host = env.objc.borrow::<UIFontHostObject>(this);
-    let family = host.custom.as_ref().and_then(|font| font.name(1))
-        .unwrap_or_else(|| font_kind_to_family(host.kind).to_string());
+    let family = if fix_text {
+        host.custom
+            .as_ref()
+            .and_then(|font| font.name(1))
+            .unwrap_or_else(|| font_kind_to_family(host.kind).to_string())
+    } else {
+        font_kind_to_family(host.kind).to_string()
+    };
     let ns = from_rust_string(env, family);
     autorelease(env, ns)
 }

@@ -538,6 +538,8 @@ struct AppPickerDelegateHostObject {
     rotation_fix: Option<bool>,
     /// `Some(..)` only when the user just flipped the switch.
     fix_movie_player: Option<bool>,
+    /// `Some(..)` only when the user just flipped the "Fix text" switch.
+    fix_text: Option<bool>,
     fps_limit_default: bool,
     fps_limit30: bool,
     fps_limit60: bool,
@@ -732,6 +734,10 @@ struct PickerSettings {
     /// an options file which enables the fix (e.g. GTA III defaults).
     rotation_fix: Option<bool>,
     fix_movie_player: Option<bool>,
+    /// `--fix-text`: use the newer Core Text font registration/lookup and
+    /// em-based glyph metrics. `None` leaves the legacy text path in charge;
+    /// `Some(..)` is an explicit choice from Settings > Graphics.
+    fix_text: Option<bool>,
     /// `--no-gles3`: pretend the GPU has no OpenGL ES 3.0 support, so apps
     /// that feature-test for it take their older GLES renderer instead.
     /// `None` leaves the choice to the command line and the app-specific
@@ -778,6 +784,7 @@ impl PickerSettings {
             // app-specific defaults in the options files still apply.
             rotation_fix: options.rotation_fix.then_some(true),
             fix_movie_player: options.fix_movie_player.then_some(true),
+            fix_text: options.fix_text.then_some(true),
             no_gles3: options.no_gles3.then_some(true),
             // Both start as "untouched": the command line already sticks
             // around and the options files still get their say. Only the saved
@@ -837,6 +844,7 @@ impl PickerSettings {
                 }
                 "rotation_fix" => set_bool_override(value, &mut settings.rotation_fix),
                 "fix_movie_player" => set_bool_override(value, &mut settings.fix_movie_player),
+                "fix_text" => set_bool_override(value, &mut settings.fix_text),
                 "no_gles3" => set_bool_override(value, &mut settings.no_gles3),
                 "fps_limit" => {
                     settings.fps_limit = FpsLimit::from_short_name(value);
@@ -890,6 +898,7 @@ impl PickerSettings {
              overlay_corner={}\n\
              rotation_fix={}\n\
              fix_movie_player={}\n\
+             fix_text={}\n\
              no_gles3={}\n\
              fps_limit={}\n\
              memory_limit_mb={}\n\
@@ -914,6 +923,7 @@ impl PickerSettings {
             self.overlay_corner.short_name(),
             optional_bool(self.rotation_fix),
             optional_bool(self.fix_movie_player),
+            optional_bool(self.fix_text),
             optional_bool(self.no_gles3),
             self.fps_limit.map_or("default", |limit| limit.short_name()),
             self.memory_limit_mb
@@ -1126,6 +1136,10 @@ const CLASSES: ClassExports = objc_classes! {
 - (())moviePlayerFix:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fix_movie_player = Some(switch_state);
+}
+- (())fixText:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fix_text = Some(switch_state);
 }
 - (())preserveAspectRatio:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -1530,6 +1544,7 @@ fn app_picker_inner(
     let mut quick_options_overlay_corner = picker_settings.overlay_corner;
     let mut quick_options_rotation_fix = picker_settings.rotation_fix;
     let mut quick_options_fix_movie_player = picker_settings.fix_movie_player;
+    let mut quick_options_fix_text = picker_settings.fix_text;
     let mut quick_options_fps_limit = picker_settings.fps_limit;
     let mut quick_options_memory_limit_mb = picker_settings.memory_limit_mb;
     let mut quick_options_preserve_aspect_ratio = picker_settings.preserve_aspect_ratio;
@@ -2203,6 +2218,8 @@ fn app_picker_inner(
             quick_options_rotation_fix = Some(rotation_fix);
         } else if let Some(fix_movie_player) = std::mem::take(&mut host_obj.fix_movie_player) {
             quick_options_fix_movie_player = Some(fix_movie_player);
+        } else if let Some(fix_text) = std::mem::take(&mut host_obj.fix_text) {
+            quick_options_fix_text = Some(fix_text);
         } else if let Some(preserve_aspect_ratio) =
             std::mem::take(&mut host_obj.preserve_aspect_ratio)
         {
@@ -2271,6 +2288,7 @@ fn app_picker_inner(
         picker_settings.overlay_corner = quick_options_overlay_corner;
         picker_settings.rotation_fix = quick_options_rotation_fix;
         picker_settings.fix_movie_player = quick_options_fix_movie_player;
+        picker_settings.fix_text = quick_options_fix_text;
         picker_settings.no_gles3 = quick_options_no_gles3;
         picker_settings.fps_limit = quick_options_fps_limit;
         picker_settings.memory_limit_mb = quick_options_memory_limit_mb;
@@ -2419,11 +2437,12 @@ fn app_picker_inner(
         quick_options_memory_limit_mb,
     ));
 
-    // The two compatibility fixes are only emitted when the Settings screen
+    // The compatibility fixes are only emitted when the Settings screen
     // actually set them (see `quick_options_fix_arguments`).
     option_args.extend(quick_options_fix_arguments(
         quick_options_rotation_fix,
         quick_options_fix_movie_player,
+        quick_options_fix_text,
     ));
     // Like the two fixes above, only emitted once the Settings screen made an
     // explicit choice, so an app-specific `--no-gles3` in the options files
@@ -4590,6 +4609,14 @@ fn setup_settings(
             picker_settings.fix_movie_player.unwrap_or(false),
             true,
         ),
+        // Opt-in: the newer Core Text handling fixes text in some Unity
+        // titles (e.g. Brawl Stars) but breaks it in many others.
+        SettingsRow::Toggle(
+            "Fix text",
+            "fixText:",
+            picker_settings.fix_text.unwrap_or(false),
+            true,
+        ),
     ];
     graphics_rows.push(SettingsRow::Toggle(
         "Show slide to unlock",
@@ -5753,13 +5780,22 @@ fn quick_options_fix_movie_player_argument(enabled: bool) -> &'static str {
     }
 }
 
-/// Launch arguments for the two compatibility fix switches. An untouched
-/// switch (`None`) emits nothing: `--no-rotation-fix` / `--no-fix-movie-player`
-/// are explicit overrides that would cancel the app-specific defaults in
-/// touchHLE_default_options.txt (GTA III needs both fixes).
+fn quick_options_fix_text_argument(enabled: bool) -> &'static str {
+    if enabled {
+        "--fix-text"
+    } else {
+        "--no-fix-text"
+    }
+}
+
+/// Launch arguments for the compatibility fix switches. An untouched switch
+/// (`None`) emits nothing: `--no-rotation-fix` / `--no-fix-movie-player` /
+/// `--no-fix-text` are explicit overrides that would cancel the app-specific
+/// defaults in touchHLE_default_options.txt (GTA III needs two of them).
 fn quick_options_fix_arguments(
     rotation_fix: Option<bool>,
     fix_movie_player: Option<bool>,
+    fix_text: Option<bool>,
 ) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(enabled) = rotation_fix {
@@ -5767,6 +5803,9 @@ fn quick_options_fix_arguments(
     }
     if let Some(enabled) = fix_movie_player {
         args.push(quick_options_fix_movie_player_argument(enabled).to_string());
+    }
+    if let Some(enabled) = fix_text {
+        args.push(quick_options_fix_text_argument(enabled).to_string());
     }
     args
 }
@@ -5931,19 +5970,25 @@ mod quick_options_fix_tests {
             quick_options_fix_movie_player_argument(false),
             "--no-fix-movie-player"
         );
+        assert_eq!(quick_options_fix_text_argument(true), "--fix-text");
+        assert_eq!(quick_options_fix_text_argument(false), "--no-fix-text");
 
-        assert!(quick_options_fix_arguments(None, None).is_empty());
+        assert!(quick_options_fix_arguments(None, None, None).is_empty());
         assert_eq!(
-            quick_options_fix_arguments(Some(true), None),
+            quick_options_fix_arguments(Some(true), None, None),
             vec!["--rotation-fix"]
         );
         assert_eq!(
-            quick_options_fix_arguments(None, Some(false)),
+            quick_options_fix_arguments(None, Some(false), None),
             vec!["--no-fix-movie-player"]
         );
         assert_eq!(
-            quick_options_fix_arguments(Some(false), Some(true)),
-            vec!["--no-rotation-fix", "--fix-movie-player"]
+            quick_options_fix_arguments(Some(false), Some(true), Some(true)),
+            vec!["--no-rotation-fix", "--fix-movie-player", "--fix-text"]
+        );
+        assert_eq!(
+            quick_options_fix_arguments(None, None, Some(false)),
+            vec!["--no-fix-text"]
         );
     }
 
