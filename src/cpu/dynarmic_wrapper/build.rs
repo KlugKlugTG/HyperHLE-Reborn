@@ -155,7 +155,7 @@ fn main() {
     wrapper_build
         .file(package_root.join("lib.cpp"))
         .cpp(true)
-        .std("c++17")
+        .std("c++20")
         .include(dynarmic_out.join("include"));
     if boost_path.is_dir() {
         wrapper_build.include(&boost_path);
