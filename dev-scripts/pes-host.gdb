@@ -9,6 +9,9 @@ watch -loc *(unsigned int*)($vm + 0x1007ce0)
 commands
 silent
 printf "MUTEX WRITE SIG=%x hostpc=%p\n", *(unsigned int*)($vm+0x1007ce0), $pc
+x/16wx $r15
+set $guestsp = *(unsigned*)($r15+52)
+x/24wx $vm+$guestsp
 bt 7
 x/7i $pc
 info registers
