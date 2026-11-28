@@ -51,9 +51,6 @@ unsafe impl SafeRead for DlInfo {}
 /// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dladdr.3.html
 /// https://github.com/apple-oss-distributions/dyld/blob/dyld-210.2.3/src/dyldAPIs.cpp
 fn dladdr(env: &mut Environment, address: ConstVoidPtr, info: MutPtr<DlInfo>) -> i32 {
-    // Default to the historical failure stub. The real implementation is
-    // opt-in because several legacy games hang when it starts resolving
-    // their images and symbols.
     if !env.options.dladdr {
         return 0;
     }

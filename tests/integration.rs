@@ -430,7 +430,7 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         &tests_dir,
         "TestApp",
         &extra_compile_args,
-        &["--game-center-authenticated", "--dladdr"],
+        &["--game-center-authenticated"],
     )?;
     // Reuse the CI-built binary with both initial status-bar states. Each
     // process enters UIApplicationMain, checks geometry during subclass init,

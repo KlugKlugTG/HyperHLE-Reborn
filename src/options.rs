@@ -324,8 +324,7 @@ pub struct Options {
     /// Bind through lazy-symbol data pointers without changing instructions.
     /// Needed by engines that hash their executable code during startup.
     pub preserve_dyld_stubs: bool,
-    /// `--dladdr`: enable the real `dladdr()` implementation. Off by default;
-    /// the failure stub is safer for legacy games that hang during startup.
+    /// Resolve mapped image addresses for dladdr().
     pub dladdr: bool,
     /// CPU affinity policy for the emulator thread on Android
     /// (`--affinity=`): `None` = default (big cores), or one of
@@ -547,8 +546,8 @@ impl Default for Options {
             gles1_implementation: None,
             gles2_compat: false,
             direct_memory_access: true,
-            preserve_dyld_stubs: false,
-            dladdr: false,
+            preserve_dyld_stubs: true,
+            dladdr: true,
             affinity: None,
             gdb_listen_addrs: None,
             preferred_languages: None,

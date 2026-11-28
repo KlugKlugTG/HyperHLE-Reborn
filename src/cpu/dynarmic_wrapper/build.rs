@@ -157,6 +157,9 @@ fn main() {
         .cpp(true)
         .std("c++20")
         .include(dynarmic_out.join("include"));
+    if wrapper_build.get_compiler().is_like_msvc() {
+        wrapper_build.flag("/utf-8");
+    }
     if boost_path.is_dir() {
         wrapper_build.include(&boost_path);
     }
