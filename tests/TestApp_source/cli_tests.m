@@ -141,6 +141,7 @@ int test_UINib_top_level_objects_exclude_proxies(void) {
 }
 
 @interface UIViewController : NSObject
+- (BOOL)shouldAutorotateToInterfaceOrientation:(int)orientation;
 - (instancetype)initWithNibName:(id)name bundle:(id)bundle;
 - (id)nibName;
 - (UIView *)view;
@@ -427,7 +428,10 @@ int test_dlopen_handle_lifetime_and_constants(void) {
 @end
 
 int test_view_backing_layer(void) {
-  if ([UIView layerClass] != [CALayer class])
+  UIViewController *controller = [[UIViewController alloc] init];
+  BOOL portrait = [controller shouldAutorotateToInterfaceOrientation:1];
+  [controller release];
+  if (!portrait || [UIView layerClass] != [CALayer class])
     return -1;
   UIView *view = [[HyperHLETestEAGLView alloc] initWithFrame:(CGRect){{0, 0}, {3, 5}}];
   if ([view contentScaleFactor] != 1 || [[view layer] contentsScale] != 1)
@@ -2877,6 +2881,27 @@ int normal_unlock_res = -1;
 void *normal_unlocker(void *arg) {
   normal_unlock_res = pthread_mutex_unlock(&normal_mutex);
   return NULL;
+}
+
+// Apple's original pthread implementation checks the signature before lazily
+// registering a static mutex and preserves a busy mutex on failed destruction.
+int test_pthread_mutex_errors(void) {
+  pthread_mutex_t m = {0};
+  if (pthread_mutex_unlock(&m) != EINVAL || pthread_mutex_trylock(&m) != EINVAL)
+    return -1;
+  pthread_mutexattr_t attr;
+  if (pthread_mutexattr_init(&attr) || pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK) ||
+      pthread_mutex_init(&m, &attr) || pthread_mutexattr_destroy(&attr))
+    return -2;
+  if (pthread_mutex_unlock(&m) != EPERM || pthread_mutex_lock(&m) ||
+      pthread_mutex_lock(&m) != EDEADLK || pthread_mutex_destroy(&m) != EBUSY)
+    return -3;
+  if (pthread_mutex_unlock(&m) || pthread_mutex_destroy(&m))
+    return -4;
+  pthread_mutex_t normal = PTHREAD_MUTEX_INITIALIZER;
+  if (pthread_mutex_unlock(&normal) || pthread_mutex_destroy(&normal))
+    return -5;
+  return 0;
 }
 
 int test_pthread_mutex_normal() {
@@ -7655,6 +7680,7 @@ struct {
     FUNC_DEF(test_cond_timedwait_broadcast),
     FUNC_DEF(test_cond_timedwait_flag_not_sticky),
     FUNC_DEF(test_cond_timedwait_sibling_not_dropped),
+    FUNC_DEF(test_pthread_mutex_errors),
     FUNC_DEF(test_pthread_mutex_normal),
     FUNC_DEF(test_pthread_mutex_recursive_trylock),
     XFUNC_DEF(test_CFMutableDictionary_NullCallbacks),

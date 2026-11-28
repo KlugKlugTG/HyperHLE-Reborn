@@ -556,7 +556,6 @@ typedef enum {
 - (void)setAlpha:(CGFloat)alpha;
 - (BOOL)isHidden;
 - (void)setHidden:(BOOL)hidden;
-- (CALayer *)layer;
 @end
 @interface UIWindow : UIView
 - (void)makeKeyAndVisible;
