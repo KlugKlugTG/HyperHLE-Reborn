@@ -168,6 +168,7 @@ typedef enum {
 
 @interface NSNumber : NSValue
 + (NSNumber *)numberWithInt:(int)value;
++ (NSNumber *)numberWithUnsignedInt:(unsigned)value;
 + (NSNumber *)numberWithFloat:(float)value;
 + (NSNumber *)numberWithBool:(bool)value;
 @end
@@ -433,6 +434,8 @@ CFTimeInterval CACurrentMediaTime();
 - (void)setToValue:(id)value;
 @end
 @interface CALayer : NSObject
+- (void)setContents:(id)contents;
+- (void)renderInContext:(CGContextRef)context;
 - (void)setAffineTransform:(CGAffineTransform)transform;
 - (void)setAnchorPoint:(CGPoint)point;
 - (void)setCornerRadius:(CGFloat)radius;

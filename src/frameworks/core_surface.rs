@@ -17,7 +17,6 @@ use std::collections::HashMap;
 
 const BAD_ARGUMENT: i32 = 0xe00002c2u32 as i32; // kIOReturnBadArgument
 
-
 // CoreSurface takes CFString keys and CFNumber values (including the FourCC).
 macro_rules! surface_keys {
     ($( $name:ident = $value:literal ),+ $(,)?) => {
@@ -269,11 +268,11 @@ fn CoreSurfaceBufferUnlock(env: &mut Environment, buffer: id) -> i32 {
     0
 }
 
-fn CoreSurfaceBufferWrapClientMemory(env: &mut Environment, properties: id) -> id {
-    if property(env, properties, kCoreSurfaceBufferClientAddress).is_some() {
-        CoreSurfaceBufferCreate(env, properties)
-    } else {
-        nil
+fn CoreSurfaceBufferWrapClientMemory(env: &mut Environment, buffer: id) -> i32 {
+    // For a client allocation Create already mapped the supplied guest address.
+    match surface(&env.objc, buffer) {
+        Some(surface) if !surface.owns_storage => 0,
+        _ => BAD_ARGUMENT,
     }
 }
 

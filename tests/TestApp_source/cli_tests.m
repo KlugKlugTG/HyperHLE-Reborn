@@ -454,6 +454,34 @@ int test_core_surface_buffer(void) {
   if (!s || !base(s) || size(s) < 36 || stride(s) != 12 || get_width(s) != 2 ||
       get_height(s) != 3 || get_format(s) != 0x42475241 || planes(s) != 0)
     return -3;
+  NSString **client = dlsym(h, "kCoreSurfaceBufferClientAddress");
+  int (*wrap)(id) = dlsym(h, "CoreSurfaceBufferWrapClientMemory");
+  if (!client || !wrap || !wrap(nil))
+    return -8;
+  unsigned char source[36];
+  memset(source, 0xa5, sizeof(source));
+  for (int i = 0; i < 3; ++i)
+    memcpy(source + 12 * i, "\0\0\xff\xff\xff\0\0\xff", 8);
+  id borrowed = create(@{*w : @2, *y : @3, *pitch : @12, *format : @0x42475241,
+                         *client : [NSNumber numberWithUnsignedInt:(unsigned)source]});
+  if (!borrowed || wrap(borrowed) || base(borrowed) != source)
+    return -9;
+  unsigned char rendered[24] = {0};
+  CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+  CGContextRef ctx = CGBitmapContextCreate(rendered, 2, 3, 8, 8, cs,
+                                           kCGImageAlphaPremultipliedLast);
+  CALayer *layer = [[CALayer alloc] init];
+  [layer setFrame:(CGRect){{0, 0}, {2, 3}}];
+  [layer setContents:borrowed];
+  CFRelease(borrowed);
+  [layer renderInContext:ctx];
+  [layer release];
+  CGContextRelease(ctx);
+  CGColorSpaceRelease(cs);
+  for (int i = 0; i < 3; ++i) {
+    if (memcmp(rendered + 8 * i, "\xff\0\0\xff\0\0\xff\xff", 8))
+      return -10;
+  }
   unsigned number = get_id(s);
   id shared = lookup(number);
   if (!number || shared != s || lock(s, 3))
