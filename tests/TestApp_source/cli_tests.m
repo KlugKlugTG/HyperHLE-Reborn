@@ -419,6 +419,26 @@ int test_dlopen_handle_lifetime_and_constants(void) {
   return dlclose(mainOnly);
 }
 
+// A UIView subclass opts in to EAGL by overriding the backing-layer class.
+@interface HyperHLETestEAGLView : UIView
+@end
+@implementation HyperHLETestEAGLView
++ (Class)layerClass { return objc_getClass("CAEAGLLayer"); }
+@end
+
+int test_view_backing_layer(void) {
+  if ([UIView layerClass] != [CALayer class])
+    return -1;
+  UIView *view = [[HyperHLETestEAGLView alloc] initWithFrame:(CGRect){{0, 0}, {3, 5}}];
+  if ([view contentScaleFactor] != 1 || [[view layer] contentsScale] != 1)
+    return -2;
+  [view setContentScaleFactor:2];
+  if ([[view layer] contentsScale] != 2)
+    return -3;
+  [view release];
+  return 0;
+}
+
 // Legacy CoreSurface is opened dynamically on devices that provide it.
 // Exercise data-symbol indirection, guest writes and the lifetime of global IDs.
 // https://github.com/rileytestut/SNES4iOS/blob/master/CoreSurface/CoreSurface.h
@@ -7717,6 +7737,7 @@ struct {
     FUNC_DEF(test_dladdr_image_and_symbols),
     FUNC_DEF(test_dlopen_handle_lifetime_and_constants),
     FUNC_DEF(test_core_surface_buffer),
+    FUNC_DEF(test_view_backing_layer),
     FUNC_DEF(test_objc_dynamic_class_pair),
     FUNC_DEF(test_UIViewController_nib_name_selection),
     FUNC_DEF(test_UINavigationController_modal_layout),

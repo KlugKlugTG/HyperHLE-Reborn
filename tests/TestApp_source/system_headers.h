@@ -434,6 +434,7 @@ CFTimeInterval CACurrentMediaTime();
 - (void)setToValue:(id)value;
 @end
 @interface CALayer : NSObject
+- (CGFloat)contentsScale;
 - (void)setContents:(id)contents;
 - (void)renderInContext:(CGContextRef)context;
 - (void)setAffineTransform:(CGAffineTransform)transform;
@@ -530,6 +531,9 @@ typedef enum {
 @end
 @class UIWindow;
 @interface UIView : UIResponder
++ (Class)layerClass;
+- (CGFloat)contentScaleFactor;
+- (void)setContentScaleFactor:(CGFloat)scale;
 - (instancetype)initWithFrame:(CGRect)frame;
 - (CALayer *)layer;
 - (CGRect)bounds;

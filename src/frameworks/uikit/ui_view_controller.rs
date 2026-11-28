@@ -13,7 +13,7 @@ use crate::frameworks::core_graphics::{CGFloat, CGRect, CGSize};
 use crate::frameworks::foundation::ns_objc_runtime::NSStringFromClass;
 use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str, to_rust_string};
 use crate::frameworks::foundation::NSUInteger;
-use crate::frameworks::uikit::ui_application::UIInterfaceOrientation;
+use crate::frameworks::uikit::ui_application::{UIInterfaceOrientation, UIInterfaceOrientationPortrait};
 use crate::frameworks::uikit::ui_view::set_view_controller;
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_super, nil, objc_classes, release, retain, Class,
@@ -545,10 +545,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)shouldAutorotateToInterfaceOrientation:(UIInterfaceOrientation)interface_orientation {
-    // Apple's default implementation supports every orientation except
-    // upside-down portrait (UIDeviceOrientationPortraitUpsideDown == 2).
-    // Rejecting plain portrait here broke apps that query it directly.
-    interface_orientation != 2
+    // On iPhone the legacy rotation API defaults to portrait. iPad supports
+    // both portrait and landscape. Subclasses may override this selector.
+    let is_ipad = env.window.as_ref().map(|window| window.device_family())
+        .or(env.options.device_family).is_some_and(|family| family.is_ipad());
+    interface_orientation == UIInterfaceOrientationPortrait ||
+        (is_ipad && (1..=4).contains(&interface_orientation))
 }
 
 - (id)nextResponder {

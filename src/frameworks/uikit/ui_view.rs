@@ -292,21 +292,21 @@ fn init_common(env: &mut Environment, this: id) -> id {
     let layer: id = msg![env; layer_class layer];
     () = msg![env; layer setDelegate:this];
     () = msg![env; layer setOpaque:true];
-    // A view's backing layer inherits the view's contentScaleFactor, which
-    // defaults to the main screen's scale (1.0 on non-retina devices, 2.0 on
-    // retina ones). EAGL derives the renderbuffer size from the layer's
-    // bounds * contentsScale, so without this retina-aware apps would
-    // allocate a half-size framebuffer and render zoomed / cropped.
-    let screen_scale: crate::frameworks::core_graphics::CGFloat = {
+    // OpenGL ES views opt in to Retina drawing by setting contentScaleFactor.
+    // https://developer.apple.com/library/archive/documentation/2DDrawing/Conceptual/DrawingPrintingiOS/SupportingHiResScreensInViews/SupportingHiResScreensInViews.html
+    let eagl_layer = env.objc.get_known_class("CAEAGLLayer", &mut env.mem);
+    let scale: CGFloat = if env.objc.class_is_subclass_of(layer_class, eagl_layer) {
+        1.0
+    } else {
         let screen: id = msg_class![env; UIScreen mainScreen];
         msg![env; screen scale]
     };
     env.objc
         .borrow_mut::<UIViewHostObject>(this)
-        .content_scale_factor = screen_scale;
+        .content_scale_factor = scale;
     env.objc
         .borrow_mut::<crate::frameworks::core_animation::ca_layer::CALayerHostObject>(layer)
-        .contents_scale = screen_scale;
+        .contents_scale = scale;
     crate::frameworks::core_animation::ca_layer::set_use_implicit_animations(env, layer, false);
 
     // A view's backing layer is not retained by the view.
@@ -460,14 +460,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (Class)layerClass {
-    // Game engines that ship their own GL view classes (Gameloft's EAGLView,
-    // Cocos2d's CCEAGLView, etc.) override +layerClass to return CAEAGLLayer.
-    // Mirror that here so their backing layer is a real CAEAGLLayer: the EAGL
-    // fast-path presentation and find_fullscreen_eagl_layer() both depend on
-    // the layer being an EAGL layer, otherwise frames go through the RAM
-    // readback slow path (or never reach the screen at all - see the
-    // Asphalt 8 black-screen report).
-    env.objc.get_known_class("CAEAGLLayer", &mut env.mem)
+    env.objc.get_known_class("CALayer", &mut env.mem)
 }
 
 // MARK: - Class-level animation block API
