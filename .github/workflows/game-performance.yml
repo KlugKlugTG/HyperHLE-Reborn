@@ -41,6 +41,8 @@ jobs:
       TRACE: ${{ matrix.trace }}
       DEBUGGER: ${{ matrix.debugger }}
       IMAGE_LOOKUP: ${{ matrix.dladdr }}
+      CAPTURE_MODEL: ${{ matrix.device || 'iphone-4s' }}
+      PRESENT_DIAG: ${{ matrix.presentdiag }}
       PRESERVE_STUBS: ${{ matrix.preserve }}
       RENDERER: ${{ matrix.renderer }}
       EMULATOR_GL_OPTION: ''
@@ -176,6 +178,10 @@ jobs:
               gdb-multiarch -nx -q -batch -x "$GITHUB_WORKSPACE/dev-scripts/pes-guest.gdb"
             ) > results/guest-debugger.txt 2>&1 &
           fi
+          if [[ "$PRESENT_DIAG" == 1 ]]; then
+            export TOUCHHLE_DUMP_READBACK=1 TOUCHHLE_TRACE_PRESENT=1 TOUCHHLE_DUMP_LAYER_TREE=1
+            mkdir -p /tmp/a8run
+          fi
           read -r -a steps <<< "$STEPS"
           args=()
           for step in "${steps[@]}"; do args+=(--step "$step"); done
@@ -188,7 +194,17 @@ jobs:
             export HLE_WATCH_SCRIPT="$GITHUB_WORKSPACE/dev-scripts/pes-host.gdb"
             printf '%s\n' '#!/bin/bash' 'echo "$$" | sudo tee "$HLE_CGROUP/cgroup.procs" >/dev/null' 'exec gdb -nx -q -batch -x "$HLE_WATCH_SCRIPT" --args "$HLE_BINARY" "$@"' > "$RUNNER_TEMP/run-game"
           fi
-          python3 dev-scripts/ai-tap-sequence.py "$RUNNER_TEMP/fixture/game.ipa" --exe "$emulator" --cwd emulator --out results/play "${args[@]}" --final-wait 5 --require-frame-change --require-nonblack-frame --require-frame-content -- "${gl[@]}" --device-family=iphone-4s --overlay=off --no-error-popup
+          python3 dev-scripts/ai-tap-sequence.py "$RUNNER_TEMP/fixture/game.ipa" --exe "$emulator" --cwd emulator --out results/play "${args[@]}" --final-wait 5 --require-frame-change --require-nonblack-frame --require-frame-content -- "${gl[@]}" --device-family="$CAPTURE_MODEL" --overlay=off --no-error-popup
+      - name: Collect renderbuffer snapshots
+        if: always() && matrix.presentdiag
+        shell: bash
+        run: |
+          mkdir -p results/raw
+          for file in /tmp/a8run/*.ppm emulator/*.ppm; do
+            if [[ -f "$file" ]]; then
+              python3 -c 'from PIL import Image; import sys; im=Image.open(sys.argv[1]); im.thumbnail((480,480)); im.save(sys.argv[2])' "$file" "results/raw/$(basename "$file").png" || cp "$file" results/raw/
+            fi
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
