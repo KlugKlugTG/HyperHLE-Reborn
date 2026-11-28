@@ -430,7 +430,9 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         &tests_dir,
         "TestApp",
         &extra_compile_args,
-        &["--game-center-authenticated"],
+        // The Core Text tests exercise the opt-in (`--fix-text`) font
+        // registration, descriptor matching and em-based metrics.
+        &["--game-center-authenticated", "--fix-text"],
     )?;
     // Reuse the CI-built binary with both initial status-bar states. Each
     // process enters UIApplicationMain, checks geometry during subclass init,

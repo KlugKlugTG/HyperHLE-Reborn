@@ -450,6 +450,13 @@ pub struct Options {
     pub dumping_options: DumpingOptions,
     pub dumping_file: PathBuf,
     pub ignore_gl_errors: bool,
+    /// Ignore `CFRunLoopStop` for the application's main run loop. Some
+    /// launcher-era apps bundle ad/analytics SDKs whose startup path stops the
+    /// main run loop when their (now dead) server can't be reached; on iOS that
+    /// ends `UIApplicationMain` and the app quits immediately, which looks like
+    /// a crash in the emulator. Opt-in so emulator behaviour stays faithful by
+    /// default.
+    pub ignore_main_runloop_stop: bool,
     /// Wrap every guest GL entry point with a `glGetError()` check after the
     /// call and log the source location (in `gles_guest.rs`) of any non-zero
     /// error. Useful when an app silently misrenders (e.g. a black screen
@@ -503,6 +510,15 @@ pub struct Options {
     /// enable it for GTA III. Off globally because some other games rely on
     /// the legacy eager-load and automatic fullscreen presentation behaviour.
     pub fix_movie_player: bool,
+    /// Use the newer Core Text/Core Graphics text stack with `--fix-text`:
+    /// process-registered fonts are looked up by name, descriptors are matched,
+    /// and glyph metrics are measured in em units like Core Text does. This is
+    /// what made the text in some Unity titles (e.g. Brawl Stars) render
+    /// correctly, but the same changes broke text in many other Unity games,
+    /// so they stay opt-in and the legacy font fallbacks and metrics are kept
+    /// unless this flag is given. Also available as the "Fix text" switch in
+    /// Settings > Graphics.
+    pub fix_text: bool,
     /// When an OpenGL ES 2.0 app binds no attribute locations itself, give a
     /// linked program's active attributes the locations 0 to N-1 in the
     /// reverse of the order the host driver chose. Turn it on with
@@ -598,6 +614,7 @@ impl Default for Options {
             dumping_options: Default::default(),
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
             ignore_gl_errors: false,
+            ignore_main_runloop_stop: false,
             trace_gl_errors: false,
             verbose_gles: false,
             gles_native: false,
@@ -625,6 +642,7 @@ impl Default for Options {
                 .map(|value| value != "0")
                 .unwrap_or(false),
             fix_movie_player: false,
+            fix_text: false,
             reverse_attrib_locations: false,
         }
     }
@@ -659,6 +677,10 @@ impl Options {
             self.fix_movie_player = true;
         } else if arg == "--no-fix-movie-player" {
             self.fix_movie_player = false;
+        } else if arg == "--fix-text" {
+            self.fix_text = true;
+        } else if arg == "--no-fix-text" {
+            self.fix_text = false;
         } else if arg == "--reverse-attrib-locations" {
             self.reverse_attrib_locations = true;
         } else if arg == "--no-reverse-attrib-locations" {
@@ -953,6 +975,10 @@ impl Options {
             self.dumping_file = crate::paths::user_data_base_path().join(path);
         } else if arg == "--ignore-gl-errors" {
             self.ignore_gl_errors = true;
+        } else if arg == "--ignore-main-runloop-stop" {
+            self.ignore_main_runloop_stop = true;
+        } else if arg == "--no-ignore-main-runloop-stop" {
+            self.ignore_main_runloop_stop = false;
         } else if arg == "--trace-gl-errors" {
             self.trace_gl_errors = true;
         } else if arg == "--no-trace-gl-errors" {
@@ -1183,6 +1209,18 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--no-fix-movie-player").unwrap());
         assert!(!options.fix_movie_player);
+    }
+
+    #[test]
+    fn fix_text_is_opt_in_and_can_be_disabled() {
+        let mut options = Options::default();
+        assert!(!options.fix_text);
+
+        assert!(options.parse_argument("--fix-text").unwrap());
+        assert!(options.fix_text);
+
+        assert!(options.parse_argument("--no-fix-text").unwrap());
+        assert!(!options.fix_text);
     }
 
     #[test]

@@ -229,15 +229,37 @@ impl Font {
         g.h_metrics().advance_width.round() as i32
     }
 
-    pub(crate) fn glyph_advance_at_size(&self, glyph_id: GlyphId, font_size: f32) -> f32 {
+    /// The scale used for glyph metrics. `em_metrics` follows Core Text,
+    /// where a font size is a number of points per em (the `--fix-text`
+    /// behavior); otherwise the historical 1.125x fudge factor is kept so
+    /// apps that were laid out against it do not move or disappear.
+    fn metrics_scale(&self, font_size: f32, em_metrics: bool) -> Scale {
+        if em_metrics {
+            self.em_scale(font_size)
+        } else {
+            scale(font_size)
+        }
+    }
+
+    pub(crate) fn glyph_advance_at_size(
+        &self,
+        glyph_id: GlyphId,
+        font_size: f32,
+        em_metrics: bool,
+    ) -> f32 {
         self.glyph(glyph_id)
-            .scaled(self.em_scale(font_size))
+            .scaled(self.metrics_scale(font_size, em_metrics))
             .h_metrics()
             .advance_width
     }
 
-    pub(crate) fn glyph_positions_at_size(&self, font_size: f32, glyphs: &[GlyphId]) -> Vec<f32> {
-        let font_scale = self.em_scale(font_size);
+    pub(crate) fn glyph_positions_at_size(
+        &self,
+        font_size: f32,
+        glyphs: &[GlyphId],
+        em_metrics: bool,
+    ) -> Vec<f32> {
+        let font_scale = self.metrics_scale(font_size, em_metrics);
         let mut previous: Option<GlyphId> = None;
         let mut x = 0.0;
         glyphs
@@ -260,10 +282,11 @@ impl Font {
         &self,
         glyph_id: GlyphId,
         font_size: f32,
+        em_metrics: bool,
     ) -> (f32, f32, f32, f32) {
         let glyph = self
             .glyph(glyph_id)
-            .scaled(self.em_scale(font_size))
+            .scaled(self.metrics_scale(font_size, em_metrics))
             .positioned(Point { x: 0.0, y: 0.0 });
         match glyph.pixel_bounding_box() {
             Some(bb) => (
@@ -280,18 +303,24 @@ impl Font {
     }
 
     /// Advance of a simple, horizontal glyph sequence in Core Text points.
-    /// Core Text and Core Graphics both measure font size in units per em.
-    pub(crate) fn text_advance_at_size(&self, font_size: f32, text: &str) -> f32 {
+    /// With `em_metrics` it measures the way Core Text does; otherwise the
+    /// historical scale is used (see [Self::metrics_scale]).
+    pub(crate) fn text_advance_at_size(
+        &self,
+        font_size: f32,
+        text: &str,
+        em_metrics: bool,
+    ) -> f32 {
         let glyphs: Vec<_> = text
             .chars()
             .map(|ch| self.glyph_id_for_unicode(ch))
             .collect();
-        let positions = self.glyph_positions_at_size(font_size, &glyphs);
+        let positions = self.glyph_positions_at_size(font_size, &glyphs, em_metrics);
         positions
             .last()
             .zip(glyphs.last())
             .map_or(0.0, |(x, glyph)| {
-                x + self.glyph_advance_at_size(*glyph, font_size)
+                x + self.glyph_advance_at_size(*glyph, font_size, em_metrics)
             })
     }
 
@@ -1541,17 +1570,17 @@ mod tests {
             );
             assert_eq!(font.glyph_bbox(invalid), font.glyph_bbox(missing));
             assert_eq!(
-                font.glyph_advance_at_size(invalid, 20.0),
-                font.glyph_advance_at_size(missing, 20.0)
+                font.glyph_advance_at_size(invalid, 20.0, true),
+                font.glyph_advance_at_size(missing, 20.0, true)
             );
             assert_eq!(
-                font.glyph_bbox_at_size(invalid, 20.0),
-                font.glyph_bbox_at_size(missing, 20.0)
+                font.glyph_bbox_at_size(invalid, 20.0, true),
+                font.glyph_bbox_at_size(missing, 20.0, true)
             );
             // Exercise invalid IDs as both sides of a kerning pair.
             assert_eq!(
-                font.glyph_positions_at_size(20.0, &[valid, invalid, invalid, valid]),
-                font.glyph_positions_at_size(20.0, &[valid, missing, missing, valid])
+                font.glyph_positions_at_size(20.0, &[valid, invalid, invalid, valid], true),
+                font.glyph_positions_at_size(20.0, &[valid, missing, missing, valid], true)
             );
         }
     }
@@ -1620,11 +1649,14 @@ mod tests {
             .h_metrics()
             .advance_width;
         let kerning = font.rt().pair_kerning(font_scale, glyphs[0], glyphs[1]);
-        let positions = font.glyph_positions_at_size(font_size, &glyphs);
+        let positions = font.glyph_positions_at_size(font_size, &glyphs, true);
+        let legacy_positions = font.glyph_positions_at_size(font_size, &glyphs, false);
 
         assert_eq!(positions[0], 0.0);
         assert!(kerning < 0.0);
         assert!((positions[1] - (first_advance + kerning)).abs() < 0.001);
+        // The legacy metric uses the historical 1.125x scale instead.
+        assert!((legacy_positions[1] - positions[1]).abs() > 0.001);
     }
 }
 

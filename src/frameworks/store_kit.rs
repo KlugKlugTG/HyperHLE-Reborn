@@ -7,6 +7,7 @@
 
 mod sk_payment_queue;
 mod sk_product;
+mod sk_store_product_view_controller;
 
 use crate::dyld::{ConstantExports, HostConstant};
 
@@ -76,7 +77,11 @@ pub const CONSTANTS: ConstantExports = &[
 pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     path: "/System/Library/Frameworks/StoreKit.framework/StoreKit",
     aliases: &[],
-    class_exports: &[sk_payment_queue::CLASSES, sk_product::CLASSES],
+    class_exports: &[
+        sk_payment_queue::CLASSES,
+        sk_product::CLASSES,
+        sk_store_product_view_controller::CLASSES,
+    ],
     constant_exports: &[CONSTANTS],
     function_exports: &[],
 };

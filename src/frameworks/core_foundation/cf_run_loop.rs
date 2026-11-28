@@ -265,6 +265,17 @@ fn CFRunLoopStop(env: &mut Environment, rl: CFRunLoopRef) {
     if rl.is_null() {
         return;
     }
+    // An SDK stopping the main run loop ends `UIApplicationMain` and the whole
+    // app, which is indistinguishable from a crash. Apps whose dead ad or
+    // analytics backends trip this on every launch can opt out
+    // (--ignore-main-runloop-stop): the request then simply times out and the
+    // game keeps running.
+    if env.options.ignore_main_runloop_stop && env.current_thread == 0 {
+        log_once!(
+            "CFRunLoopStop on the main run loop ignored (--ignore-main-runloop-stop)"
+        );
+        return;
+    }
     env.objc
         .borrow_mut::<crate::frameworks::foundation::ns_run_loop::NSRunLoopHostObject>(rl)
         .stopped = true;

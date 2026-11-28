@@ -495,6 +495,48 @@ fn handle_open_err<T, E: std::fmt::Display, P: std::fmt::Debug>(
     }
 }
 
+/// Open a host file backing a guest file. Guest apps routinely open files that
+/// their sandbox manifest lists but the host has not materialized yet (SQLite
+/// journal files, lazily created caches). When the host file is missing but the
+/// guest asked for write access, create the missing parent directories and the
+/// file instead of treating it as an emulator bug.
+fn open_backing_file(
+    host_path: &std::path::Path,
+    read: bool,
+    write: bool,
+    append: bool,
+    truncate: bool,
+) -> std::fs::File {
+    let open = |create: bool, truncate: bool| {
+        std::fs::OpenOptions::new()
+            .read(read || create)
+            .write(write || create)
+            .append(append)
+            .create(create)
+            .truncate(truncate)
+            .open(host_path)
+    };
+    match open(false, truncate) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && (write || append) => {
+            if let Some(parent) = host_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match open(true, truncate) {
+                Ok(file) => {
+                    log!(
+                        "Guest opened a write-mode file that did not exist on the host; created {:?}",
+                        host_path
+                    );
+                    file
+                }
+                Err(e) => handle_open_err(Err::<std::fs::File, _>(e), host_path),
+            }
+        }
+        Err(e) => handle_open_err(Err::<std::fs::File, _>(e), host_path),
+    }
+}
+
 /// Backing for the guest's `/dev/random` and `/dev/urandom` character devices.
 ///
 /// On Apple platforms (iOS/macOS) both device nodes are identical: a
@@ -1853,16 +1895,7 @@ impl Fs {
 
         match action {
             OpenAction::OpenPath(host_path) => {
-                let file = handle_open_err(
-                    File::options()
-                        .read(read)
-                        .write(write)
-                        .append(append)
-                        .create(false)
-                        .truncate(truncate)
-                        .open(&host_path),
-                    &host_path,
-                );
+                let file = open_backing_file(&host_path, read, write, append, truncate);
                 return Ok(GuestFile::File(file));
             }
             OpenAction::OpenIpa => {
@@ -1926,16 +1959,7 @@ impl Fs {
                         );
                     }
                 }
-                let file = handle_open_err(
-                    File::options()
-                        .read(read)
-                        .write(write)
-                        .append(append)
-                        .create(false)
-                        .truncate(truncate)
-                        .open(&host_path),
-                    &host_path,
-                );
+                let file = open_backing_file(&host_path, read, write, append, truncate);
                 return Ok(GuestFile::File(file));
             }
         }

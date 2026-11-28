@@ -137,6 +137,25 @@ fn destroy_exception(env: &mut Environment, payload: ConstPtr<id>) {
 }
 
 pub fn objc_exception_throw(env: &mut Environment, exception: id) {
+    {
+        // Diagnostics: an Objective-C exception reaching the guest runtime is
+        // usually the reason an app quits or misbehaves during launch, but the
+        // guest-side crash reporter may swallow it silently.
+        let class = ObjC::read_isa(exception, &env.mem);
+        let name = env.objc.get_class_name(class).to_owned();
+        let reason: id = crate::objc::msg![env; exception reason];
+        let reason_str = if reason == nil {
+            "<none>".to_string()
+        } else {
+            crate::frameworks::foundation::ns_string::to_rust_string(env, reason).to_string()
+        };
+        log!(
+            "Objective-C exception raised: class={} reason={:?} lr={:#x}",
+            name,
+            reason_str,
+            env.cpu.regs()[crate::cpu::Cpu::LR]
+        );
+    }
     let allocator = guest_runtime(env, "___cxa_allocate_exception");
     let payload: MutPtr<u32> = allocator.call_from_host(env, (16u32,));
     assert!(

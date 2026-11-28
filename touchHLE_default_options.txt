@@ -415,3 +415,11 @@ com.notdoppler.EarntoDie: --preserve-dyld-stubs --present-mode=readback
 # Preserve the freed isa and overlay ivar until reuse so that cleanup removes
 # substView, which otherwise remains above EAGLView and intercepts every tap.
 com.gameloft.BackStab: --zero-memory-on-alloc
+
+# Zombie Catchers 1.05 (fi.twomenandadog.zombiecatchers)
+# The bundled PlayHaven/Upsight ad SDK stops the main run loop when its
+# (long-dead) marketing backend can't be reached; on iOS that ends
+# UIApplicationMain and the app quits during launch. Ignore that stop so the
+# request times out and the game continues, and let the launcher-era Vungle
+# SDK recreate its SQLite journal files.
+fi.twomenandadog.zombiecatchers: --ignore-main-runloop-stop --device-family=iphone-4

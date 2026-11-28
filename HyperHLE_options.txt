@@ -3,10 +3,10 @@
 # Options in this file take precedence over ones in touchHLE_default_options.txt
 #
 # Tip: "Rotation fix" is a switch in the app picker's Settings > Display
-# screen and "Movie player fix" and "No GLES 3" are ones in Settings >
-# Graphics, so --rotation-fix, --fix-movie-player and --no-gles3 don't have to
-# be added here. The same screen's "FPS Limiter" and Settings > Emulation's
-# "RAM Limiter" cover --fps-limit= and --memory-limit=.
+# screen and "Movie player fix", "Fix text" and "No GLES 3" are ones in
+# Settings > Graphics, so --rotation-fix, --fix-movie-player, --fix-text and
+# --no-gles3 don't have to be added here. The same screen's "FPS Limiter" and
+# Settings > Emulation's "RAM Limiter" cover --fps-limit= and --memory-limit=.
 #
 # ---
 #
