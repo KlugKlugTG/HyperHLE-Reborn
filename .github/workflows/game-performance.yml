@@ -190,8 +190,9 @@ jobs:
           if [[ "$IMAGE_LOOKUP" == 1 ]]; then gl+=(--dladdr); fi
           if [[ "$PRESERVE_STUBS" == 1 ]]; then gl+=(--preserve-dyld-stubs); fi
           if [[ "$DEBUGGER" == guest ]]; then gl+=(--gdb=127.0.0.1:23450); fi
-          if [[ "$DEBUGGER" == watch ]]; then
+          if [[ "$DEBUGGER" == watch || "$DEBUGGER" == imports ]]; then
             export HLE_WATCH_SCRIPT="$GITHUB_WORKSPACE/dev-scripts/pes-host.gdb"
+            if [[ "$DEBUGGER" == imports ]]; then export HLE_WATCH_SCRIPT="$GITHUB_WORKSPACE/dev-scripts/pes-imports.gdb"; fi
             printf '%s\n' '#!/bin/bash' 'echo "$$" | sudo tee "$HLE_CGROUP/cgroup.procs" >/dev/null' 'exec gdb -nx -q -batch -x "$HLE_WATCH_SCRIPT" --args "$HLE_BINARY" "$@"' > "$RUNNER_TEMP/run-game"
           fi
           python3 dev-scripts/ai-tap-sequence.py "$RUNNER_TEMP/fixture/game.ipa" --exe "$emulator" --cwd emulator --out results/play "${args[@]}" --final-wait 5 --require-frame-change --require-nonblack-frame --require-frame-content -- "${gl[@]}" --device-family="$CAPTURE_MODEL" --overlay=off --no-error-popup
