@@ -772,6 +772,23 @@ Other options:
         enabled by an app-specific options file. Turning the "Movie player
         fix" Settings switch off passes this flag.
 
+    --fix-text
+        Use the newer Core Text/Core Graphics text handling: application fonts
+        registered with CTFontManagerRegisterGraphicsFont are found by name,
+        descriptors report the registered family/PostScript names, and glyph
+        metrics are measured in em units the way Core Text does. This is the
+        change that fixed the text in some Unity titles (Brawl Stars), but it
+        also made text disappear in many other Unity games, so it is off by
+        default. Also available as "Fix text" in Settings > Graphics. Leaving
+        the switch alone keeps the legacy behavior; turning it on is an
+        explicit per-app override.
+
+    --no-fix-text
+        Use the legacy text handling (bundled-font fallbacks and the original
+        1.125x font size metric), even if --fix-text was enabled by an
+        app-specific options file. Turning the "Fix text" Settings switch off
+        passes this flag.
+
     --reverse-attrib-locations
         When an OpenGL ES 2.0 app binds no attribute locations itself, give
         the active attributes of a linked program the locations 0 to N-1, in

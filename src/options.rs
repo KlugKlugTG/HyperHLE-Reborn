@@ -511,6 +511,15 @@ pub struct Options {
     /// enable it for GTA III. Off globally because some other games rely on
     /// the legacy eager-load and automatic fullscreen presentation behaviour.
     pub fix_movie_player: bool,
+    /// Use the newer Core Text/Core Graphics text stack with `--fix-text`:
+    /// process-registered fonts are looked up by name, descriptors are matched,
+    /// and glyph metrics are measured in em units like Core Text does. This is
+    /// what made the text in some Unity titles (e.g. Brawl Stars) render
+    /// correctly, but the same changes broke text in many other Unity games,
+    /// so they stay opt-in and the legacy font fallbacks and metrics are kept
+    /// unless this flag is given. Also available as the "Fix text" switch in
+    /// Settings > Graphics.
+    pub fix_text: bool,
     /// When an OpenGL ES 2.0 app binds no attribute locations itself, give a
     /// linked program's active attributes the locations 0 to N-1 in the
     /// reverse of the order the host driver chose. Turn it on with
@@ -634,6 +643,7 @@ impl Default for Options {
                 .map(|value| value != "0")
                 .unwrap_or(false),
             fix_movie_player: false,
+            fix_text: false,
             reverse_attrib_locations: false,
         }
     }
@@ -668,6 +678,10 @@ impl Options {
             self.fix_movie_player = true;
         } else if arg == "--no-fix-movie-player" {
             self.fix_movie_player = false;
+        } else if arg == "--fix-text" {
+            self.fix_text = true;
+        } else if arg == "--no-fix-text" {
+            self.fix_text = false;
         } else if arg == "--reverse-attrib-locations" {
             self.reverse_attrib_locations = true;
         } else if arg == "--no-reverse-attrib-locations" {
@@ -1196,6 +1210,18 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--no-fix-movie-player").unwrap());
         assert!(!options.fix_movie_player);
+    }
+
+    #[test]
+    fn fix_text_is_opt_in_and_can_be_disabled() {
+        let mut options = Options::default();
+        assert!(!options.fix_text);
+
+        assert!(options.parse_argument("--fix-text").unwrap());
+        assert!(options.fix_text);
+
+        assert!(options.parse_argument("--no-fix-text").unwrap());
+        assert!(!options.fix_text);
     }
 
     #[test]
