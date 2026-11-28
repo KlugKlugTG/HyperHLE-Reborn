@@ -40,6 +40,8 @@ jobs:
       STEPS: ${{ inputs.steps || '1:- 20:-' }}
       TRACE: ${{ matrix.trace }}
       DEBUGGER: ${{ matrix.debugger }}
+      IMAGE_LOOKUP: ${{ matrix.dladdr }}
+      PRESERVE_STUBS: ${{ matrix.preserve }}
       RENDERER: ${{ matrix.renderer }}
       EMULATOR_GL_OPTION: ''
       ALSOFT_DRIVERS: 'null'
@@ -179,6 +181,8 @@ jobs:
           for step in "${steps[@]}"; do args+=(--step "$step"); done
           gl=()
           if [[ -n "$EMULATOR_GL_OPTION" ]]; then gl+=("$EMULATOR_GL_OPTION"); fi
+          if [[ "$IMAGE_LOOKUP" == 1 ]]; then gl+=(--dladdr); fi
+          if [[ "$PRESERVE_STUBS" == 1 ]]; then gl+=(--preserve-dyld-stubs); fi
           if [[ "$DEBUGGER" == guest ]]; then gl+=(--gdb=127.0.0.1:23450); fi
           if [[ "$DEBUGGER" == watch ]]; then
             export HLE_WATCH_SCRIPT="$GITHUB_WORKSPACE/dev-scripts/pes-host.gdb"
